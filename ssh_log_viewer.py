@@ -2610,15 +2610,37 @@ class MainWindow(QMainWindow):
             self._status.setText("ダウンロード失敗")
             return
 
-        # text_editor.py を起動
-        editor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'text_editor.py')
+        # text_editor を起動: EXE 版とスクリプト版を自動判別
         try:
-            subprocess.Popen([sys.executable, editor_script, local_path],
-                             cwd=os.path.dirname(editor_script))
+            if getattr(sys, 'frozen', False):
+                # PyInstaller でビルドされた EXE として動作中
+                # → 同じフォルダにある "Text Editor.exe" を呼ぶ
+                exe_dir = os.path.dirname(sys.executable)
+                editor_exe = os.path.join(exe_dir, "Text Editor.exe")
+                if not os.path.isfile(editor_exe):
+                    QMessageBox.warning(
+                        self, "テキストエディタが見つかりません",
+                        f"Text Editor.exe が見つかりません:\n{exe_dir}\n\n"
+                        "EXE版を使う場合は両アプリを同じフォルダに置いてください。\n"
+                        f"ダウンロードファイル:\n{local_path}",
+                    )
+                    return
+                subprocess.Popen([editor_exe, local_path], cwd=exe_dir)
+            else:
+                # 通常スクリプト実行 → python text_editor.py
+                editor_script = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), 'text_editor.py'
+                )
+                subprocess.Popen(
+                    [sys.executable, editor_script, local_path],
+                    cwd=os.path.dirname(editor_script),
+                )
             self._status.setText(f"テキストエディタで開きました: {local_name}")
         except Exception as e:
-            QMessageBox.critical(self, "起動エラー",
-                f"text_editor.py の起動に失敗しました:\n{e}")
+            QMessageBox.critical(
+                self, "起動エラー",
+                f"テキストエディタの起動に失敗しました:\n{e}"
+            )
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
