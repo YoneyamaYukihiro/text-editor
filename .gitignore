@@ -22,8 +22,12 @@ env/
 
 # エディタ / OS
 .vscode/
+.vs/
 .idea/
 *.swp
 *~
 Thumbs.db
 .DS_Store
+
+# PyInstaller の生成 spec (絶対パスが入るため)
+*.spec

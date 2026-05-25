@@ -1,6 +1,8 @@
 #!/usr/bin/env python3
-"""SSH Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-import sys, os, re, json, stat as stat_mod, time
+"""SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
+__version__ = "1.0.0"
+
+import sys, os, re, json, stat as stat_mod, time, socket, select
 
 try:
     import paramiko
@@ -17,7 +19,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter,
-    QAction, QKeySequence,
+    QAction, QKeySequence, QTextCursor,
 )
 
 
@@ -25,17 +27,31 @@ from PyQt6.QtGui import (
 # サーバーカラーパレット（最大6サーバー）
 # ---------------------------------------------------------------------------
 
-_PALETTES = [
-    ('#0D2137', '#4A9EFF'),   # blue
-    ('#0D2A0D', '#5FBF5F'),   # green
-    ('#2D1800', '#E8A030'),   # orange
-    ('#1A0D2A', '#9876CC'),   # purple
-    ('#2A0D0D', '#CF6679'),   # red
-    ('#1A2A2A', '#4EC9B0'),   # teal
+# ダーク用: 暗背景 + 明るいアクセント文字
+_PALETTES_DARK = [
+    ('#0D2137', '#7FC0FF'),   # blue   (was #4A9EFF)
+    ('#0D2A0D', '#80E080'),   # green  (was #5FBF5F)
+    ('#2D1800', '#FFC060'),   # orange (was #E8A030)
+    ('#1A0D2A', '#C8A0FF'),   # purple (was #9876CC)
+    ('#2A0D0D', '#FF8095'),   # red    (was #CF6679)
+    ('#1A2A2A', '#80E6D0'),   # teal   (was #4EC9B0)
+]
+# ライト用: 淡背景 + 濃いアクセント文字
+_PALETTES_LIGHT = [
+    ('#DDEAFF', '#1A4A8A'),   # blue
+    ('#DDF0DD', '#2A6A2A'),   # green
+    ('#FFE8CC', '#8A4A00'),   # orange
+    ('#EADDF0', '#5A3A8A'),   # purple
+    ('#FFD8D8', '#8A2020'),   # red
+    ('#D8F0F0', '#1A6A6A'),   # teal
 ]
 
+
 def _palette(idx: int) -> tuple[str, str]:
-    return _PALETTES[idx % len(_PALETTES)]
+    """現在のテーマに応じて (bg, fg) を返す"""
+    is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+    pal = _PALETTES_LIGHT if is_light else _PALETTES_DARK
+    return pal[idx % len(pal)]
 
 
 # ---------------------------------------------------------------------------
@@ -57,14 +73,231 @@ def _save_profiles(profiles: dict):
 
 
 # ---------------------------------------------------------------------------
+# アプリ設定 (フォントサイズ・テーマ)
+# ---------------------------------------------------------------------------
+
+_SETTINGS_PATH = os.path.join(os.path.expanduser('~'), '.ssh_log_viewer_settings.json')
+
+# 暗系テーマ共通の構文配色 (白文字＝暗背景向き)
+_SYNTAX_DARK = {
+    'syn_timestamp': '#4EC9B0', 'syn_bracket':   '#9876AA',
+    'syn_exception': '#FF7070', 'syn_stack':     '#CC7832',
+    'syn_http':      '#FF7070',
+    'syn_sql_kw':    '#CC7832', 'syn_sql_type':  '#4EC9B0',
+    'syn_sql_func':  '#DCDCAA', 'syn_sql_str':   '#6A8759',
+    'syn_sql_num':   '#6897BB', 'syn_sql_cmt':   '#808080',
+}
+# 明系テーマ共通の構文配色 (黒文字＝白背景向き)
+_SYNTAX_LIGHT = {
+    'syn_timestamp': '#007070', 'syn_bracket':   '#6F42C1',
+    'syn_exception': '#A80000', 'syn_stack':     '#B45A00',
+    'syn_http':      '#A80000',
+    'syn_sql_kw':    '#B45A00', 'syn_sql_type':  '#007070',
+    'syn_sql_func':  '#7A5500', 'syn_sql_str':   '#22863A',
+    'syn_sql_num':   '#1C5BC0', 'syn_sql_cmt':   '#6A737D',
+}
+
+# テーマプリセット (背景・テキスト・選択色 + ログ表示用配色)
+_THEME_PRESETS = {
+    'Dark': {
+        'bg':          '#1a1a1a',
+        'panel_bg':    '#1e1e1e',
+        'toolbar_bg':  '#252525',
+        'text':        '#a9b7c6',
+        'text_dim':    '#808080',
+        'selection':   '#214283',
+        'border':      '#333333',
+        'control_bg':  '#3a3a3a',
+        'control_hover': '#4a4a4a',
+        'log_bg':      '#1a1a1a',
+        'level_error_bg': '#3D1515', 'level_error_fg': '#FF7070',
+        'level_warn_bg':  '#2D2512', 'level_warn_fg':  '#E8B26A',
+        'level_info_bg':  '#1A2A1A', 'level_info_fg':  '#6A9F6A',
+        'level_debug_fg': '#707070', 'level_trace_fg': '#505050',
+        **_SYNTAX_DARK,
+    },
+    'Dark Blue': {
+        'bg':          '#0e1525',
+        'panel_bg':    '#131c2f',
+        'toolbar_bg':  '#172238',
+        'text':        '#c0d0e8',
+        'text_dim':    '#7080a0',
+        'selection':   '#2a4a8a',
+        'border':      '#1f2d4a',
+        'control_bg':  '#1f2d4a',
+        'control_hover': '#2a3d60',
+        'log_bg':      '#0e1525',
+        'level_error_bg': '#3a1a25', 'level_error_fg': '#FF8080',
+        'level_warn_bg':  '#332a12', 'level_warn_fg':  '#FFD080',
+        'level_info_bg':  '#162a3a', 'level_info_fg':  '#80C0FF',
+        'level_debug_fg': '#7080a0', 'level_trace_fg': '#506080',
+        **_SYNTAX_DARK,
+    },
+    'High Contrast': {
+        'bg':          '#000000',
+        'panel_bg':    '#0a0a0a',
+        'toolbar_bg':  '#151515',
+        'text':        '#ffffff',
+        'text_dim':    '#a0a0a0',
+        'selection':   '#0066cc',
+        'border':      '#444444',
+        'control_bg':  '#2a2a2a',
+        'control_hover': '#3a3a3a',
+        'log_bg':      '#000000',
+        'level_error_bg': '#600000', 'level_error_fg': '#FF6060',
+        'level_warn_bg':  '#5a4500', 'level_warn_fg':  '#FFD060',
+        'level_info_bg':  '#003a00', 'level_info_fg':  '#80FF80',
+        'level_debug_fg': '#a0a0a0', 'level_trace_fg': '#707070',
+        **_SYNTAX_DARK,
+    },
+    'Monochrome': {
+        'bg':          '#1c1c1c',
+        'panel_bg':    '#222222',
+        'toolbar_bg':  '#2a2a2a',
+        'text':        '#cccccc',
+        'text_dim':    '#888888',
+        'selection':   '#505050',
+        'border':      '#3a3a3a',
+        'control_bg':  '#3a3a3a',
+        'control_hover': '#4a4a4a',
+        'log_bg':      '#1c1c1c',
+        'level_error_bg': '#3a3a3a', 'level_error_fg': '#ffffff',
+        'level_warn_bg':  '#2f2f2f', 'level_warn_fg':  '#dddddd',
+        'level_info_bg':  '#262626', 'level_info_fg':  '#aaaaaa',
+        'level_debug_fg': '#888888', 'level_trace_fg': '#666666',
+        **_SYNTAX_DARK,
+    },
+    'Light': {
+        'bg':          '#f4f4f4',
+        'panel_bg':    '#ffffff',
+        'toolbar_bg':  '#e6e6e6',
+        'text':        '#1e1e1e',
+        'text_dim':    '#666666',
+        'selection':   '#cfe5ff',
+        'border':      '#cccccc',
+        'control_bg':  '#dcdcdc',
+        'control_hover': '#c8c8c8',
+        'log_bg':      '#ffffff',
+        'level_error_bg': '#ffe2e2', 'level_error_fg': '#a80000',
+        'level_warn_bg':  '#fff4cc', 'level_warn_fg':  '#7a5500',
+        'level_info_bg':  '#e6f5e6', 'level_info_fg':  '#206020',
+        'level_debug_fg': '#888888', 'level_trace_fg': '#aaaaaa',
+        **_SYNTAX_LIGHT,
+    },
+    'Solarized Light': {
+        'bg':          '#fdf6e3',
+        'panel_bg':    '#eee8d5',
+        'toolbar_bg':  '#e4dcc3',
+        'text':        '#586e75',
+        'text_dim':    '#93a1a1',
+        'selection':   '#cfd9c4',
+        'border':      '#b8b298',
+        'control_bg':  '#e4dcc3',
+        'control_hover': '#d4cba8',
+        'log_bg':      '#fdf6e3',
+        'level_error_bg': '#fadbd8', 'level_error_fg': '#dc322f',
+        'level_warn_bg':  '#fbeac0', 'level_warn_fg':  '#b58900',
+        'level_info_bg':  '#dde7c8', 'level_info_fg':  '#859900',
+        'level_debug_fg': '#93a1a1', 'level_trace_fg': '#b1c0c0',
+        **_SYNTAX_LIGHT,
+    },
+}
+
+_DEFAULT_SETTINGS = {
+    'tree_font_size':     10,
+    'toolbar_font_size':  11,
+    'log_font_size':       9,
+    'terminal_font_size': 10,
+    'theme':              'Dark',
+    'show_quick_jump':    True,   # 左パネルのクイックジャンプ表示
+    'show_panel_hints':   True,   # 左パネルの説明ラベル表示
+}
+
+
+def _load_settings() -> dict:
+    try:
+        with open(_SETTINGS_PATH, 'r', encoding='utf-8') as f:
+            loaded = json.load(f)
+    except Exception:
+        loaded = {}
+    return {**_DEFAULT_SETTINGS, **loaded}
+
+
+def _save_settings(s: dict):
+    with open(_SETTINGS_PATH, 'w', encoding='utf-8') as f:
+        json.dump(s, f, ensure_ascii=False, indent=2)
+
+
+# モジュールグローバルとして共有
+SETTINGS: dict = _load_settings()
+
+
+# ---------------------------------------------------------------------------
+# ワークスペース (定型ログイン構成 — 接続+開きたいログのセット)
+# ---------------------------------------------------------------------------
+
+_WORKSPACES_PATH = os.path.join(os.path.expanduser('~'), '.ssh_log_viewer_workspaces.json')
+
+
+def _load_workspaces() -> dict:
+    try:
+        with open(_WORKSPACES_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_workspaces(workspaces: dict):
+    with open(_WORKSPACES_PATH, 'w', encoding='utf-8') as f:
+        json.dump(workspaces, f, ensure_ascii=False, indent=2)
+
+
+def _theme() -> dict:
+    return _THEME_PRESETS.get(SETTINGS.get('theme', 'Dark'), _THEME_PRESETS['Dark'])
+
+
+# ---------------------------------------------------------------------------
+# 一時ファイルクリーンアップ (「テキストエディタで開く」DL分)
+# ---------------------------------------------------------------------------
+
+_TEMP_RETENTION_DAYS = 7
+
+
+def _cleanup_old_temp_files(base_dir: str, max_age_days: int = _TEMP_RETENTION_DAYS):
+    """指定 dir 配下で N 日以上前のファイルを削除し、空ディレクトリも除去。"""
+    if not os.path.isdir(base_dir):
+        return 0
+    cutoff = time.time() - max_age_days * 86400
+    removed = 0
+    for root, _dirs, files in os.walk(base_dir, topdown=False):
+        for fname in files:
+            fpath = os.path.join(root, fname)
+            try:
+                if os.path.getmtime(fpath) < cutoff:
+                    os.remove(fpath)
+                    removed += 1
+            except Exception:
+                pass
+        try:
+            if not os.listdir(root) and root != base_dir:
+                os.rmdir(root)
+        except Exception:
+            pass
+    return removed
+
+
+# ---------------------------------------------------------------------------
 # SSH接続クラス
 # ---------------------------------------------------------------------------
 
 class SSHConnection:
+    protocol = 'ssh'
+
     def __init__(self):
         self.client = None
         self.sftp   = None
         self.label  = ''
+        self._info  = {}
 
     def connect(self, host, port, user, password='', key_path=''):
         c = paramiko.SSHClient()
@@ -79,6 +312,8 @@ class SSHConnection:
         self.client = c
         self.sftp   = c.open_sftp()
         self.label  = f"{user}@{host}"
+        self._info  = dict(host=host, port=port, user=user,
+                           password=password, key_path=key_path)
 
     def disconnect(self):
         try:
@@ -107,6 +342,390 @@ class SSHConnection:
         _, out, _ = self.client.exec_command(cmd)
         return out.read().decode('utf-8', errors='replace')
 
+    def open_tail_channel(self, path: str) -> '_TailChannel':
+        transport = self.client.get_transport()
+        chan = transport.open_session()
+        # -F (= --follow=name --retry): ローテーションされても同じ名前を追従
+        chan.exec_command(f'tail -F "{path}"')
+        return _SSHChannel(chan)
+
+    def open_shell_channel(self) -> '_TailChannel':
+        chan = self.client.invoke_shell(term='xterm', width=120, height=30)
+        return _SSHChannel(chan)
+
+    def download_bytes(self, path: str) -> bytes:
+        """リモートファイルを全文バイトで取得 (SFTP)。"""
+        with self.sftp.open(path, 'rb') as f:
+            return f.read()
+
+
+# ---------------------------------------------------------------------------
+# Telnet 低レベルクライアント（Python 3.13+ で telnetlib が削除されたため自前実装）
+# ---------------------------------------------------------------------------
+
+# Telnet command bytes
+_IAC, _DONT, _DO, _WONT, _WILL = 0xFF, 0xFE, 0xFD, 0xFC, 0xFB
+_SB, _SE = 0xFA, 0xF0
+
+
+class _TelnetClient:
+    """最小限の telnet クライアント。IAC ネゴシエーションは全拒否で応答する。"""
+
+    def __init__(self):
+        self.sock: socket.socket | None = None
+
+    def open(self, host: str, port: int = 23, timeout: float = 10):
+        self.sock = socket.create_connection((host, port), timeout=timeout)
+        self.sock.setblocking(False)
+
+    def close(self):
+        try:
+            if self.sock:
+                self.sock.shutdown(socket.SHUT_RDWR)
+        except Exception:
+            pass
+        try:
+            if self.sock:
+                self.sock.close()
+        except Exception:
+            pass
+        self.sock = None
+
+    def write(self, data: bytes):
+        if not self.sock:
+            return
+        # ペイロード中の 0xFF はエスケープが必要
+        payload = data.replace(b'\xff', b'\xff\xff')
+        self.sock.setblocking(True)
+        try:
+            self.sock.sendall(payload)
+        finally:
+            self.sock.setblocking(False)
+
+    def recv(self, timeout: float = 0.3) -> bytes:
+        """IAC を処理した上で読み取れた生バイトを返す。タイムアウトしたら b''。"""
+        if not self.sock:
+            return b''
+        r, _, _ = select.select([self.sock], [], [], timeout)
+        if not r:
+            return b''
+        try:
+            raw = self.sock.recv(4096)
+        except (BlockingIOError, ConnectionResetError, OSError):
+            return b''
+        if not raw:
+            return b''
+        return self._process_iac(raw)
+
+    def read_until(self, expected: bytes, timeout: float = 10) -> bytes:
+        deadline = time.time() + timeout
+        result = bytearray()
+        while time.time() < deadline:
+            chunk = self.recv(0.3)
+            if chunk:
+                result.extend(chunk)
+                if expected in result:
+                    break
+        return bytes(result)
+
+    def _process_iac(self, raw: bytes) -> bytes:
+        """IAC コマンドを取り除き、すべてのオプション要求を拒否で応答する。"""
+        out = bytearray()
+        responses = bytearray()
+        i, n = 0, len(raw)
+        while i < n:
+            b = raw[i]
+            if b != _IAC:
+                out.append(b)
+                i += 1
+                continue
+            if i + 1 >= n:
+                break
+            cmd = raw[i + 1]
+            if cmd == _IAC:
+                out.append(_IAC)
+                i += 2
+            elif cmd in (_DO, _DONT, _WILL, _WONT):
+                if i + 2 >= n:
+                    break
+                opt = raw[i + 2]
+                if cmd == _DO:
+                    responses.extend([_IAC, _WONT, opt])
+                elif cmd == _WILL:
+                    responses.extend([_IAC, _DONT, opt])
+                i += 3
+            elif cmd == _SB:
+                # サブネゴシエーション: IAC SE まで読み捨て
+                se = raw.find(bytes([_IAC, _SE]), i + 2)
+                if se == -1:
+                    break
+                i = se + 2
+            else:
+                i += 2
+        if responses and self.sock:
+            self.sock.setblocking(True)
+            try:
+                self.sock.sendall(bytes(responses))
+            except Exception:
+                pass
+            finally:
+                self.sock.setblocking(False)
+        return bytes(out)
+
+
+# ---------------------------------------------------------------------------
+# 擬似 stat (Telnet listdir 用 — paramiko.SFTPAttributes と互換)
+# ---------------------------------------------------------------------------
+
+class _FakeStat:
+    def __init__(self, name: str, is_dir: bool):
+        self.filename = name
+        self.st_mode = stat_mod.S_IFDIR if is_dir else stat_mod.S_IFREG
+
+
+# ---------------------------------------------------------------------------
+# Telnet 接続クラス（SSHConnection と同じ API）
+# ---------------------------------------------------------------------------
+
+_TELNET_END_MARKER = '__TEL_END_OF_CMD__'
+
+
+class TelnetConnection:
+    protocol = 'telnet'
+
+    def __init__(self):
+        self._tn: _TelnetClient | None = None
+        self.label = ''
+        self._info: dict = {}
+
+    @property
+    def connected(self) -> bool:
+        return self._tn is not None
+
+    def connect(self, host, port, user, password='', key_path=''):
+        port = port or 23
+        tn = _TelnetClient()
+        tn.open(host, port, timeout=10)
+
+        # ログインプロンプト待ち（複数表現に対応）
+        banner = tn.read_until(b':', timeout=10).lower()
+        if b'login' in banner or b'username' in banner or b'user' in banner:
+            tn.write(user.encode() + b'\r\n')
+        else:
+            # ヒューリスティック: 何か来たら user を送る
+            tn.write(user.encode() + b'\r\n')
+
+        if password:
+            tn.read_until(b'assword:', timeout=10)
+            tn.write(password.encode() + b'\r\n')
+
+        # プロンプトが出るまで少し待つ
+        time.sleep(0.5)
+        tn.recv(0.5)
+
+        self._tn = tn
+        self.label = f"{user}@{host}"
+        self._info = dict(host=host, port=port, user=user,
+                          password=password, key_path=key_path)
+
+    def disconnect(self):
+        try:
+            if self._tn:
+                try:
+                    self._tn.write(b'exit\r\n')
+                except Exception:
+                    pass
+                self._tn.close()
+        except Exception:
+            pass
+        self._tn = None
+
+    # --- 内部: マーカー付きでコマンドを実行 ---
+
+    def _exec_raw(self, cmd: str, timeout: float = 30) -> str:
+        if not self._tn:
+            return ''
+        # 入力バッファに残った前回出力を捨てる
+        while self._tn.recv(0.05):
+            pass
+        full = f'{cmd}; echo {_TELNET_END_MARKER}\r\n'
+        self._tn.write(full.encode())
+
+        out = bytearray()
+        deadline = time.time() + timeout
+        while time.time() < deadline:
+            chunk = self._tn.recv(0.3)
+            if chunk:
+                out.extend(chunk)
+                if _TELNET_END_MARKER.encode() in out:
+                    break
+        text = out.decode('utf-8', errors='replace')
+        # マーカー以降を切り捨て
+        idx = text.find(_TELNET_END_MARKER)
+        if idx >= 0:
+            text = text[:idx]
+        # コマンドエコー (先頭の echo 行) を削除
+        lines = text.splitlines()
+        if lines and (cmd[:30] in lines[0] or _TELNET_END_MARKER in lines[0]):
+            lines = lines[1:]
+        # 末尾の空行・プロンプト行 (もし残っていれば) を削除
+        while lines and re.search(r'[$#>]\s*$', lines[-1]):
+            lines = lines[:-1]
+        return '\n'.join(lines)
+
+    def exec(self, cmd: str) -> str:
+        return self._exec_raw(cmd)
+
+    def read_tail(self, path: str, lines: int = 5000) -> str:
+        return self._exec_raw(
+            f'tail -n {lines} "{path}" 2>/dev/null || cat "{path}" 2>/dev/null'
+        )
+
+    def listdir(self, path: str):
+        out = self._exec_raw(f'ls -la "{path}" 2>/dev/null')
+        entries: list[_FakeStat] = []
+        for line in out.splitlines():
+            line = line.strip()
+            if not line or line.startswith('total'):
+                continue
+            parts = line.split(None, 8)
+            if len(parts) < 9:
+                continue
+            mode = parts[0]
+            name = parts[8]
+            # シンボリックリンク表記 "name -> target" は name 側だけ採用
+            if ' -> ' in name:
+                name = name.split(' -> ', 1)[0]
+            if name in ('.', '..'):
+                continue
+            entries.append(_FakeStat(name, mode.startswith('d')))
+        entries.sort(key=lambda a: (not stat_mod.S_ISDIR(a.st_mode), a.filename.lower()))
+        return entries
+
+    # --- ストリーミング系: 別接続を新規に開く ---
+
+    def open_tail_channel(self, path: str) -> '_TailChannel':
+        new_tn = _TelnetClient()
+        new_tn.open(self._info['host'], self._info['port'], timeout=10)
+        new_tn.read_until(b':', timeout=10)
+        new_tn.write(self._info['user'].encode() + b'\r\n')
+        if self._info.get('password'):
+            new_tn.read_until(b'assword:', timeout=10)
+            new_tn.write(self._info['password'].encode() + b'\r\n')
+        time.sleep(0.5)
+        new_tn.recv(0.5)
+        # -F (= --follow=name --retry): ローテーションされても同じ名前を追従
+        new_tn.write(f'tail -F "{path}"\r\n'.encode())
+        return _TelnetChannel(new_tn)
+
+    def open_shell_channel(self) -> '_TailChannel':
+        new_tn = _TelnetClient()
+        new_tn.open(self._info['host'], self._info['port'], timeout=10)
+        new_tn.read_until(b':', timeout=10)
+        new_tn.write(self._info['user'].encode() + b'\r\n')
+        if self._info.get('password'):
+            new_tn.read_until(b'assword:', timeout=10)
+            new_tn.write(self._info['password'].encode() + b'\r\n')
+        return _TelnetChannel(new_tn)
+
+    def download_bytes(self, path: str) -> bytes:
+        """リモートファイルを全文バイトで取得 (cat 経由、Base64ラップでバイナリ安全に)。"""
+        # base64 を経由してバイナリでも壊れず取得
+        b64 = self._exec_raw(f'base64 "{path}" 2>/dev/null', timeout=120)
+        import base64 as _b64
+        try:
+            return _b64.b64decode(''.join(b64.split()))
+        except Exception:
+            # fallback: cat で文字列として取得
+            return self._exec_raw(f'cat "{path}"', timeout=120).encode('utf-8', errors='replace')
+
+
+# ---------------------------------------------------------------------------
+# 接続クラス用の型エイリアス (Duck-typed: SSHConnection | TelnetConnection)
+# ---------------------------------------------------------------------------
+
+RemoteConnection = SSHConnection  # forward declaration; both types share API
+
+
+# ---------------------------------------------------------------------------
+# Tail/Shell ストリーム抽象チャネル
+# ---------------------------------------------------------------------------
+
+class _TailChannel:
+    def recv_ready(self, timeout: float = 0.1) -> bool: ...
+    def recv(self, n: int = 4096) -> bytes: ...
+    def send(self, data: bytes): ...
+    def close(self): ...
+
+
+class _SSHChannel:
+    def __init__(self, chan):
+        self._chan = chan
+
+    def recv_ready(self, timeout: float = 0.1) -> bool:
+        # paramiko's Channel: poll then time.sleep
+        if self._chan.recv_ready():
+            return True
+        # 短時間待つ
+        t0 = time.time()
+        while time.time() - t0 < timeout:
+            if self._chan.recv_ready():
+                return True
+            time.sleep(0.02)
+        return False
+
+    def recv(self, n: int = 4096) -> bytes:
+        try:
+            return self._chan.recv(n)
+        except Exception:
+            return b''
+
+    def send(self, data: bytes):
+        # 例外は呼び出し側で見たいので飲み込まない
+        self._chan.send(data)
+
+    def close(self):
+        try:
+            self._chan.close()
+        except Exception:
+            pass
+
+
+class _TelnetChannel:
+    def __init__(self, tn: _TelnetClient):
+        self._tn = tn
+        self._buf = bytearray()
+
+    def recv_ready(self, timeout: float = 0.1) -> bool:
+        if self._buf:
+            return True
+        chunk = self._tn.recv(timeout)
+        if chunk:
+            self._buf.extend(chunk)
+            return True
+        return False
+
+    def recv(self, n: int = 4096) -> bytes:
+        if not self._buf:
+            chunk = self._tn.recv(0.05)
+            if chunk:
+                self._buf.extend(chunk)
+        if not self._buf:
+            return b''
+        data = bytes(self._buf[:n])
+        del self._buf[:n]
+        return data
+
+    def send(self, data: bytes):
+        # 例外は呼び出し側で見たいので飲み込まない
+        self._tn.write(data)
+
+    def close(self):
+        try:
+            self._tn.close()
+        except Exception:
+            pass
+
 
 # ---------------------------------------------------------------------------
 # Tail -f ワーカー
@@ -116,7 +735,7 @@ class TailWorker(QThread):
     new_text = pyqtSignal(str)
     error    = pyqtSignal(str)
 
-    def __init__(self, conn: SSHConnection, path: str):
+    def __init__(self, conn, path: str):
         super().__init__()
         self._conn = conn
         self._path = path
@@ -126,24 +745,29 @@ class TailWorker(QThread):
         self._stop = True
 
     def run(self):
+        chan = None
         try:
-            transport = self._conn.client.get_transport()
-            chan = transport.open_session()
-            chan.exec_command(f'tail -f "{self._path}"')
+            chan = self._conn.open_tail_channel(self._path)
             buf = b''
             while not self._stop:
-                if chan.recv_ready():
-                    buf += chan.recv(4096)
+                if chan.recv_ready(0.1):
+                    data = chan.recv(4096)
+                    if not data:
+                        time.sleep(0.05)
+                        continue
+                    buf += data
                     parts = buf.split(b'\n')
                     buf   = parts[-1]
                     text  = b'\n'.join(parts[:-1]).decode('utf-8', errors='replace')
                     if text:
                         self.new_text.emit(text)
                 else:
-                    time.sleep(0.1)
-            chan.close()
+                    time.sleep(0.05)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if chan:
+                chan.close()
 
 
 # ---------------------------------------------------------------------------
@@ -170,36 +794,152 @@ def _filter_lines(lines: list[str], pattern: str, level: str) -> list[str]:
 
 
 class LogHighlighter(QSyntaxHighlighter):
-    _LEVELS = [
-        (re.compile(r'\b(?:ERROR|CRITICAL|FATAL|SEVERE)\b', re.I), '#3D1515', '#FF7070'),
-        (re.compile(r'\bWARN(?:ING)?\b', re.I),                    '#2D2512', '#E8B26A'),
-        (re.compile(r'\bINFO\b', re.I),                             '#1A2A1A', '#6A9F6A'),
-        (re.compile(r'\bDEBUG\b', re.I),                            None,      '#707070'),
-        (re.compile(r'\bTRACE\b', re.I),                            None,      '#505050'),
+    # レベル定義: (正規表現, テーマキー prefix)。色はテーマから引く。
+    _LEVEL_PATTERNS = [
+        (re.compile(r'\b(?:ERROR|CRITICAL|FATAL|SEVERE)\b', re.I), 'error'),
+        (re.compile(r'\bWARN(?:ING)?\b', re.I),                    'warn'),
+        (re.compile(r'\bINFO\b', re.I),                             'info'),
+        (re.compile(r'\bDEBUG\b', re.I),                            'debug'),
+        (re.compile(r'\bTRACE\b', re.I),                            'trace'),
     ]
+    # (正規表現, テーマキー) — 色はテーマから取得
     _INLINE = [
-        (re.compile(r'\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})?'), '#4EC9B0'),
-        (re.compile(r'\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b'),  '#4EC9B0'),
-        (re.compile(r'\[[\w\s.:\-/]+\]'),                    '#9876AA'),
-        (re.compile(r'\b\w+(?:Exception|Error)\b'),           '#FF7070'),
-        (re.compile(r'^\s+at\s+[\w.$<>()\[\]/]+'),           '#CC7832'),
-        (re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'), '#4EC9B0'),
-        (re.compile(r'\b[45]\d{2}\b'),                        '#FF7070'),
+        (re.compile(r'\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?(?:Z|[+-]\d{2}:\d{2})?'), 'syn_timestamp'),
+        (re.compile(r'\b\d{2}:\d{2}:\d{2}(?:[.,]\d+)?\b'),      'syn_timestamp'),
+        (re.compile(r'\[[\w\s.:\-/]+\]'),                        'syn_bracket'),
+        (re.compile(r'\b\w+(?:Exception|Error)\b'),              'syn_exception'),
+        (re.compile(r'^\s+at\s+[\w.$<>()\[\]/]+'),               'syn_stack'),
+        (re.compile(r'\b\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}\b'),  'syn_timestamp'),
+        # HTTPステータスコード(4xx/5xx) ハイライトは産業ログでの誤検出が多いため無効化
     ]
 
+    # --- SQL 検出パターン ---
+    # SQL指標：これらが見つかった行のみSQLハイライトを適用 (誤検出抑止)
+    _SQL_INDICATOR = re.compile(
+        r'\b(?:SELECT|INSERT\s+INTO|UPDATE\s+\w+\s+SET|DELETE\s+FROM|'
+        r'CREATE\s+(?:TABLE|INDEX|VIEW|DATABASE|SCHEMA)|'
+        r'ALTER\s+TABLE|DROP\s+(?:TABLE|INDEX|VIEW)|'
+        r'WITH\s+\w+\s+AS|MERGE\s+INTO|TRUNCATE\s+TABLE)\b',
+        re.IGNORECASE,
+    )
+    _SQL_KEYWORDS = re.compile(
+        r'\b(?:SELECT|FROM|WHERE|AND|OR|NOT|IN|IS|NULL|LIKE|ILIKE|BETWEEN|EXISTS|'
+        r'INSERT|INTO|VALUES|UPDATE|SET|DELETE|TRUNCATE|'
+        r'CREATE|TABLE|INDEX|VIEW|DATABASE|SCHEMA|SEQUENCE|TRIGGER|'
+        r'ALTER|DROP|ADD|COLUMN|MODIFY|RENAME|'
+        r'JOIN|INNER|LEFT|RIGHT|FULL|OUTER|CROSS|ON|USING|AS|'
+        r'GROUP\s+BY|ORDER\s+BY|HAVING|LIMIT|OFFSET|FETCH|DISTINCT|'
+        r'UNION(?:\s+ALL)?|EXCEPT|INTERSECT|ALL|ANY|SOME|'
+        r'CASE|WHEN|THEN|ELSE|END|'
+        r'WITH|RECURSIVE|OVER|PARTITION\s+BY|ROW|RANGE|'
+        r'BEGIN|COMMIT|ROLLBACK|TRANSACTION|SAVEPOINT|'
+        r'PRIMARY\s+KEY|FOREIGN\s+KEY|REFERENCES|UNIQUE|DEFAULT|CHECK|CONSTRAINT|'
+        r'IF\s+(?:NOT\s+)?EXISTS|REPLACE|MERGE|MATCHED)\b',
+        re.IGNORECASE,
+    )
+    _SQL_TYPES = re.compile(
+        r'\b(?:INT|INTEGER|BIGINT|SMALLINT|TINYINT|FLOAT|DOUBLE|DECIMAL|NUMERIC|REAL|'
+        r'CHAR|VARCHAR|TEXT|NVARCHAR|NCHAR|CLOB|'
+        r'DATE|TIME|DATETIME|TIMESTAMP|'
+        r'BOOLEAN|BOOL|BIT|BINARY|VARBINARY|BLOB|'
+        r'JSON|JSONB|XML|UUID)\b',
+        re.IGNORECASE,
+    )
+    _SQL_FUNCTIONS = re.compile(
+        r'\b(?:COUNT|SUM|AVG|MIN|MAX|COALESCE|NULLIF|IFNULL|NVL|'
+        r'UPPER|LOWER|TRIM|LTRIM|RTRIM|LENGTH|LEN|SUBSTRING|SUBSTR|CONCAT|REPLACE|'
+        r'NOW|GETDATE|CURRENT_DATE|CURRENT_TIME|CURRENT_TIMESTAMP|EXTRACT|DATEADD|DATEDIFF|'
+        r'CAST|CONVERT|TO_CHAR|TO_DATE|TO_NUMBER|'
+        r'ROW_NUMBER|RANK|DENSE_RANK|LEAD|LAG|FIRST_VALUE|LAST_VALUE|'
+        r'ROUND|FLOOR|CEIL|CEILING|ABS|MOD|POWER|SQRT)\b(?=\s*\()',
+        re.IGNORECASE,
+    )
+    _SQL_STRING = re.compile(r"'(?:[^'\\]|\\.|'')*'")
+    _SQL_COMMENT = re.compile(r'--[^\n]*')
+    _SQL_NUMBER = re.compile(r'\b\d+(?:\.\d+)?\b')
+
+    # ファイル拡張子で全文SQLモード
+    _SQL_FILE_EXTS = ('.sql', '.ddl', '.dml', '.pls', '.plsql')
+
+    def __init__(self, document, mode: str = 'log'):
+        super().__init__(document)
+        self._mode = mode
+
+    @classmethod
+    def detect_mode_for_file(cls, filename: str) -> str:
+        name = filename.lower()
+        # .gz は中身の拡張子で判定
+        if name.endswith('.gz'):
+            name = name[:-3]
+        if any(name.endswith(ext) for ext in cls._SQL_FILE_EXTS):
+            return 'sql'
+        return 'log'
+
+    def set_mode(self, mode: str):
+        if mode != self._mode:
+            self._mode = mode
+            self.rehighlight()
+
     def highlightBlock(self, text: str):
-        for pat, bg, fg in self._LEVELS:
+        if self._mode == 'sql':
+            self._apply_sql(text)
+            return
+
+        # --- ログモード ---
+        t = _theme()
+        for pat, key in self._LEVEL_PATTERNS:
             if pat.search(text):
                 fmt = QTextCharFormat()
+                bg = t.get(f'level_{key}_bg')
+                fg = t.get(f'level_{key}_fg')
                 if bg: fmt.setBackground(QColor(bg))
-                fmt.setForeground(QColor(fg))
+                if fg: fmt.setForeground(QColor(fg))
                 self.setFormat(0, len(text), fmt)
                 break
-        for pat, color in self._INLINE:
+        for pat, key in self._INLINE:
             fmt = QTextCharFormat()
-            fmt.setForeground(QColor(color))
+            fmt.setForeground(QColor(t.get(key, '#888888')))
             for m in pat.finditer(text):
                 self.setFormat(m.start(), m.end() - m.start(), fmt)
+        # ログ中にSQLが含まれる行のみSQL要素を上書き色分け
+        if self._SQL_INDICATOR.search(text):
+            self._apply_sql(text)
+
+    def _apply_sql(self, text: str):
+        t = _theme()
+        # 順番: キーワード/型/関数 → 文字列 → 数値 → コメント
+        kw_fmt = QTextCharFormat()
+        kw_fmt.setForeground(QColor(t['syn_sql_kw']))
+        kw_fmt.setFontWeight(700)
+        for m in self._SQL_KEYWORDS.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), kw_fmt)
+
+        type_fmt = QTextCharFormat()
+        type_fmt.setForeground(QColor(t['syn_sql_type']))
+        type_fmt.setFontWeight(700)
+        for m in self._SQL_TYPES.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), type_fmt)
+
+        fn_fmt = QTextCharFormat()
+        fn_fmt.setForeground(QColor(t['syn_sql_func']))
+        for m in self._SQL_FUNCTIONS.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), fn_fmt)
+
+        num_fmt = QTextCharFormat()
+        num_fmt.setForeground(QColor(t['syn_sql_num']))
+        for m in self._SQL_NUMBER.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), num_fmt)
+
+        str_fmt = QTextCharFormat()
+        str_fmt.setForeground(QColor(t['syn_sql_str']))
+        for m in self._SQL_STRING.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), str_fmt)
+
+        cm_fmt = QTextCharFormat()
+        cm_fmt.setForeground(QColor(t['syn_sql_cmt']))
+        cm_fmt.setFontItalic(True)
+        for m in self._SQL_COMMENT.finditer(text):
+            self.setFormat(m.start(), m.end() - m.start(), cm_fmt)
 
 
 # ---------------------------------------------------------------------------
@@ -230,35 +970,31 @@ class MiniLogViewer(QWidget):
 
         # ── ヘッダー（サーバー色） ────────────────────────────────────
         header = QWidget()
-        header.setFixedHeight(22)
-        header.setStyleSheet(f"background:{self._bg};")
+        header.setFixedHeight(30)
         hl = QHBoxLayout(header)
         hl.setContentsMargins(5, 0, 2, 0)
         hl.setSpacing(4)
 
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color:{self._fg}; font-size:9px;")
-        dot.setFixedWidth(10)
-        hl.addWidget(dot)
+        self._header = header
+        self._header_dot = QLabel("●")
+        self._header_dot.setFixedWidth(10)
+        hl.addWidget(self._header_dot)
 
-        lbl = QLabel(f"{self.server_label}  ·  {os.path.basename(self.filepath)}")
-        lbl.setStyleSheet(f"color:{self._fg}; font-size:10px; font-weight:600;")
-        lbl.setToolTip(self.filepath)
-        hl.addWidget(lbl, 1)
+        self._header_lbl = QLabel(
+            f"{self.server_label}  ·  {os.path.basename(self.filepath)}"
+        )
+        self._header_lbl.setToolTip(self.filepath)
+        hl.addWidget(self._header_lbl, 1)
 
+        self._header_btns: list[QPushButton] = []
         for text, tip, slot, check in [
-            ("⏩", "Tail -f", None, True),
+            ("⏩", "Tail -F (リアルタイム追従 / ログローテーション自動追従)", None, True),
             ("↺",  "再読み込み", self._load, False),
             ("✕",  "閉じる", lambda: self.close_requested.emit(self), False),
         ]:
             btn = QPushButton(text)
-            btn.setFixedSize(20, 18)
+            btn.setFixedSize(30, 26)
             btn.setToolTip(tip)
-            btn.setStyleSheet(
-                "QPushButton{background:#00000040;color:#ccc;border:none;font-size:10px;}"
-                "QPushButton:hover{background:#00000080;}"
-                "QPushButton:checked{background:#214283;}"
-            )
             if check:
                 btn.setCheckable(True)
                 self.tail_btn = btn
@@ -266,20 +1002,20 @@ class MiniLogViewer(QWidget):
             else:
                 btn.clicked.connect(slot)
             hl.addWidget(btn)
+            self._header_btns.append(btn)
         root.addWidget(header)
 
         # ── フィルタバー（超コンパクト） ─────────────────────────────
-        fbar = QWidget()
-        fbar.setFixedHeight(20)
-        fbar.setStyleSheet("background:#252525;")
-        fl = QHBoxLayout(fbar)
+        self._fbar = QWidget()
+        self._fbar.setFixedHeight(20)
+        fl = QHBoxLayout(self._fbar)
         fl.setContentsMargins(4, 1, 4, 1)
         fl.setSpacing(3)
 
         self.filter_input = QLineEdit()
         self.filter_input.setPlaceholderText("フィルタ...")
-        self.filter_input.setStyleSheet(
-            "background:#333;color:#a9b7c6;border:none;padding:0 2px;font-size:10px;"
+        self.filter_input.setToolTip(
+            "このセルだけのフィルタ — 検索文字列または正規表現 (即時反映)"
         )
         self.filter_input.textChanged.connect(self._apply_filter)
         fl.addWidget(self.filter_input, 1)
@@ -287,32 +1023,84 @@ class MiniLogViewer(QWidget):
         self.level_combo = QComboBox()
         self.level_combo.addItems(["ALL", "ERR+", "WRN+", "INF+"])
         self.level_combo.setFixedWidth(52)
-        self.level_combo.setStyleSheet(
-            "background:#333;color:#a9b7c6;border:none;font-size:10px;"
-            "QComboBox::drop-down{border:none;width:12px;}"
+        self.level_combo.setToolTip(
+            "このセルだけのレベルフィルタ:\n"
+            "  ALL  = 全行\n"
+            "  ERR+ = ERROR/CRITICAL/FATAL のみ\n"
+            "  WRN+ = WARN以上\n"
+            "  INF+ = INFO以上"
         )
         self.level_combo.currentIndexChanged.connect(self._apply_filter)
         fl.addWidget(self.level_combo)
-        root.addWidget(fbar)
+        root.addWidget(self._fbar)
 
         # ── テキストエリア ────────────────────────────────────────────
         self.text = QPlainTextEdit()
         self.text.setReadOnly(True)
-        self.text.setFont(QFont("Consolas", 9))
-        self.text.setStyleSheet(
-            "background:#1a1a1a;color:#a9b7c6;border:none;"
-            "selection-background-color:#214283;"
-        )
-        self.highlighter = LogHighlighter(self.text.document())
+        mode = LogHighlighter.detect_mode_for_file(self.filepath)
+        self.highlighter = LogHighlighter(self.text.document(), mode=mode)
         root.addWidget(self.text, 1)
 
         # ── ステータス（超コンパクト） ────────────────────────────────
         self.stats = QLabel("")
         self.stats.setFixedHeight(14)
-        self.stats.setStyleSheet(
-            "background:#222;color:#555;padding:0 4px;font-size:9px;"
-        )
         root.addWidget(self.stats)
+
+        self.apply_settings()
+
+    def apply_settings(self):
+        fs = SETTINGS.get('log_font_size', 9)
+        t = _theme()
+        # サーバー識別色をテーマに応じて再取得
+        self._bg, self._fg = _palette(self.color_idx)
+        self._header.setStyleSheet(f"background:{self._bg};")
+        self._header_dot.setStyleSheet(f"color:{self._fg}; font-size:9px;")
+        self._header_lbl.setStyleSheet(
+            f"color:{self._fg}; font-size:10px; font-weight:600;"
+        )
+        # ヘッダー上のミニボタンのスタイルもテーマに合わせる
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        if is_light:
+            mini_btn_style = (
+                f"QPushButton{{background:#ffffff80;color:{self._fg};border:none;"
+                f"font-size:13px;font-weight:bold;}}"
+                f"QPushButton:hover{{background:#ffffffc0;}}"
+                f"QPushButton:checked{{background:{t['selection']};color:{t['text']};}}"
+            )
+        else:
+            mini_btn_style = (
+                "QPushButton{background:#00000060;color:#ffffff;border:none;"
+                "font-size:13px;font-weight:bold;}"
+                "QPushButton:hover{background:#000000a0;}"
+                f"QPushButton:checked{{background:{t['selection']};}}"
+            )
+        for btn in self._header_btns:
+            btn.setStyleSheet(mini_btn_style)
+
+        self.text.setFont(QFont("Consolas", fs))
+        self.text.setStyleSheet(
+            f"background:{t['log_bg']};color:{t['text']};border:none;"
+            f"selection-background-color:{t['selection']};"
+        )
+        self._fbar.setStyleSheet(f"background:{t['toolbar_bg']};")
+        self.filter_input.setStyleSheet(
+            f"background:{t['panel_bg']};color:{t['text']};"
+            f"border:1px solid {t['border']};padding:0 2px;font-size:10px;"
+        )
+        self.level_combo.setStyleSheet(
+            f"background:{t['panel_bg']};color:{t['text']};"
+            f"border:1px solid {t['border']};font-size:10px;"
+            "QComboBox::drop-down{border:none;width:12px;}"
+        )
+        self.stats.setStyleSheet(
+            f"background:{t['toolbar_bg']};color:{t['text_dim']};"
+            f"padding:0 4px;font-size:9px;"
+        )
+        # レベル色など Theme 連動のハイライトを再適用
+        try:
+            self.highlighter.rehighlight()
+        except Exception:
+            pass
 
     # ── データ操作 ─────────────────────────────────────────────────────
 
@@ -387,12 +1175,20 @@ class MiniLogViewer(QWidget):
 class EmptyCell(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setStyleSheet("background:#141414; border:1px solid #242424;")
-        lbl = QLabel("空き\nファイルをダブルクリックで開く")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        lbl.setStyleSheet("color:#303030; font-size:11px; border:none;")
+        self._label = QLabel("空き\nファイルをダブルクリックで開く")
+        self._label.setAlignment(Qt.AlignmentFlag.AlignCenter)
         lay = QVBoxLayout(self)
-        lay.addWidget(lbl)
+        lay.addWidget(self._label)
+        self.apply_settings()
+
+    def apply_settings(self):
+        t = _theme()
+        self.setStyleSheet(
+            f"background:{t['log_bg']}; border:1px solid {t['border']};"
+        )
+        self._label.setStyleSheet(
+            f"color:{t['text_dim']}; font-size:11px; border:none;"
+        )
 
 
 # ---------------------------------------------------------------------------
@@ -459,15 +1255,17 @@ class LogGrid(QWidget):
         for extra in self._slots[n:]:
             v = extra.viewer()
             if v: v.stop_tail()
+            extra.setParent(None)
             extra.deleteLater()
         self._slots = self._slots[:n]
 
-        # 既存スプリッターを除去
+        # 既存スプリッターを除去 (kept slots は先に親解除して退避)
         if self._hsplit:
             for slot in self._slots:
                 slot.setParent(None)
             self._outer.removeWidget(self._hsplit)
             self._hsplit.deleteLater()
+            self._hsplit = None
 
         # ネストされた QSplitter を構築
         hsplit = QSplitter(Qt.Orientation.Horizontal)
@@ -479,6 +1277,10 @@ class LogGrid(QWidget):
             for row in range(self._rows):
                 slot = self._slots[row * self._cols + col]
                 vsplit.addWidget(slot)
+                slot.show()  # setParent(None) で隠れていた場合に備え明示表示
+                v = slot.viewer()
+                if v:
+                    v.show()
                 vsplit.setStretchFactor(row, 1)
             hsplit.addWidget(vsplit)
             hsplit.setStretchFactor(col, 1)
@@ -486,20 +1288,25 @@ class LogGrid(QWidget):
 
         self._hsplit = hsplit
         self._outer.addWidget(hsplit)
+        hsplit.show()
 
-        # レイアウト確定後に均等分割を強制適用
-        QTimer.singleShot(0, self._equalize)
+        # レイアウト確定後に均等分割を適用 (幅が確定するまで少し待つ)
+        QTimer.singleShot(30, self._equalize)
 
     def _equalize(self):
-        """全スプリッターを均等分割する"""
+        """全スプリッターを均等分割する。幅が未確定なら no-op (stretch factor に委ねる)。"""
         if not self._hsplit:
             return
         w = self._hsplit.width()
         h = self._hsplit.height()
-        if w > 0 and self._cols > 0:
+        # 幅未確定の場合は setSizes(0) を避け、再試行
+        if w < 50 or h < 50:
+            QTimer.singleShot(50, self._equalize)
+            return
+        if self._cols > 0:
             self._hsplit.setSizes([w // self._cols] * self._cols)
         for vsplit in self._vsplits:
-            if h > 0 and self._rows > 0:
+            if self._rows > 0:
                 vsplit.setSizes([h // self._rows] * self._rows)
 
     def resizeEvent(self, event):
@@ -532,6 +1339,15 @@ class LogGrid(QWidget):
     def apply_filter(self, pattern: str, level: str):
         for v in self.viewers(): v.set_filter(pattern, level)
 
+    def apply_settings(self):
+        """テーマ変更時に空セル/ビューア両方を更新"""
+        for slot in self._slots:
+            child = slot._child
+            if isinstance(child, EmptyCell):
+                child.apply_settings()
+            elif isinstance(child, MiniLogViewer):
+                child.apply_settings()
+
 
 # ---------------------------------------------------------------------------
 # リモートファイルブラウザ（1サーバー分）
@@ -539,9 +1355,11 @@ class LogGrid(QWidget):
 
 class ServerPanel(QWidget):
     """1サーバーの接続状態＋ファイルツリー"""
-    file_open_requested  = pyqtSignal(object, str, int)   # conn, path, color_idx
-    disconnect_requested = pyqtSignal(object)             # self
-    save_dir_requested   = pyqtSignal(object, str)        # self, path
+    file_open_requested    = pyqtSignal(object, str, int)   # conn, path, color_idx
+    edit_open_requested    = pyqtSignal(object, str)        # conn, path
+    disconnect_requested   = pyqtSignal(object)             # self
+    save_dir_requested     = pyqtSignal(object, str)        # self, path
+    terminal_requested     = pyqtSignal(object)             # self
 
     def __init__(self, conn: SSHConnection, color_idx: int,
                  initial_path: str = '/var/log', parent=None):
@@ -558,81 +1376,162 @@ class ServerPanel(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(1)
 
-        # サーバーヘッダー
-        header = QWidget()
-        header.setFixedHeight(24)
-        header.setStyleSheet(f"background:{self._bg};")
-        hl = QHBoxLayout(header)
+        # サーバーヘッダー (apply_settings で配色を都度更新)
+        self._header = QWidget()
+        self._header.setFixedHeight(24)
+        hl = QHBoxLayout(self._header)
         hl.setContentsMargins(6, 0, 4, 0)
         hl.setSpacing(4)
-        dot = QLabel("●")
-        dot.setStyleSheet(f"color:{self._fg}; font-size:10px;")
-        hl.addWidget(dot)
-        lbl = QLabel(self.conn.label)
-        lbl.setStyleSheet(f"color:{self._fg}; font-size:11px; font-weight:600;")
-        hl.addWidget(lbl, 1)
-        disc = QPushButton("切断")
-        disc.setFixedHeight(18)
-        disc.setStyleSheet(
-            "QPushButton{background:#00000050;color:#aaa;border:none;padding:0 6px;font-size:10px;}"
-            "QPushButton:hover{background:#00000090;}"
-        )
-        disc.clicked.connect(lambda: self.disconnect_requested.emit(self))
-        hl.addWidget(disc)
-        layout.addWidget(header)
+        self._header_dot = QLabel("●")
+        hl.addWidget(self._header_dot)
+        proto_tag = getattr(self.conn, 'protocol', 'ssh').upper()
+        self._header_lbl = QLabel(f"[{proto_tag}] {self.conn.label}")
+        hl.addWidget(self._header_lbl, 1)
 
-        # パスバー
+        self._term_btn = QPushButton("⌨ ターミナル")
+        self._term_btn.setFixedHeight(18)
+        self._term_btn.setToolTip("ターミナルを開く")
+        self._term_btn.clicked.connect(lambda: self.terminal_requested.emit(self))
+        hl.addWidget(self._term_btn)
+
+        self._disc_btn = QPushButton("切断")
+        self._disc_btn.setFixedHeight(18)
+        self._disc_btn.clicked.connect(lambda: self.disconnect_requested.emit(self))
+        hl.addWidget(self._disc_btn)
+        layout.addWidget(self._header)
+
+        # パスバーラベル
+        self._path_hint = QLabel("📁 表示中のフォルダ:")
+        self._path_hint.setStyleSheet("color:#888; font-size:10px; padding:2px 4px 0 4px;")
+        layout.addWidget(self._path_hint)
+
         path_row = QHBoxLayout()
         path_row.setContentsMargins(2, 1, 2, 1)
         path_row.setSpacing(2)
         self.path_input = QLineEdit(self._initial_path)
-        self.path_input.setStyleSheet(
-            "background:#222;color:#a9b7c6;border:none;padding:1px 3px;font-size:10px;"
-        )
+        self.path_input.setToolTip("リモートサーバーのフォルダパスを入力して Enter または → で移動")
         self.path_input.returnPressed.connect(lambda: self._load(self.path_input.text()))
         go_btn = QPushButton("→")
         go_btn.setFixedSize(20, 18)
-        go_btn.setStyleSheet("background:#333;color:#aaa;border:none;")
+        go_btn.setToolTip("入力したフォルダに移動")
+        go_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-weight:bold;")
         go_btn.clicked.connect(lambda: self._load(self.path_input.text()))
+        refresh_btn = QPushButton("↻")
+        refresh_btn.setFixedSize(22, 18)
+        refresh_btn.setToolTip(
+            "現在のフォルダを再読み込み (ローテーションされた新ファイルを表示)"
+        )
+        refresh_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-size:13px;font-weight:bold;")
+        refresh_btn.clicked.connect(lambda: self._load(self.path_input.text()))
         save_btn = QPushButton("📌")
         save_btn.setFixedSize(22, 18)
-        save_btn.setToolTip("現在のDIRをプロファイルに保存")
-        save_btn.setStyleSheet("background:#333;color:#aaa;border:none;font-size:11px;")
+        save_btn.setToolTip("現在のフォルダを「次回接続時の初期DIR」としてプロファイルに保存")
+        save_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-size:11px;")
         save_btn.clicked.connect(
             lambda: self.save_dir_requested.emit(self, self.path_input.text())
         )
         path_row.addWidget(self.path_input, 1)
         path_row.addWidget(go_btn)
+        path_row.addWidget(refresh_btn)
         path_row.addWidget(save_btn)
         layout.addLayout(path_row)
 
-        # クイックアクセス
+        # クイックアクセス — コンテナにまとめて一括表示/非表示可能に
+        self._quick_container = QWidget()
+        quick_vl = QVBoxLayout(self._quick_container)
+        quick_vl.setContentsMargins(0, 0, 0, 0)
+        quick_vl.setSpacing(0)
+
+        self._quick_hint = QLabel("⚡ クイックジャンプ:")
+        self._quick_hint.setStyleSheet("color:#888; font-size:10px; padding:4px 4px 0 4px;")
+        quick_vl.addWidget(self._quick_hint)
+
         quick = QHBoxLayout()
         quick.setContentsMargins(2, 0, 2, 0)
         quick.setSpacing(2)
-        for label, path in [("/var/log", "/var/log"), ("~", "~"), ("/tmp", "/tmp")]:
+        self._quick_btns: list[QPushButton] = []
+        quick_items = [
+            ("📋 ログ",   "/var/log", "/var/log — Linux標準のシステム・アプリログ保管DIR"),
+            ("🏠 ホーム", "~",        "~ — ログインユーザーのホームDIR"),
+            ("🗂 /tmp",  "/tmp",     "/tmp — 一時ファイル領域"),
+        ]
+        for label, path, tip in quick_items:
             btn = QPushButton(label)
-            btn.setFixedHeight(16)
-            btn.setStyleSheet(
-                "background:#2a2a2a;color:#888;border:none;padding:0 3px;font-size:9px;"
-            )
+            btn.setFixedHeight(18)
+            btn.setToolTip(tip)
             btn.clicked.connect(lambda _, p=path: self._load(p))
             quick.addWidget(btn)
+            self._quick_btns.append(btn)
         quick.addStretch()
-        layout.addLayout(quick)
+        quick_vl.addLayout(quick)
+        layout.addWidget(self._quick_container)
+
+        # ファイルツリーラベル
+        self._tree_hint = QLabel("📄 ダブルクリックでログを開く:")
+        self._tree_hint.setStyleSheet("color:#888; font-size:10px; padding:4px 4px 0 4px;")
+        layout.addWidget(self._tree_hint)
 
         # ファイルツリー
         self.tree = QTreeWidget()
         self.tree.setHeaderHidden(True)
-        self.tree.setStyleSheet(
-            "QTreeWidget{background:#1e1e1e;color:#a9b7c6;border:none;font-size:10px;}"
-            "QTreeWidget::item{padding:1px 0;}"
-            "QTreeWidget::item:selected{background:#214283;}"
-            "QTreeWidget::item:hover{background:#2a2a2a;}"
-        )
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.itemExpanded.connect(self._on_expand)
+        self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         layout.addWidget(self.tree, 1)
+
+        self.apply_settings()
+
+    def apply_settings(self):
+        fs = SETTINGS.get('tree_font_size', 10)
+        t = _theme()
+        # サーバー識別色をテーマに応じて取り直し、ヘッダーを再着色
+        self._bg, self._fg = _palette(self.color_idx)
+        self._header.setStyleSheet(f"background:{self._bg};")
+        self._header_dot.setStyleSheet(f"color:{self._fg}; font-size:10px;")
+        self._header_lbl.setStyleSheet(
+            f"color:{self._fg}; font-size:11px; font-weight:600;"
+        )
+        # ヘッダー上のボタン: 暗ヘッダーなら白文字、明ヘッダーなら濃色文字
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        if is_light:
+            hdr_btn_style = (
+                f"QPushButton{{background:#ffffff80;color:{self._fg};border:none;"
+                f"padding:0 8px;font-size:11px;font-weight:600;}}"
+                f"QPushButton:hover{{background:#ffffffc0;}}"
+            )
+        else:
+            hdr_btn_style = (
+                "QPushButton{background:#00000060;color:#ffffff;border:none;"
+                "padding:0 8px;font-size:11px;font-weight:600;}"
+                "QPushButton:hover{background:#000000a0;}"
+            )
+        self._term_btn.setStyleSheet(hdr_btn_style)
+        self._disc_btn.setStyleSheet(hdr_btn_style)
+
+        # サイドバー本体
+        self.path_input.setStyleSheet(
+            f"background:{t['panel_bg']};color:{t['text']};"
+            f"border:1px solid {t['border']};"
+            f"padding:1px 3px;font-size:{fs}px;"
+        )
+        for btn in self._quick_btns:
+            btn.setStyleSheet(
+                f"background:{t['control_bg']};color:{t['text_dim']};border:none;"
+                f"padding:0 3px;font-size:{max(fs-1, 7)}px;"
+            )
+        self.tree.setStyleSheet(
+            f"QTreeWidget{{background:{t['panel_bg']};color:{t['text']};border:none;font-size:{fs}px;}}"
+            f"QTreeWidget::item{{padding:1px 0;}}"
+            f"QTreeWidget::item:selected{{background:{t['selection']};}}"
+            f"QTreeWidget::item:hover{{background:{t['control_bg']};}}"
+        )
+        # 表示/非表示の切り替え (画面の縦スペースを節約)
+        self._quick_container.setVisible(SETTINGS.get('show_quick_jump', True))
+        show_hints = SETTINGS.get('show_panel_hints', True)
+        self._path_hint.setVisible(show_hints)
+        self._quick_hint.setVisible(show_hints)
+        self._tree_hint.setVisible(show_hints)
 
     def _load(self, path: str):
         if path.strip() == '~':
@@ -672,6 +1571,34 @@ class ServerPanel(QWidget):
         if d and not d['is_dir']:
             self.file_open_requested.emit(self.conn, d['path'], self.color_idx)
 
+    def _on_tree_context_menu(self, pos):
+        """ツリーの右クリックメニュー (ファイルのみ)。"""
+        from PyQt6.QtWidgets import QMenu
+        item = self.tree.itemAt(pos)
+        if not item:
+            return
+        d = item.data(0, Qt.ItemDataRole.UserRole)
+        if not d or d.get('is_dir'):
+            return  # フォルダにはメニューを出さない
+
+        menu = QMenu(self)
+        menu.setStyleSheet(
+            "QMenu{background:#2b2b2b;color:#e0e0e0;border:1px solid #555;}"
+            "QMenu::item{padding:6px 18px;}"
+            "QMenu::item:selected{background:#214283;}"
+            "QMenu::separator{height:1px;background:#444;margin:4px 8px;}"
+        )
+
+        act_log = menu.addAction("📊 ログビューアで開く (グリッドに追加)")
+        menu.addSeparator()
+        act_edit = menu.addAction("📝 テキストエディタで開く (ダウンロード)")
+
+        chosen = menu.exec(self.tree.viewport().mapToGlobal(pos))
+        if chosen == act_log:
+            self.file_open_requested.emit(self.conn, d['path'], self.color_idx)
+        elif chosen == act_edit:
+            self.edit_open_requested.emit(self.conn, d['path'])
+
 
 # ---------------------------------------------------------------------------
 # SSH接続ダイアログ
@@ -680,7 +1607,7 @@ class ServerPanel(QWidget):
 class SSHConnectDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("SSH接続")
+        self.setWindowTitle("サーバー接続")
         self.setMinimumWidth(380)
         self._profiles = _load_profiles()
         self._build_ui()
@@ -705,6 +1632,17 @@ class SSHConnectDialog(QDialog):
             pr.addWidget(btn)
         lay.addLayout(pr)
 
+        # プロトコル選択
+        proto_row = QHBoxLayout()
+        proto_row.addWidget(QLabel("プロトコル:"))
+        self.proto_combo = QComboBox()
+        self.proto_combo.addItems(["SSH", "Telnet"])
+        self.proto_combo.setFixedWidth(90)
+        self.proto_combo.currentTextChanged.connect(self._on_proto_change)
+        proto_row.addWidget(self.proto_combo)
+        proto_row.addStretch()
+        lay.addLayout(proto_row)
+
         g = QGridLayout()
         g.setSpacing(4)
         fields = [
@@ -716,8 +1654,10 @@ class SSHConnectDialog(QDialog):
             ("ログDIR:",    "log_dir",  "/var/log",               False),
         ]
         self._fields: dict[str, QLineEdit] = {}
+        self._field_rows: dict[str, list] = {}  # ラベル + 入力 widget の参照
         for r, (label, key, ph, pw) in enumerate(fields):
-            g.addWidget(QLabel(label), r, 0)
+            lbl = QLabel(label)
+            g.addWidget(lbl, r, 0)
             le = QLineEdit()
             le.setPlaceholderText(ph)
             if pw: le.setEchoMode(QLineEdit.EchoMode.Password)
@@ -731,8 +1671,10 @@ class SSHConnectDialog(QDialog):
                 btn.clicked.connect(self._browse_key)
                 row.addWidget(btn)
                 g.addLayout(row, r, 1)
+                self._field_rows[key] = [lbl, le, btn]
             else:
                 g.addWidget(le, r, 1)
+                self._field_rows[key] = [lbl, le]
         lay.addLayout(g)
 
         btns = QHBoxLayout()
@@ -760,11 +1702,37 @@ class SSHConnectDialog(QDialog):
         p = self._profiles.get(self.combo.currentText(), {})
         for k, le in self._fields.items():
             le.setText(str(p.get(k, '')))
+        proto = p.get('protocol', 'SSH')
+        i = self.proto_combo.findText(proto)
+        if i >= 0:
+            self.proto_combo.setCurrentIndex(i)
+
+    def _on_proto_change(self, text: str):
+        is_telnet = (text == 'Telnet')
+        # デフォルトポート切替（ユーザーが触っていれば尊重）
+        cur_port = self._fields['port'].text().strip()
+        if cur_port in ('', '22', '23'):
+            self._fields['port'].setText('23' if is_telnet else '22')
+        # Telnet では秘密鍵欄を無効化
+        for w in self._field_rows.get('key_path', []):
+            w.setEnabled(not is_telnet)
 
     def _save(self):
-        name, ok = QInputDialog.getText(self, "保存", "プロファイル名:")
+        current = self.combo.currentText()
+        default_name = '' if current == '-- 新規 --' else current
+        name, ok = QInputDialog.getText(
+            self, "保存", "プロファイル名:", text=default_name
+        )
         if not ok or not name.strip(): return
         name = name.strip()
+        if name in self._profiles and name != default_name:
+            ans = QMessageBox.question(
+                self, "上書き確認",
+                f"「{name}」は既に存在します。上書きしますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
         self._profiles[name] = self._info()
         _save_profiles(self._profiles)
         if self.combo.findText(name) < 0:
@@ -785,12 +1753,382 @@ class SSHConnectDialog(QDialog):
         if path: self._fields['key_path'].setText(path)
 
     def _info(self) -> dict:
-        return {k: le.text() for k, le in self._fields.items()}
+        d = {k: le.text() for k, le in self._fields.items()}
+        d['protocol'] = self.proto_combo.currentText()
+        return d
 
     def get_info(self) -> dict:
         info = self._info()
-        info['port'] = int(info.get('port') or 22)
+        proto = info.get('protocol', 'SSH')
+        default_port = 23 if proto == 'Telnet' else 22
+        info['port'] = int(info.get('port') or default_port)
         return info
+
+
+# ---------------------------------------------------------------------------
+# 設定ダイアログ
+# ---------------------------------------------------------------------------
+
+class SettingsDialog(QDialog):
+    """フォントサイズとテーマの設定。OK で SETTINGS を更新・保存。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("設定")
+        self.setMinimumWidth(360)
+        self._build_ui()
+
+    def _build_ui(self):
+        from PyQt6.QtWidgets import QSpinBox  # 既に import 済みだが明示
+
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(4)
+
+        # フォントサイズグループ
+        lay.addWidget(self._section_label("フォントサイズ"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+
+        self._spinners: dict[str, QSpinBox] = {}
+        rows = [
+            ("左サイドバー (DIRツリー):", 'tree_font_size',     7, 24),
+            ("ツールバー:",                'toolbar_font_size',  7, 24),
+            ("ログセル (本文):",           'log_font_size',      7, 24),
+            ("ターミナル:",                'terminal_font_size', 7, 24),
+        ]
+        for r, (label, key, lo, hi) in enumerate(rows):
+            grid.addWidget(QLabel(label), r, 0)
+            container, sp = self._make_spinner(key, lo, hi)
+            grid.addWidget(container, r, 1)
+            self._spinners[key] = sp
+        lay.addLayout(grid)
+
+        # テーマ
+        lay.addWidget(self._section_label("テーマ"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("プリセット:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
+        cur_theme = SETTINGS.get('theme', 'Dark')
+        i = self.theme_combo.findText(cur_theme)
+        if i >= 0:
+            self.theme_combo.setCurrentIndex(i)
+        theme_row.addWidget(self.theme_combo, 1)
+        lay.addLayout(theme_row)
+
+        # 左パネル表示オプション
+        lay.addWidget(self._section_label("左パネル表示"))
+        self.cb_quick_jump = QCheckBox("クイックジャンプ (📋ログ / 🏠ホーム / 🗂/tmp) を表示")
+        self.cb_quick_jump.setChecked(bool(SETTINGS.get('show_quick_jump', True)))
+        lay.addWidget(self.cb_quick_jump)
+        self.cb_panel_hints = QCheckBox("説明ラベル (📁 表示中のフォルダ・⚡クイック…等) を表示")
+        self.cb_panel_hints.setChecked(bool(SETTINGS.get('show_panel_hints', True)))
+        lay.addWidget(self.cb_panel_hints)
+
+        lay.addStretch()
+
+        # ボタン
+        btns = QHBoxLayout()
+        reset = QPushButton("デフォルトに戻す")
+        reset.clicked.connect(self._reset_defaults)
+        btns.addWidget(reset)
+        btns.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog{{background:{t['bg']};}}
+            QLabel{{color:{t['text']};}}
+            QCheckBox{{color:{t['text']}; padding:2px;}}
+            QComboBox{{background:{t['control_bg']};color:{t['text']};
+                      border:1px solid {t['border']};
+                      padding:2px 4px;min-height:24px;}}
+            QComboBox QAbstractItemView{{background:{t['panel_bg']};color:{t['text']};
+                                        selection-background-color:{t['selection']};}}
+            QPushButton{{background:{t['control_bg']};color:{t['text']};border:none;
+                        padding:4px 12px;border-radius:2px;}}
+            QPushButton:hover{{background:{t['control_hover']};}}
+            QPushButton:default{{background:{t['selection']};color:{t['text']};}}
+        """)
+
+    @staticmethod
+    def _section_label(text: str) -> QLabel:
+        t = _theme()
+        lbl = QLabel(text)
+        lbl.setStyleSheet(
+            f"color:{t['text_dim']}; background:{t['toolbar_bg']};"
+            f"font-weight:600; padding:4px 6px;"
+        )
+        return lbl
+
+    @staticmethod
+    def _make_spinner(key: str, lo: int, hi: int):
+        """[値] [△] [▽] の横並びスピナー (コンパクト)。"""
+        from PyQt6.QtWidgets import QSpinBox  # 念のため
+        t = _theme()
+        container = QWidget()
+        h = QHBoxLayout(container)
+        h.setContentsMargins(0, 0, 0, 0)
+        h.setSpacing(0)
+
+        sp = QSpinBox()
+        sp.setRange(lo, hi)
+        sp.setValue(int(SETTINGS.get(key, _DEFAULT_SETTINGS[key])))
+        sp.setSuffix(" px")
+        sp.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        sp.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        sp.setStyleSheet(
+            f"QSpinBox{{background:{t['panel_bg']};color:{t['text']};"
+            f"border:1px solid {t['border']};"
+            f"border-right:none;padding:1px 4px;}}"
+        )
+        sp.setFixedSize(60, 22)
+
+        btn_style = (
+            f"QPushButton{{background:{t['control_bg']};color:{t['text']};"
+            f"border:1px solid {t['border']};"
+            f"padding:0;margin:0;font-size:10px;font-weight:bold;}}"
+            f"QPushButton:hover{{background:{t['control_hover']};}}"
+            f"QPushButton:pressed{{background:{t['selection']};color:{t['text']};}}"
+        )
+
+        up = QPushButton("△")
+        up.setFixedSize(20, 22)
+        up.setAutoRepeat(True)
+        up.setAutoRepeatInterval(80)
+        up.setStyleSheet(btn_style)
+        up.setToolTip("増やす")
+        up.clicked.connect(lambda: sp.stepBy(+1))
+
+        down = QPushButton("▽")
+        down.setFixedSize(20, 22)
+        down.setAutoRepeat(True)
+        down.setAutoRepeatInterval(80)
+        down.setStyleSheet(btn_style)
+        down.setToolTip("減らす")
+        down.clicked.connect(lambda: sp.stepBy(-1))
+
+        h.addWidget(sp)
+        h.addWidget(up)
+        h.addWidget(down)
+        h.addStretch()
+        return container, sp
+
+    def _reset_defaults(self):
+        for k, sp in self._spinners.items():
+            sp.setValue(int(_DEFAULT_SETTINGS[k]))
+        i = self.theme_combo.findText(_DEFAULT_SETTINGS['theme'])
+        if i >= 0:
+            self.theme_combo.setCurrentIndex(i)
+        self.cb_quick_jump.setChecked(bool(_DEFAULT_SETTINGS['show_quick_jump']))
+        self.cb_panel_hints.setChecked(bool(_DEFAULT_SETTINGS['show_panel_hints']))
+
+    def accept(self):
+        for k, sp in self._spinners.items():
+            SETTINGS[k] = sp.value()
+        SETTINGS['theme'] = self.theme_combo.currentText()
+        SETTINGS['show_quick_jump']  = bool(self.cb_quick_jump.isChecked())
+        SETTINGS['show_panel_hints'] = bool(self.cb_panel_hints.isChecked())
+        try:
+            _save_settings(SETTINGS)
+        except Exception as e:
+            QMessageBox.warning(self, "保存エラー", str(e))
+        super().accept()
+
+
+# ---------------------------------------------------------------------------
+# 対話的ターミナル
+# ---------------------------------------------------------------------------
+
+class TerminalReader(QThread):
+    new_text = pyqtSignal(str)
+    error    = pyqtSignal(str)
+
+    def __init__(self, channel):
+        super().__init__()
+        self._chan = channel
+        self._stop = False
+
+    def stop(self):
+        self._stop = True
+
+    def run(self):
+        try:
+            while not self._stop:
+                if self._chan.recv_ready(0.1):
+                    data = self._chan.recv(4096)
+                    if not data:
+                        time.sleep(0.05)
+                        continue
+                    self.new_text.emit(data.decode('utf-8', errors='replace'))
+                else:
+                    time.sleep(0.05)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+
+
+class TerminalDialog(QDialog):
+    """SSH/Telnet で対話的にコマンドを送れるターミナル。"""
+
+    def __init__(self, conn, parent=None):
+        super().__init__(parent)
+        proto = getattr(conn, 'protocol', 'ssh').upper()
+        self.setWindowTitle(f"ターミナル [{proto}] — {conn.label}")
+        self.resize(820, 520)
+        self._conn = conn
+        self._chan = None
+        self._reader: TerminalReader | None = None
+        self._history: list[str] = []
+        self._hist_idx = 0
+        self._build_ui()
+        self._open_channel()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lay.setSpacing(3)
+
+        self.output = QPlainTextEdit()
+        self.output.setReadOnly(True)
+        lay.addWidget(self.output, 1)
+
+        row = QHBoxLayout()
+        row.setSpacing(3)
+        self.input = QLineEdit()
+        self.input.setPlaceholderText("コマンド (Enter で送信 / ↑↓で履歴)")
+        self.input.returnPressed.connect(self._send)
+        self.input.installEventFilter(self)
+        row.addWidget(self.input, 1)
+
+        send_btn = QPushButton("送信")
+        send_btn.clicked.connect(self._send)
+        row.addWidget(send_btn)
+
+        ctrlc_btn = QPushButton("Ctrl+C")
+        ctrlc_btn.setToolTip("中断シグナル送信 (0x03)")
+        ctrlc_btn.clicked.connect(lambda: self._send_raw(b'\x03'))
+        row.addWidget(ctrlc_btn)
+
+        clear_btn = QPushButton("クリア")
+        clear_btn.clicked.connect(self.output.clear)
+        row.addWidget(clear_btn)
+
+        lay.addLayout(row)
+
+        self.setStyleSheet("""
+            QDialog{background:#1a1a1a;}
+            QPushButton{background:#3a3a3a;color:#a9b7c6;border:none;
+                        padding:3px 10px;border-radius:2px;font-size:11px;}
+            QPushButton:hover{background:#4a4a4a;}
+        """)
+
+        self.apply_settings()
+
+    def apply_settings(self):
+        fs = SETTINGS.get('terminal_font_size', 10)
+        t = _theme()
+        self.output.setFont(QFont("Consolas", fs))
+        self.output.setStyleSheet(
+            f"background:#0e0e0e;color:#d0d0d0;border:1px solid {t['border']};"
+            f"selection-background-color:{t['selection']};"
+        )
+        self.input.setStyleSheet(
+            f"background:#1e1e1e;color:#d0d0d0;border:1px solid {t['border']};padding:3px;"
+            f"font-family:Consolas; font-size:{fs + 1}px;"
+        )
+
+    def eventFilter(self, obj, event):
+        if obj is self.input and event.type() == event.Type.KeyPress:
+            if event.key() == Qt.Key.Key_Up:
+                self._history_step(-1)
+                return True
+            if event.key() == Qt.Key.Key_Down:
+                self._history_step(+1)
+                return True
+        return super().eventFilter(obj, event)
+
+    def _history_step(self, delta: int):
+        if not self._history:
+            return
+        self._hist_idx = max(0, min(len(self._history), self._hist_idx + delta))
+        if self._hist_idx >= len(self._history):
+            self.input.setText('')
+        else:
+            self.input.setText(self._history[self._hist_idx])
+
+    def _open_channel(self):
+        try:
+            self._chan = self._conn.open_shell_channel()
+        except Exception as e:
+            QMessageBox.critical(self, "ターミナルを開けません", str(e))
+            QTimer.singleShot(0, self.reject)
+            return
+        self._reader = TerminalReader(self._chan)
+        self._reader.new_text.connect(self._append)
+        self._reader.error.connect(lambda e: self._append(f"\n[エラー] {e}\n"))
+        self._reader.start()
+        # 入力欄にフォーカスを当て、即座にタイプ可能にする
+        QTimer.singleShot(50, self.input.setFocus)
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        self.input.setFocus()
+
+    def _append(self, text: str):
+        text = _ANSI_ESCAPE_RE.sub('', text)
+        text = text.replace('\r\n', '\n').replace('\r', '')
+        self.output.moveCursor(QTextCursor.MoveOperation.End)
+        self.output.insertPlainText(text)
+        sb = self.output.verticalScrollBar()
+        sb.setValue(sb.maximum())
+
+    def _send(self):
+        if not self._chan:
+            self._append("\n[エラー] チャネルが閉じています\n")
+            return
+        cmd = self.input.text()
+        # SSH PTY は \n で十分、Telnet は \r\n が標準
+        eol = b'\r\n' if getattr(self._conn, 'protocol', 'ssh') == 'telnet' else b'\n'
+        try:
+            self._chan.send(cmd.encode('utf-8') + eol)
+        except Exception as e:
+            self._append(f"\n[送信エラー] {e}\n")
+            return
+        if cmd.strip():
+            if not self._history or self._history[-1] != cmd:
+                self._history.append(cmd)
+            self._hist_idx = len(self._history)
+        self.input.clear()
+        self.input.setFocus()
+
+    def _send_raw(self, data: bytes):
+        if not self._chan:
+            self._append("\n[エラー] チャネルが閉じています\n")
+            return
+        try:
+            self._chan.send(data)
+        except Exception as e:
+            self._append(f"\n[送信エラー] {e}\n")
+
+    def closeEvent(self, event):
+        if self._reader:
+            self._reader.stop()
+            self._reader.wait(2000)
+        if self._chan:
+            self._chan.close()
+        super().closeEvent(event)
 
 
 # ---------------------------------------------------------------------------
@@ -799,7 +2137,8 @@ class SSHConnectDialog(QDialog):
 
 _GRID_PRESETS = {
     "1×1": (1, 1), "1×2": (1, 2), "2×1": (2, 1),
-    "2×2": (2, 2), "2×4": (2, 4), "3×4": (3, 4),
+    "2×2": (2, 2), "2×4": (2, 4),
+    "3×1": (3, 1), "3×2": (3, 2), "3×3": (3, 3), "3×4": (3, 4),
     "4×3": (4, 3), "4×4": (4, 4),
 }
 
@@ -807,9 +2146,10 @@ _GRID_PRESETS = {
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("SSH Log Viewer")
+        self.setWindowTitle(f"Multi-Server Log Viewer  v{__version__}")
         self.resize(1600, 900)
         self._panels: list[ServerPanel] = []
+        self._terminals: list = []
         self._setup_ui()
         self._apply_theme()
 
@@ -822,47 +2162,110 @@ class MainWindow(QMainWindow):
         tb.setIconSize(QSize(16, 16))
         self.addToolBar(tb)
 
-        tb.addWidget(QLabel(" グリッド: "))
+        grid_lbl = QLabel(" グリッド: ")
+        grid_lbl.setToolTip("ログ表示エリアの分割数 (行×列)")
+        tb.addWidget(grid_lbl)
         self.grid_combo = QComboBox()
         self.grid_combo.addItems(_GRID_PRESETS.keys())
         self.grid_combo.setCurrentText("2×2")
         self.grid_combo.setFixedWidth(70)
+        self.grid_combo.setToolTip("ログを並べるセル数を変更 (例: 2×2 = 4セル)")
         self.grid_combo.currentTextChanged.connect(self._on_grid_change)
         tb.addWidget(self.grid_combo)
 
         tb.addSeparator()
 
         btn_all_tail = QPushButton("⏩ 全Tail")
+        btn_all_tail.setToolTip("全セルで tail -f を開始 (新しい行が自動追従されます)")
         btn_all_tail.clicked.connect(lambda: self.grid.start_all_tail())
         tb.addWidget(btn_all_tail)
 
         btn_stop_all = QPushButton("⏹ 全停止")
+        btn_stop_all.setToolTip("全セルの tail -f を停止")
         btn_stop_all.clicked.connect(lambda: self.grid.stop_all_tail())
         tb.addWidget(btn_stop_all)
 
         tb.addSeparator()
 
-        tb.addWidget(QLabel(" 共通フィルタ: "))
+        gf_lbl = QLabel(" 共通フィルタ: ")
+        gf_lbl.setToolTip("開いている全ログセルにまとめてフィルタを適用")
+        tb.addWidget(gf_lbl)
         self.global_filter = QLineEdit()
         self.global_filter.setPlaceholderText("全セルに適用...")
         self.global_filter.setFixedWidth(180)
+        self.global_filter.setToolTip(
+            "検索文字列または正規表現 — 「適用」で全セルに反映"
+        )
         tb.addWidget(self.global_filter)
 
         self.global_level = QComboBox()
         self.global_level.addItems(["ALL", "ERROR+", "WARN+", "INFO+"])
         self.global_level.setFixedWidth(70)
+        self.global_level.setToolTip(
+            "ログレベルでフィルタ:\n"
+            "  ALL = 全行\n"
+            "  ERROR+ = ERROR/CRITICAL/FATAL のみ\n"
+            "  WARN+  = WARN以上\n"
+            "  INFO+  = INFO以上"
+        )
         tb.addWidget(self.global_level)
 
         apply_btn = QPushButton("適用")
         apply_btn.setFixedWidth(44)
+        apply_btn.setToolTip("共通フィルタとレベルを全セルに反映")
         apply_btn.clicked.connect(self._apply_global_filter)
         tb.addWidget(apply_btn)
 
         tb.addSeparator()
 
         add_server_btn = QPushButton("＋ サーバー接続")
+        add_server_btn.setToolTip(
+            "新しいサーバーに SSH または Telnet で接続 (最大6台)"
+        )
         add_server_btn.clicked.connect(self._add_server)
         tb.addWidget(add_server_btn)
+
+        tb.addSeparator()
+
+        # ── ワークスペース (定型ログイン) ──────────────────────────────
+        ws_lbl = QLabel(" ワークスペース: ")
+        ws_lbl.setToolTip(
+            "サーバー接続 + 開いたログの構成を保存しておき、ワンクリックで復元"
+        )
+        tb.addWidget(ws_lbl)
+        self.ws_combo = QComboBox()
+        self.ws_combo.setFixedWidth(140)
+        self.ws_combo.setToolTip("保存済みワークスペースを選んで「読込」")
+        tb.addWidget(self.ws_combo)
+        self._refresh_workspace_combo()
+
+        ws_load_btn = QPushButton("読込")
+        ws_load_btn.setFixedWidth(44)
+        ws_load_btn.setToolTip(
+            "選択中のワークスペースを開く: "
+            "現在の接続を全切断 → 保存されたプロファイルで再接続 → ログを開く"
+        )
+        ws_load_btn.clicked.connect(self._load_workspace)
+        tb.addWidget(ws_load_btn)
+
+        ws_save_btn = QPushButton("保存")
+        ws_save_btn.setFixedWidth(44)
+        ws_save_btn.setToolTip("現在の接続/開いているログをワークスペースとして保存")
+        ws_save_btn.clicked.connect(self._save_workspace)
+        tb.addWidget(ws_save_btn)
+
+        ws_del_btn = QPushButton("削除")
+        ws_del_btn.setFixedWidth(44)
+        ws_del_btn.setToolTip("選択中のワークスペースを削除")
+        ws_del_btn.clicked.connect(self._delete_workspace)
+        tb.addWidget(ws_del_btn)
+
+        tb.addSeparator()
+
+        settings_btn = QPushButton("⚙ 設定")
+        settings_btn.setToolTip("フォントサイズ・テーマの設定")
+        settings_btn.clicked.connect(self._open_settings)
+        tb.addWidget(settings_btn)
 
         # ── メイン分割 ────────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -910,18 +2313,21 @@ class MainWindow(QMainWindow):
         if dlg.exec() != QDialog.DialogCode.Accepted:
             return
         info = dlg.get_info()
-        conn = SSHConnection()
-        self._status.setText(f"接続中: {info['host']}...")
+        proto = info.get('protocol', 'SSH')
+        conn = TelnetConnection() if proto == 'Telnet' else SSHConnection()
+        self._status.setText(f"接続中 ({proto}): {info['host']}...")
         QApplication.processEvents()
         try:
             conn.connect(info['host'], info['port'], info['user'],
-                         info['password'], info['key_path'])
+                         info['password'], info.get('key_path', ''))
             color_idx  = len(self._panels)
             log_dir    = info.get('log_dir', '/var/log') or '/var/log'
             panel = ServerPanel(conn, color_idx, log_dir, self)
             panel.file_open_requested.connect(self._open_log)
+            panel.edit_open_requested.connect(self._open_in_text_editor)
             panel.disconnect_requested.connect(self._remove_server)
             panel.save_dir_requested.connect(self._save_log_dir)
+            panel.terminal_requested.connect(self._open_terminal)
             # プロファイル名を panel に記憶させてDIR更新時に使う
             panel._profile_name = dlg.combo.currentText()
             self._panels.append(panel)
@@ -936,10 +2342,332 @@ class MainWindow(QMainWindow):
             self._status.setText("接続失敗")
 
     def _remove_server(self, panel: ServerPanel):
+        # このサーバーのコネクションを使っているリソースを先にきれいに停止
+        closed_cells = 0
+        # 1. このサーバー宛のログセルを閉じる (内部で stop_tail も走る)
+        for slot in self.grid._slots:
+            v = slot.viewer()
+            if v and getattr(v, 'conn', None) is panel.conn:
+                slot.clear()
+                closed_cells += 1
+        # 2. このサーバー宛のターミナルを閉じる
+        for dlg in list(self._terminals):
+            if getattr(dlg, '_conn', None) is panel.conn:
+                try:
+                    dlg.close()
+                except Exception:
+                    pass
+        # 3. コネクション切断 (SSH なら logout / Telnet なら socket close)
         panel.conn.disconnect()
         self._panels.remove(panel)
         panel.deleteLater()
-        self._status.setText(f"切断  残 {len(self._panels)} 台")
+        suffix = f"  ログセル {closed_cells} 個も閉じました" if closed_cells else ""
+        self._status.setText(f"切断  残 {len(self._panels)} 台{suffix}")
+
+    def _open_terminal(self, panel: ServerPanel):
+        dlg = TerminalDialog(panel.conn, self)
+        self._terminals.append(dlg)
+        dlg.destroyed.connect(lambda _=None, d=dlg: self._terminals.remove(d) if d in self._terminals else None)
+        dlg.show()  # 非モーダル — 複数同時オープン可
+
+    # ------------------------------------------------ ワークスペース (定型ログイン)
+
+    def _refresh_workspace_combo(self):
+        """保存済みワークスペース一覧を再読込してコンボに反映"""
+        if not hasattr(self, 'ws_combo'):
+            return
+        cur = self.ws_combo.currentText()
+        self.ws_combo.blockSignals(True)
+        self.ws_combo.clear()
+        ws = _load_workspaces()
+        for name in sorted(ws.keys()):
+            self.ws_combo.addItem(name)
+        if cur:
+            i = self.ws_combo.findText(cur)
+            if i >= 0:
+                self.ws_combo.setCurrentIndex(i)
+        self.ws_combo.blockSignals(False)
+
+    def _capture_workspace(self) -> dict:
+        """現在の状態をワークスペースdictに変換"""
+        # サーバーごとに開いているファイルを集計
+        servers: list[dict] = []
+        for panel in self._panels:
+            profile = getattr(panel, '_profile_name', '-- 新規 --')
+            if profile == '-- 新規 --':
+                continue  # プロファイル未保存のサーバーはスキップ
+            files = []
+            for v in self.grid.viewers():
+                if getattr(v, 'conn', None) is panel.conn:
+                    files.append(v.filepath)
+            servers.append({'profile': profile, 'files': files})
+        return {
+            'grid': {'rows': self.grid._rows, 'cols': self.grid._cols},
+            'servers': servers,
+        }
+
+    def _save_workspace(self):
+        if not self._panels:
+            QMessageBox.information(self, "保存できません",
+                "サーバーに1台も接続していません。先に接続してから保存してください。")
+            return
+        # プロファイル名がない (新規) サーバーがあれば警告
+        no_profile = [p for p in self._panels
+                      if getattr(p, '_profile_name', '-- 新規 --') == '-- 新規 --']
+        if no_profile:
+            QMessageBox.warning(self, "プロファイル必須",
+                f"プロファイルを保存していないサーバーが {len(no_profile)} 台あります。\n"
+                "接続ダイアログの「保存」ボタンでプロファイルを作成してください。\n"
+                "そのサーバーはワークスペースに含まれません。")
+
+        cur = self.ws_combo.currentText()
+        name, ok = QInputDialog.getText(
+            self, "ワークスペースを保存", "名前:", text=cur or ''
+        )
+        if not ok or not name.strip():
+            return
+        name = name.strip()
+
+        all_ws = _load_workspaces()
+        if name in all_ws:
+            ans = QMessageBox.question(
+                self, "上書き確認",
+                f"「{name}」は既に存在します。上書きしますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        snapshot = self._capture_workspace()
+        all_ws[name] = snapshot
+        _save_workspaces(all_ws)
+        self._refresh_workspace_combo()
+        self.ws_combo.setCurrentText(name)
+        self._status.setText(
+            f"💾 ワークスペース「{name}」を保存 "
+            f"({len(snapshot['servers'])}サーバー / グリッド {snapshot['grid']['rows']}×{snapshot['grid']['cols']})"
+        )
+
+    def _delete_workspace(self):
+        name = self.ws_combo.currentText()
+        if not name:
+            return
+        ans = QMessageBox.question(
+            self, "削除確認", f"ワークスペース「{name}」を削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        all_ws = _load_workspaces()
+        all_ws.pop(name, None)
+        _save_workspaces(all_ws)
+        self._refresh_workspace_combo()
+        self._status.setText(f"🗑 ワークスペース「{name}」を削除")
+
+    def _load_workspace(self):
+        name = self.ws_combo.currentText()
+        if not name:
+            QMessageBox.information(self, "選択なし", "読み込むワークスペースを選んでください。")
+            return
+        all_ws = _load_workspaces()
+        ws = all_ws.get(name)
+        if not ws:
+            QMessageBox.warning(self, "見つかりません", f"ワークスペース「{name}」が見つかりません。")
+            return
+
+        # 確認
+        if self._panels:
+            ans = QMessageBox.question(
+                self, "確認",
+                f"現在の {len(self._panels)} サーバー接続を切断して "
+                f"「{name}」を読み込みますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans != QMessageBox.StandardButton.Yes:
+                return
+
+        # 1. 既存接続を全切断
+        for panel in list(self._panels):
+            self._remove_server(panel)
+        self._panels.clear()
+
+        # 2. グリッドサイズ復元
+        grid = ws.get('grid', {})
+        rows = int(grid.get('rows', 2))
+        cols = int(grid.get('cols', 2))
+        # コンボの該当プリセットを設定（無ければ近いものに）
+        preset_key = f"{rows}×{cols}"
+        i = self.grid_combo.findText(preset_key)
+        if i >= 0:
+            self.grid_combo.setCurrentIndex(i)
+        else:
+            self.grid.set_size(rows, cols)
+
+        # 3. 各サーバーをプロファイル経由で接続 → 各ログを開く
+        profiles = _load_profiles()
+        connected = 0
+        failed = []
+        opened_files = 0
+        for srv in ws.get('servers', []):
+            prof_name = srv.get('profile')
+            files = srv.get('files', [])
+            info = profiles.get(prof_name)
+            if not info:
+                failed.append(f"{prof_name} (プロファイル削除済み)")
+                continue
+            try:
+                conn = self._connect_from_profile(prof_name, info)
+                # この conn の color_idx は self._panels.index で取れる
+                panel = self._panels[-1]
+                for fp in files:
+                    self._open_log(conn, fp, panel.color_idx)
+                    opened_files += 1
+                connected += 1
+            except Exception as e:
+                failed.append(f"{prof_name}: {e}")
+
+        msg = f"ワークスペース「{name}」読込完了: {connected}サーバー / {opened_files}ログ"
+        if failed:
+            msg += f" / 失敗 {len(failed)}件"
+            QMessageBox.warning(self, "一部失敗",
+                "以下のサーバーは接続できませんでした:\n\n" + "\n".join(failed))
+        self._status.setText(msg)
+
+    def _connect_from_profile(self, prof_name: str, info: dict):
+        """プロファイル情報からサーバーパネルを作成・登録する。
+        パスワード未保存ならプロンプト。"""
+        if len(self._panels) >= 6:
+            raise RuntimeError("最大6サーバーまで")
+        proto = info.get('protocol', 'SSH')
+        host = info.get('host', '')
+        port = int(info.get('port') or (23 if proto == 'Telnet' else 22))
+        user = info.get('user', '')
+        password = info.get('password', '')
+        key_path = info.get('key_path', '')
+        log_dir = info.get('log_dir', '/var/log') or '/var/log'
+
+        if not password and not (key_path and proto == 'SSH'):
+            password, ok = QInputDialog.getText(
+                self, f"パスワード入力: {prof_name}",
+                f"{user}@{host} のパスワード:",
+                QLineEdit.EchoMode.Password,
+            )
+            if not ok:
+                raise RuntimeError("パスワード入力キャンセル")
+
+        conn = TelnetConnection() if proto == 'Telnet' else SSHConnection()
+        conn.connect(host, port, user, password, key_path)
+        color_idx = len(self._panels)
+        panel = ServerPanel(conn, color_idx, log_dir, self)
+        panel.file_open_requested.connect(self._open_log)
+        panel.edit_open_requested.connect(self._open_in_text_editor)
+        panel.disconnect_requested.connect(self._remove_server)
+        panel.save_dir_requested.connect(self._save_log_dir)
+        panel.terminal_requested.connect(self._open_terminal)
+        panel._profile_name = prof_name
+        self._panels.append(panel)
+        if self._no_server_label:
+            self.panel_splitter.widget(0).hide()
+            self._no_server_label = None
+        self.panel_splitter.addWidget(panel)
+        return conn
+
+    # ------------------------------------------------ テキストエディタで開く
+
+    def _open_in_text_editor(self, conn, remote_path: str):
+        """リモートファイルをローカルにダウンロード → text_editor.py を起動。
+        - SSH: SFTP でバイナリ取得
+        - Telnet: base64 経由で取得
+        - .gz は自動解凍
+        """
+        import tempfile
+        import subprocess
+        import gzip
+
+        base = os.path.basename(remote_path)
+        is_gz = base.lower().endswith('.gz')
+        local_name = base[:-3] if is_gz else base
+        # ホスト名を含めてユニークな保存先に
+        host_tag = (getattr(conn, 'label', 'remote') or 'remote').replace('@', '_').replace('/', '_')
+        tmp_dir = os.path.join(tempfile.gettempdir(), 'ssh_log_viewer', host_tag)
+        os.makedirs(tmp_dir, exist_ok=True)
+        local_path = os.path.join(tmp_dir, local_name)
+
+        self._status.setText(f"ダウンロード中: {remote_path}...")
+        QApplication.processEvents()
+        try:
+            data = conn.download_bytes(remote_path)
+            if is_gz:
+                try:
+                    data = gzip.decompress(data)
+                except Exception as e:
+                    QMessageBox.warning(self, "解凍エラー",
+                        f"{base} の gzip 解凍に失敗しました:\n{e}\n圧縮ファイルのまま開きます。")
+            with open(local_path, 'wb') as f:
+                f.write(data)
+        except Exception as e:
+            QMessageBox.critical(self, "ダウンロードエラー", str(e))
+            self._status.setText("ダウンロード失敗")
+            return
+
+        # text_editor.py を起動
+        editor_script = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'text_editor.py')
+        try:
+            subprocess.Popen([sys.executable, editor_script, local_path],
+                             cwd=os.path.dirname(editor_script))
+            self._status.setText(f"テキストエディタで開きました: {local_name}")
+        except Exception as e:
+            QMessageBox.critical(self, "起動エラー",
+                f"text_editor.py の起動に失敗しました:\n{e}")
+
+    def _open_settings(self):
+        dlg = SettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._apply_all_settings()
+
+    def _apply_all_settings(self):
+        """SETTINGS の変更を全 UI に反映する。"""
+        self._apply_theme()
+        for panel in self._panels:
+            panel.apply_settings()
+        # 空セルとビューアの両方を更新
+        self.grid.apply_settings()
+        for dlg in list(self._terminals):
+            try:
+                dlg.apply_settings()
+            except Exception:
+                pass
+
+    # ---------------------------------------------------------------- 終了処理
+
+    def closeEvent(self, event):
+        """アプリ終了時に Tail スレッドを止め、SSH/Telnet 接続をきちんと切断する。
+        これをしないと remote 側の `tail -F` プロセスや SSH セッションが
+        サーバー側にしばらく残ってしまう (タイムアウトまで)。
+        """
+        # 1. 全ログセルの tail を停止 (各 worker は finally で channel.close())
+        try:
+            for v in self.grid.viewers():
+                v.stop_tail()
+        except Exception:
+            pass
+
+        # 2. 全ターミナルダイアログを閉じる
+        for dlg in list(self._terminals):
+            try:
+                dlg.close()
+            except Exception:
+                pass
+        self._terminals.clear()
+
+        # 3. 全サーバー接続を明示的に切断 (SSHClient.close / Telnet socket close)
+        for panel in list(self._panels):
+            try:
+                panel.conn.disconnect()
+            except Exception:
+                pass
+
+        super().closeEvent(event)
 
     def _save_log_dir(self, panel: ServerPanel, path: str):
         name = getattr(panel, '_profile_name', '-- 新規 --')
@@ -966,8 +2694,8 @@ class MainWindow(QMainWindow):
             self.grid.set_size(r, c)
 
     def _open_log(self, conn: SSHConnection, path: str, color_idx: int):
-        server_label = conn.label.split('@')[1] if '@' in conn.label else conn.label
-        viewer = MiniLogViewer(conn, path, server_label, color_idx)
+        # 接続ラベル (user@host) をそのまま表示
+        viewer = MiniLogViewer(conn, path, conn.label, color_idx)
         if not self.grid.assign(viewer):
             QMessageBox.information(
                 self, "グリッド満杯",
@@ -986,28 +2714,65 @@ class MainWindow(QMainWindow):
     # ---------------------------------------------------------------- テーマ
 
     def _apply_theme(self):
-        self.setStyleSheet("""
-            QMainWindow,QWidget { background:#1a1a1a; color:#a9b7c6; }
-            QToolBar  { background:#252525; border:none; padding:2px 4px; spacing:3px; }
-            QToolBar QLabel { color:#888; font-size:10px; }
-            QPushButton { background:#3a3a3a;color:#a9b7c6;border:none;
-                          padding:2px 8px;border-radius:2px;font-size:11px; }
-            QPushButton:hover   { background:#4a4a4a; }
-            QPushButton:checked { background:#214283; }
-            QComboBox { background:#3a3a3a;color:#a9b7c6;border:1px solid #444;padding:1px 3px; }
-            QComboBox::drop-down { border:none; width:14px; }
-            QComboBox QAbstractItemView { background:#2b2b2b;color:#a9b7c6;
-                                          selection-background-color:#214283; }
-            QLineEdit { background:#333;color:#a9b7c6;border:1px solid #444;padding:1px 3px; }
-            QStatusBar { background:#252525;color:#808080; }
-            QSplitter::handle { background:#2a2a2a; }
-            QSplitter::handle:horizontal { width:2px; }
-            QSplitter::handle:vertical   { height:3px; }
-            QScrollBar:vertical   { background:#1e1e1e;width:6px; }
-            QScrollBar::handle:vertical { background:#3a3a3a;border-radius:3px; }
-            QScrollBar:horizontal { background:#1e1e1e;height:6px; }
-            QScrollBar::handle:horizontal { background:#3a3a3a;border-radius:3px; }
+        t = _theme()
+        fs_tb = SETTINGS.get('toolbar_font_size', 11)
+        self.setStyleSheet(f"""
+            QMainWindow,QWidget {{ background:{t['bg']}; color:{t['text']}; }}
+            QToolTip {{ background-color:#2b2b2b; color:#ffffff;
+                        border:1px solid #666; padding:3px 6px; }}
+            QToolBar  {{ background:{t['toolbar_bg']}; border:none; padding:2px 4px; spacing:3px; }}
+            QToolBar QLabel {{ color:{t['text_dim']}; font-size:{max(fs_tb-1, 7)}px; }}
+            QToolBar QPushButton {{ background:{t['control_bg']};color:{t['text']};border:none;
+                                    padding:2px 8px;border-radius:2px;font-size:{fs_tb}px; }}
+            QToolBar QPushButton:hover   {{ background:{t['control_hover']}; }}
+            QToolBar QPushButton:checked {{ background:{t['selection']}; }}
+            QToolBar QComboBox {{ background:{t['control_bg']};color:{t['text']};
+                                  border:1px solid {t['border']};
+                                  padding:1px 3px;font-size:{fs_tb}px; }}
+            QToolBar QLineEdit {{ background:{t['panel_bg']};color:{t['text']};
+                                  border:1px solid {t['border']};
+                                  padding:1px 3px;font-size:{fs_tb}px; }}
+            QComboBox {{ background:{t['control_bg']};color:{t['text']};
+                         border:1px solid {t['border']};padding:1px 3px; }}
+            QComboBox::drop-down {{ border:none; width:14px; }}
+            QComboBox QAbstractItemView {{ background:{t['panel_bg']};color:{t['text']};
+                                           selection-background-color:{t['selection']}; }}
+            QLineEdit {{ background:{t['panel_bg']};color:{t['text']};
+                         border:1px solid {t['border']};padding:1px 3px; }}
+            QStatusBar {{ background:{t['toolbar_bg']};color:{t['text_dim']}; }}
+            QSplitter::handle {{ background:{t['border']}; }}
+            QSplitter::handle:horizontal {{ width:2px; }}
+            QSplitter::handle:vertical   {{ height:3px; }}
+            QScrollBar:vertical {{
+                background:{t['panel_bg']}; width:12px; border:none; margin:0;
+            }}
+            QScrollBar::handle:vertical {{
+                background:{t['control_bg']}; border-radius:4px;
+                min-height:30px; margin:2px;
+            }}
+            QScrollBar::handle:vertical:hover {{ background:{t['control_hover']}; }}
+            QScrollBar::add-line:vertical,
+            QScrollBar::sub-line:vertical {{ height:0; width:0; }}
+            QScrollBar::add-page:vertical,
+            QScrollBar::sub-page:vertical {{ background:none; }}
+            QScrollBar:horizontal {{
+                background:{t['panel_bg']}; height:12px; border:none; margin:0;
+            }}
+            QScrollBar::handle:horizontal {{
+                background:{t['control_bg']}; border-radius:4px;
+                min-width:30px; margin:2px;
+            }}
+            QScrollBar::handle:horizontal:hover {{ background:{t['control_hover']}; }}
+            QScrollBar::add-line:horizontal,
+            QScrollBar::sub-line:horizontal {{ height:0; width:0; }}
+            QScrollBar::add-page:horizontal,
+            QScrollBar::sub-page:horizontal {{ background:none; }}
         """)
+        # 「サーバー未接続」のラベル色も合わせる
+        if hasattr(self, '_no_server_label') and self._no_server_label is not None:
+            self._no_server_label.setStyleSheet(
+                f"color:{t['text_dim']}; padding:12px; font-size:11px;"
+            )
 
 
 # ---------------------------------------------------------------------------
@@ -1015,8 +2780,21 @@ class MainWindow(QMainWindow):
 # ---------------------------------------------------------------------------
 
 if __name__ == '__main__':
+    # 起動時の一時ファイルクリーンアップ (「テキストエディタで開く」DL分)
+    import tempfile as _tempfile
+    try:
+        _tmp_root = os.path.join(_tempfile.gettempdir(), 'ssh_log_viewer')
+        _cleanup_old_temp_files(_tmp_root)
+    except Exception:
+        pass
+
     app = QApplication(sys.argv)
-    app.setApplicationName("SSH Log Viewer")
+    app.setApplicationName("Multi-Server Log Viewer")
+    try:
+        from app_icons import ssh_log_viewer_icon
+        app.setWindowIcon(ssh_log_viewer_icon())
+    except Exception:
+        pass
     window = MainWindow()
     window.show()
     sys.exit(app.exec())
