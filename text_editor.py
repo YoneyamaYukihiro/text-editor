@@ -2327,12 +2327,121 @@ class MainWindow(QMainWindow):
         tm = mb.addMenu("ツール(&T)")
         self._add_action(tm, "ログからSQL抽出・整形(&S)...", QKeySequence("Ctrl+Shift+Q"), self._show_sql_extract)
         tm.addSeparator()
+        self._add_action(tm, "📤 設定をエクスポート...", QKeySequence(), self._export_settings)
+        self._add_action(tm, "📥 設定をインポート...", QKeySequence(), self._import_settings)
+        tm.addSeparator()
         self._add_action(tm, "⚙ 設定(&P)...", QKeySequence("Ctrl+,"), self._open_settings)
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
+
+    # ---------------------------------------------- 設定移行 (Export / Import)
+
+    _MIGRATION_APP_KEY = "Sora Editor"
+    _MIGRATION_SCHEMA = 1
+
+    def _export_settings(self):
+        """FTPプロファイル + UI設定 + 検索履歴 を JSON にエクスポート"""
+        from datetime import datetime
+        path, _ = QFileDialog.getSaveFileName(
+            self, "設定をエクスポート",
+            f"sora_settings_{datetime.now():%Y%m%d_%H%M%S}.json",
+            "JSON (*.json);;すべて (*)",
+        )
+        if not path:
+            return
+        bundle = {
+            "schema_version": self._MIGRATION_SCHEMA,
+            "app": self._MIGRATION_APP_KEY,
+            "version": __version__,
+            "exported_at": datetime.now().isoformat(timespec='seconds'),
+            "ftp_profiles": load_profiles(),
+            "settings":     dict(SETTINGS),
+            "history":      dict(SEARCH_HISTORY),
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(bundle, f, ensure_ascii=False, indent=2)
+            self.statusBar().showMessage(
+                f"📤 エクスポート完了 → {os.path.basename(path)}", 4000
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "エクスポートエラー", str(e))
+
+    def _import_settings(self):
+        path, _ = QFileDialog.getOpenFileName(
+            self, "設定をインポート", "", "JSON (*.json);;すべて (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                bundle = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "読込エラー", str(e))
+            return
+        if bundle.get('app') != self._MIGRATION_APP_KEY:
+            QMessageBox.warning(
+                self, "アプリ違い",
+                f"このファイルは別アプリのエクスポートです: {bundle.get('app')}",
+            )
+            return
+
+        ftp_profiles = bundle.get('ftp_profiles', {})
+        settings     = bundle.get('settings', {})
+        history      = bundle.get('history', {})
+
+        cur_ftp = load_profiles()
+        msg = (
+            f"インポートします:\n"
+            f"・FTPプロファイル: {len(ftp_profiles)}件 (現在 {len(cur_ftp)}件)\n"
+            f"・UI設定: {len(settings)}項目\n"
+            f"・検索/置換履歴: 検索{len(history.get('search', []))} / "
+            f"置換{len(history.get('replace', []))}\n\n"
+            "「Yes」=マージ / 「No」=置換 / 「Cancel」=中止"
+        )
+        ans = QMessageBox.question(
+            self, "インポート", msg,
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No |
+            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans == QMessageBox.StandardButton.Cancel:
+            return
+
+        if ans == QMessageBox.StandardButton.Yes:
+            new_ftp = {**cur_ftp, **ftp_profiles}
+        else:
+            new_ftp = dict(ftp_profiles)
+
+        try:
+            save_profiles(new_ftp)
+            for k, v in settings.items():
+                if k in _DEFAULT_SETTINGS:
+                    SETTINGS[k] = v
+            _save_settings(SETTINGS)
+            # 検索履歴も統合
+            if history:
+                for key in ('search', 'replace'):
+                    incoming = history.get(key, [])
+                    if ans == QMessageBox.StandardButton.Yes:
+                        # 重複排除して結合
+                        merged = list(dict.fromkeys(incoming + SEARCH_HISTORY.get(key, [])))
+                        SEARCH_HISTORY[key] = merged[:_HISTORY_MAX]
+                    else:
+                        SEARCH_HISTORY[key] = incoming[:_HISTORY_MAX]
+                _save_search_history()
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+            return
+
+        self._apply_all_settings()
+        self.statusBar().showMessage(
+            f"📥 インポート完了: FTPプロファイル {len(new_ftp)}件", 4000
+        )
 
     def _apply_all_settings(self):
         """テーマ・フォントサイズの変更を全UIに反映"""

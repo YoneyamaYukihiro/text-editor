@@ -2536,6 +2536,18 @@ class MainWindow(QMainWindow):
         settings_btn.clicked.connect(self._open_settings)
         tb.addWidget(settings_btn)
 
+        # 設定移行 (Export / Import) ボタン: ポップアップメニュー付き
+        from PyQt6.QtWidgets import QMenu
+        migrate_btn = QPushButton("📦 移行")
+        migrate_btn.setToolTip("プロファイル/ワークスペース/設定を JSON にエクスポート、または別PCのファイルをインポート")
+        migrate_menu = QMenu(migrate_btn)
+        act_exp = migrate_menu.addAction("📤 エクスポート (JSONに保存)...")
+        act_imp = migrate_menu.addAction("📥 インポート (JSONから読込)...")
+        act_exp.triggered.connect(self._export_settings)
+        act_imp.triggered.connect(self._import_settings)
+        migrate_btn.setMenu(migrate_menu)
+        tb.addWidget(migrate_btn)
+
         # ── メイン分割 ────────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
 
@@ -2909,6 +2921,117 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
+
+    # ---------------------------------------------- 設定移行 (Export / Import)
+
+    _MIGRATION_APP_KEY = "Multi-Server Log Viewer"
+    _MIGRATION_SCHEMA = 1
+
+    def _export_settings(self):
+        """プロファイル + ワークスペース + UI設定をJSONファイルにエクスポート"""
+        from datetime import datetime
+        path, _ = QFileDialog.getSaveFileName(
+            self, "設定をエクスポート",
+            f"mslv_settings_{datetime.now():%Y%m%d_%H%M%S}.json",
+            "JSON (*.json);;すべて (*)",
+        )
+        if not path:
+            return
+        bundle = {
+            "schema_version": self._MIGRATION_SCHEMA,
+            "app": self._MIGRATION_APP_KEY,
+            "version": __version__,
+            "exported_at": datetime.now().isoformat(timespec='seconds'),
+            "profiles":   _load_profiles(),
+            "workspaces": _load_workspaces(),
+            "settings":   dict(SETTINGS),
+        }
+        try:
+            with open(path, 'w', encoding='utf-8') as f:
+                json.dump(bundle, f, ensure_ascii=False, indent=2)
+            self._status.setText(
+                f"📤 エクスポート完了: {len(bundle['profiles'])}プロファイル / "
+                f"{len(bundle['workspaces'])}ワークスペース → {os.path.basename(path)}"
+            )
+        except Exception as e:
+            QMessageBox.critical(self, "エクスポートエラー", str(e))
+
+    def _import_settings(self):
+        """JSONファイルからプロファイル/ワークスペース/UI設定をインポート"""
+        path, _ = QFileDialog.getOpenFileName(
+            self, "設定をインポート", "", "JSON (*.json);;すべて (*)"
+        )
+        if not path:
+            return
+        try:
+            with open(path, 'r', encoding='utf-8') as f:
+                bundle = json.load(f)
+        except Exception as e:
+            QMessageBox.critical(self, "読込エラー", str(e))
+            return
+        if bundle.get('app') != self._MIGRATION_APP_KEY:
+            QMessageBox.warning(
+                self, "アプリ違い",
+                f"このファイルは別アプリのエクスポートです: {bundle.get('app')}",
+            )
+            return
+
+        profiles   = bundle.get('profiles', {})
+        workspaces = bundle.get('workspaces', {})
+        settings   = bundle.get('settings', {})
+
+        # 現在の状況を確認
+        cur_profiles = _load_profiles()
+        cur_ws       = _load_workspaces()
+        msg = (
+            f"インポートします:\n"
+            f"・プロファイル: {len(profiles)}件 "
+            f"(現在 {len(cur_profiles)}件)\n"
+            f"・ワークスペース: {len(workspaces)}件 "
+            f"(現在 {len(cur_ws)}件)\n"
+            f"・UI設定: {len(settings)}項目\n\n"
+            "どう取り込みますか？\n"
+            "「Yes」… マージ (重複は新しい方で上書き、既存も残す)\n"
+            "「No」 … 置換 (現在の設定を消して全部入れ替え)\n"
+            "「Cancel」… 中止"
+        )
+        ans = QMessageBox.question(
+            self, "インポート", msg,
+            QMessageBox.StandardButton.Yes |
+            QMessageBox.StandardButton.No |
+            QMessageBox.StandardButton.Cancel,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans == QMessageBox.StandardButton.Cancel:
+            return
+
+        if ans == QMessageBox.StandardButton.Yes:
+            # マージ
+            new_profiles = {**cur_profiles, **profiles}
+            new_ws       = {**cur_ws, **workspaces}
+        else:
+            # 置換
+            new_profiles = dict(profiles)
+            new_ws       = dict(workspaces)
+
+        try:
+            _save_profiles(new_profiles)
+            _save_workspaces(new_ws)
+            # UI 設定はマージ後保存
+            for k, v in settings.items():
+                if k in _DEFAULT_SETTINGS:
+                    SETTINGS[k] = v
+            _save_settings(SETTINGS)
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+            return
+
+        self._refresh_workspace_combo()
+        self._apply_all_settings()
+        self._status.setText(
+            f"📥 インポート完了: プロファイル {len(new_profiles)}件 / "
+            f"ワークスペース {len(new_ws)}件"
+        )
 
     def _apply_all_settings(self):
         """SETTINGS の変更を全 UI に反映する。"""
