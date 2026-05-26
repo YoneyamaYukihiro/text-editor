@@ -1,11 +1,11 @@
-# Multi-Server Log Viewer & Text Editor
+# Multi-Server Log Viewer & Sora Editor
 
 リモートサーバーのログ解析・編集を効率化する Python (PyQt6) 製ツールセット。
 
 | アプリ | 役割 |
 |---|---|
 | **Multi-Server Log Viewer** ([ssh_log_viewer.py](ssh_log_viewer.py)) | 複数サーバーへ SSH/Telnet 同時接続、グリッドでログをリアルタイム表示 |
-| **テキストエディタ** ([text_editor.py](text_editor.py)) | 過去ログの編集・整形、Grep、SQL/Python等のシンタックスハイライト |
+| **Sora Editor** ([text_editor.py](text_editor.py)) | 過去ログの編集・整形、Grep、SQL/Python等のシンタックスハイライト |
 
 - バージョン: **1.0.0**
 - 対応OS: Windows 10/11 (Linux/macOS も Python経由で動作)
@@ -38,7 +38,7 @@ text-editor/
 ├── assets/                  # アイコン (PNG/ICO 各サイズ)
 └── dist/                    # PyInstaller ビルド出力
     ├── Multi-Server Log Viewer.exe
-    └── Text Editor.exe
+    └── Sora Editor.exe
 ```
 
 ---
@@ -75,7 +75,7 @@ python text_editor.py /path/to/file.log   # 引数でファイル開けます
 
 ### EXE版 (PyInstaller ビルド済み)
 - [dist/Multi-Server Log Viewer.exe](dist/Multi-Server%20Log%20Viewer.exe) をダブルクリック
-- [dist/Text Editor.exe](dist/Text%20Editor.exe) をダブルクリック
+- [dist/Sora Editor.exe](dist/Text%20Editor.exe) をダブルクリック
 - デスクトップへショートカット、タスクバーピン留め可能
 
 ### EXE 再ビルド
@@ -87,7 +87,7 @@ python -m PyInstaller --noconfirm --noconsole --onefile \
   --add-data "app_icons.py;." \
   ssh_log_viewer.py
 python -m PyInstaller --noconfirm --noconsole --onefile \
-  --name "Text Editor" \
+  --name "Sora Editor" \
   --icon=assets/text_editor.ico \
   text_editor.py
 ```

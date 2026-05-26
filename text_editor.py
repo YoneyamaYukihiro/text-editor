@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""テキストエディタ — マルチタブ・FTP対応"""
+"""Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
 __version__ = "1.0.0"
 
 import sys
@@ -2181,7 +2181,7 @@ class SettingsDialog(QDialog):
 class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"テキストエディタ  v{__version__}")
+        self.setWindowTitle(f"Sora Editor  v{__version__}")
         self.setMinimumSize(800, 500)
         self.resize(1200, 800)
 
@@ -3339,7 +3339,7 @@ if __name__ == '__main__':
         pass
 
     app = QApplication(sys.argv)
-    app.setApplicationName("テキストエディタ")
+    app.setApplicationName("Sora Editor")
     try:
         from app_icons import text_editor_icon
         app.setWindowIcon(text_editor_icon())

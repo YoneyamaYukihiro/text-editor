@@ -15,6 +15,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QPlainTextEdit, QLabel, QLineEdit, QPushButton, QComboBox,
     QTreeWidget, QTreeWidgetItem, QDialog, QGridLayout, QFileDialog,
     QMessageBox, QInputDialog, QCheckBox, QFrame, QToolBar, QSizePolicy,
+    QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
@@ -983,22 +984,31 @@ class MiniLogViewer(QWidget):
         self._header_lbl = QLabel(
             f"{self.server_label}  ·  {os.path.basename(self.filepath)}"
         )
-        self._header_lbl.setToolTip(self.filepath)
+        # フルパス + 接続情報を tooltip で確認可能に
+        self._header_lbl.setToolTip(
+            f"接続: {self.conn.label}\nパス: {self.filepath}"
+        )
         hl.addWidget(self._header_lbl, 1)
 
         self._header_btns: list[QPushButton] = []
-        for text, tip, slot, check in [
-            ("⏩", "Tail -F (リアルタイム追従 / ログローテーション自動追従)", None, True),
-            ("↺",  "再読み込み", self._load, False),
-            ("✕",  "閉じる", lambda: self.close_requested.emit(self), False),
+        # role: 'tail' = トグル / 'stop' = 停止専用 / 他は通常クリック
+        for text, tip, slot, role in [
+            ("▶", "Tail -F 開始 (リアルタイム追従 / ログローテーション自動追従)", None, 'tail'),
+            ("■", "Tail 停止 (このセルのみ)", None, 'stop'),
+            ("↺", "再読み込み", self._load, None),
+            ("✕", "閉じる", lambda: self.close_requested.emit(self), None),
         ]:
             btn = QPushButton(text)
             btn.setFixedSize(30, 26)
             btn.setToolTip(tip)
-            if check:
+            if role == 'tail':
                 btn.setCheckable(True)
                 self.tail_btn = btn
                 btn.toggled.connect(self._toggle_tail)
+            elif role == 'stop':
+                self.stop_btn = btn
+                btn.setEnabled(False)           # 起動直後は無効
+                btn.clicked.connect(self.stop_tail)
             else:
                 btn.clicked.connect(slot)
             hl.addWidget(btn)
@@ -1133,6 +1143,8 @@ class MiniLogViewer(QWidget):
             self._worker.start()
         else:
             self._stop_worker()
+        if hasattr(self, 'stop_btn'):
+            self.stop_btn.setEnabled(on)
         self.tail_changed.emit(on)
 
     def _append(self, text: str):
@@ -1384,8 +1396,8 @@ class ServerPanel(QWidget):
         hl.setSpacing(4)
         self._header_dot = QLabel("●")
         hl.addWidget(self._header_dot)
-        proto_tag = getattr(self.conn, 'protocol', 'ssh').upper()
-        self._header_lbl = QLabel(f"[{proto_tag}] {self.conn.label}")
+        self._header_lbl = QLabel(self._make_header_text())
+        self._header_lbl.setToolTip(self.conn.label)   # フル user@host はツールチップで
         hl.addWidget(self._header_lbl, 1)
 
         self._term_btn = QPushButton("⌨ ターミナル")
@@ -1481,6 +1493,19 @@ class ServerPanel(QWidget):
         layout.addWidget(self.tree, 1)
 
         self.apply_settings()
+
+    def _make_header_text(self) -> str:
+        """ヘッダー表示テキスト: プロファイル名があれば優先、なければ user@host"""
+        proto_tag = getattr(self.conn, 'protocol', 'ssh').upper()
+        name = getattr(self, '_profile_name', None)
+        if name and name != '-- 新規 --':
+            return f"[{proto_tag}] {name}"
+        return f"[{proto_tag}] {self.conn.label}"
+
+    def refresh_header_label(self):
+        """プロファイル名設定後に呼んでヘッダーラベルを更新"""
+        self._header_lbl.setText(self._make_header_text())
+        self._header_lbl.setToolTip(self.conn.label)
 
     def apply_settings(self):
         fs = SETTINGS.get('tree_font_size', 10)
@@ -1625,9 +1650,9 @@ class SSHConnectDialog(QDialog):
             self.combo.addItem(n)
         self.combo.currentIndexChanged.connect(self._on_select)
         pr.addWidget(self.combo, 1)
-        for text, slot in [("保存", self._save), ("削除", self._delete)]:
+        for text, slot, width in [("保存", self._save, 40), ("管理", self._manage, 40)]:
             btn = QPushButton(text)
-            btn.setFixedWidth(40)
+            btn.setFixedWidth(width)
             btn.clicked.connect(slot)
             pr.addWidget(btn)
         lay.addLayout(pr)
@@ -1739,12 +1764,22 @@ class SSHConnectDialog(QDialog):
             self.combo.addItem(name)
         self.combo.setCurrentText(name)
 
-    def _delete(self):
-        name = self.combo.currentText()
-        if name == "-- 新規 --": return
-        self._profiles.pop(name, None)
-        _save_profiles(self._profiles)
-        self.combo.removeItem(self.combo.currentIndex())
+    def _manage(self):
+        """プロファイル管理ダイアログ (並べ替え/名前変更/削除) を開く"""
+        cur = self.combo.currentText()
+        dlg = ProfileManagerDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # ファイルから再読込してコンボに反映
+            self._profiles = _load_profiles()
+            self.combo.blockSignals(True)
+            self.combo.clear()
+            self.combo.addItem("-- 新規 --")
+            for n in self._profiles:
+                self.combo.addItem(n)
+            # 元の選択を復元 (削除/改名されていなければ)
+            idx = self.combo.findText(cur)
+            self.combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.combo.blockSignals(False)
 
     def _browse_key(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -1768,6 +1803,240 @@ class SSHConnectDialog(QDialog):
 # ---------------------------------------------------------------------------
 # 設定ダイアログ
 # ---------------------------------------------------------------------------
+
+class ProfileManagerDialog(QDialog):
+    """サーバー接続プロファイルの並べ替え/名前変更/削除を行うダイアログ"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("接続プロファイル管理")
+        self.setMinimumSize(420, 360)
+        self._profiles = _load_profiles()
+        self._build_ui()
+        self._populate()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        hint = QLabel("ドラッグで並べ替え / ダブルクリックで名前変更")
+        hint.setStyleSheet("color:#888;font-size:10px;")
+        lay.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.list.itemDoubleClicked.connect(self._on_rename)
+        lay.addWidget(self.list, 1)
+
+        ops = QHBoxLayout()
+        rename_btn = QPushButton("✏ 名前変更")
+        rename_btn.clicked.connect(self._on_rename_selected)
+        delete_btn = QPushButton("🗑 削除")
+        delete_btn.clicked.connect(self._on_delete)
+        ops.addWidget(rename_btn)
+        ops.addWidget(delete_btn)
+        ops.addStretch()
+        lay.addLayout(ops)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
+                          border:1px solid {t['border']}; font-size:12px; }}
+            QListWidget::item {{ padding:4px 6px; }}
+            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:none; padding:4px 12px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:default {{ background:{t['selection']}; color:{t['text']}; }}
+        """)
+
+    def _populate(self):
+        self.list.clear()
+        for name, info in self._profiles.items():
+            host = info.get('host', '')
+            user = info.get('user', '')
+            proto = info.get('protocol', 'SSH')
+            item = QListWidgetItem(name)
+            item.setToolTip(f"[{proto}] {user}@{host}")
+            self.list.addItem(item)
+
+    def _on_rename(self, item):
+        old = item.text()
+        new, ok = QInputDialog.getText(
+            self, "名前変更", "新しい名前:", text=old,
+        )
+        if not ok or not new.strip() or new == old:
+            return
+        new = new.strip()
+        if new in self._profiles:
+            QMessageBox.warning(self, "重複", f"「{new}」は既に存在します。")
+            return
+        new_map = {}
+        for k, v in self._profiles.items():
+            new_map[new if k == old else k] = v
+        self._profiles = new_map
+        item.setText(new)
+
+    def _on_rename_selected(self):
+        item = self.list.currentItem()
+        if item:
+            self._on_rename(item)
+
+    def _on_delete(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        name = item.text()
+        ans = QMessageBox.question(
+            self, "削除確認", f"プロファイル「{name}」を削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._profiles.pop(name, None)
+        self.list.takeItem(self.list.row(item))
+
+    def accept(self):
+        names_in_order = [self.list.item(i).text() for i in range(self.list.count())]
+        reordered = {n: self._profiles[n] for n in names_in_order if n in self._profiles}
+        _save_profiles(reordered)
+        super().accept()
+
+
+class WorkspaceManagerDialog(QDialog):
+    """ワークスペースの並べ替え/名前変更/削除を行うダイアログ"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ワークスペース管理")
+        self.setMinimumSize(420, 360)
+        self._workspaces = _load_workspaces()
+        self._build_ui()
+        self._populate()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        hint = QLabel("ドラッグで並べ替え / ダブルクリックで名前変更")
+        hint.setStyleSheet("color:#888;font-size:10px;")
+        lay.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.list.itemDoubleClicked.connect(self._on_rename)
+        lay.addWidget(self.list, 1)
+
+        # 操作ボタン
+        ops = QHBoxLayout()
+        rename_btn = QPushButton("✏ 名前変更")
+        rename_btn.clicked.connect(self._on_rename_selected)
+        delete_btn = QPushButton("🗑 削除")
+        delete_btn.clicked.connect(self._on_delete)
+        ops.addWidget(rename_btn)
+        ops.addWidget(delete_btn)
+        ops.addStretch()
+        lay.addLayout(ops)
+
+        # OK / キャンセル
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
+                          border:1px solid {t['border']}; font-size:12px; }}
+            QListWidget::item {{ padding:4px 6px; }}
+            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:none; padding:4px 12px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:default {{ background:{t['selection']}; color:{t['text']}; }}
+        """)
+
+    def _populate(self):
+        self.list.clear()
+        for name, ws in self._workspaces.items():
+            grid = ws.get('grid', {})
+            n_servers = len(ws.get('servers', []))
+            r, c = grid.get('rows', 0), grid.get('cols', 0)
+            item = QListWidgetItem(name)
+            item.setToolTip(f"{n_servers}サーバー / グリッド {r}×{c}")
+            self.list.addItem(item)
+
+    def _on_rename(self, item):
+        old = item.text()
+        new, ok = QInputDialog.getText(
+            self, "名前変更", "新しい名前:", text=old,
+        )
+        if not ok or not new.strip() or new == old:
+            return
+        new = new.strip()
+        if new in self._workspaces:
+            QMessageBox.warning(self, "重複", f"「{new}」は既に存在します。")
+            return
+        # 順序を保ったまま rename
+        new_map = {}
+        for k, v in self._workspaces.items():
+            new_map[new if k == old else k] = v
+        self._workspaces = new_map
+        item.setText(new)
+
+    def _on_rename_selected(self):
+        item = self.list.currentItem()
+        if item:
+            self._on_rename(item)
+
+    def _on_delete(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        name = item.text()
+        ans = QMessageBox.question(
+            self, "削除確認", f"「{name}」を削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._workspaces.pop(name, None)
+        self.list.takeItem(self.list.row(item))
+
+    def accept(self):
+        # リストの現在の並び順で dict を再構築
+        names_in_order = [self.list.item(i).text() for i in range(self.list.count())]
+        reordered = {n: self._workspaces[n] for n in names_in_order if n in self._workspaces}
+        _save_workspaces(reordered)
+        super().accept()
+
 
 class SettingsDialog(QDialog):
     """フォントサイズとテーマの設定。OK で SETTINGS を更新・保存。"""
@@ -2136,8 +2405,8 @@ class TerminalDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 _GRID_PRESETS = {
-    "1×1": (1, 1), "1×2": (1, 2), "2×1": (2, 1),
-    "2×2": (2, 2), "2×4": (2, 4),
+    "1×1": (1, 1), "1×2": (1, 2), "1×3": (1, 3), "1×4": (1, 4),
+    "2×1": (2, 1), "2×2": (2, 2), "2×4": (2, 4),
     "3×1": (3, 1), "3×2": (3, 2), "3×3": (3, 3), "3×4": (3, 4),
     "4×3": (4, 3), "4×4": (4, 4),
 }
@@ -2175,12 +2444,12 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        btn_all_tail = QPushButton("⏩ 全Tail")
+        btn_all_tail = QPushButton("▶ 全Tail")
         btn_all_tail.setToolTip("全セルで tail -f を開始 (新しい行が自動追従されます)")
         btn_all_tail.clicked.connect(lambda: self.grid.start_all_tail())
         tb.addWidget(btn_all_tail)
 
-        btn_stop_all = QPushButton("⏹ 全停止")
+        btn_stop_all = QPushButton("■ 全停止")
         btn_stop_all.setToolTip("全セルの tail -f を停止")
         btn_stop_all.clicked.connect(lambda: self.grid.stop_all_tail())
         tb.addWidget(btn_stop_all)
@@ -2254,11 +2523,11 @@ class MainWindow(QMainWindow):
         ws_save_btn.clicked.connect(self._save_workspace)
         tb.addWidget(ws_save_btn)
 
-        ws_del_btn = QPushButton("削除")
-        ws_del_btn.setFixedWidth(44)
-        ws_del_btn.setToolTip("選択中のワークスペースを削除")
-        ws_del_btn.clicked.connect(self._delete_workspace)
-        tb.addWidget(ws_del_btn)
+        ws_mgr_btn = QPushButton("管理")
+        ws_mgr_btn.setFixedWidth(44)
+        ws_mgr_btn.setToolTip("ワークスペースの並べ替え / 名前変更 / 削除")
+        ws_mgr_btn.clicked.connect(self._manage_workspaces)
+        tb.addWidget(ws_mgr_btn)
 
         tb.addSeparator()
 
@@ -2330,6 +2599,7 @@ class MainWindow(QMainWindow):
             panel.terminal_requested.connect(self._open_terminal)
             # プロファイル名を panel に記憶させてDIR更新時に使う
             panel._profile_name = dlg.combo.currentText()
+            panel.refresh_header_label()
             self._panels.append(panel)
             # 初回は placeholder を除去
             if self._no_server_label:
@@ -2373,14 +2643,15 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------ ワークスペース (定型ログイン)
 
     def _refresh_workspace_combo(self):
-        """保存済みワークスペース一覧を再読込してコンボに反映"""
+        """保存済みワークスペース一覧を JSON 保存順で再読込してコンボに反映"""
         if not hasattr(self, 'ws_combo'):
             return
         cur = self.ws_combo.currentText()
         self.ws_combo.blockSignals(True)
         self.ws_combo.clear()
         ws = _load_workspaces()
-        for name in sorted(ws.keys()):
+        # JSON の dict 順 (=保存順 / 管理ダイアログで並べ替え可) で表示
+        for name in ws.keys():
             self.ws_combo.addItem(name)
         if cur:
             i = self.ws_combo.findText(cur)
@@ -2448,21 +2719,12 @@ class MainWindow(QMainWindow):
             f"({len(snapshot['servers'])}サーバー / グリッド {snapshot['grid']['rows']}×{snapshot['grid']['cols']})"
         )
 
-    def _delete_workspace(self):
-        name = self.ws_combo.currentText()
-        if not name:
-            return
-        ans = QMessageBox.question(
-            self, "削除確認", f"ワークスペース「{name}」を削除しますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        all_ws = _load_workspaces()
-        all_ws.pop(name, None)
-        _save_workspaces(all_ws)
-        self._refresh_workspace_combo()
-        self._status.setText(f"🗑 ワークスペース「{name}」を削除")
+    def _manage_workspaces(self):
+        """ワークスペース管理ダイアログを開く"""
+        dlg = WorkspaceManagerDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._refresh_workspace_combo()
+            self._status.setText("ワークスペースを更新しました")
 
     def _load_workspace(self):
         name = self.ws_combo.currentText()
@@ -2565,6 +2827,7 @@ class MainWindow(QMainWindow):
         panel.save_dir_requested.connect(self._save_log_dir)
         panel.terminal_requested.connect(self._open_terminal)
         panel._profile_name = prof_name
+        panel.refresh_header_label()
         self._panels.append(panel)
         if self._no_server_label:
             self.panel_splitter.widget(0).hide()
@@ -2614,13 +2877,13 @@ class MainWindow(QMainWindow):
         try:
             if getattr(sys, 'frozen', False):
                 # PyInstaller でビルドされた EXE として動作中
-                # → 同じフォルダにある "Text Editor.exe" を呼ぶ
+                # → 同じフォルダにある "Sora Editor.exe" を呼ぶ
                 exe_dir = os.path.dirname(sys.executable)
-                editor_exe = os.path.join(exe_dir, "Text Editor.exe")
+                editor_exe = os.path.join(exe_dir, "Sora Editor.exe")
                 if not os.path.isfile(editor_exe):
                     QMessageBox.warning(
                         self, "テキストエディタが見つかりません",
-                        f"Text Editor.exe が見つかりません:\n{exe_dir}\n\n"
+                        f"Sora Editor.exe が見つかりません:\n{exe_dir}\n\n"
                         "EXE版を使う場合は両アプリを同じフォルダに置いてください。\n"
                         f"ダウンロードファイル:\n{local_path}",
                     )
@@ -2716,8 +2979,15 @@ class MainWindow(QMainWindow):
             self.grid.set_size(r, c)
 
     def _open_log(self, conn: SSHConnection, path: str, color_idx: int):
-        # 接続ラベル (user@host) をそのまま表示
-        viewer = MiniLogViewer(conn, path, conn.label, color_idx)
+        # プロファイル名があれば優先、なければ user@host
+        label = conn.label
+        for p in self._panels:
+            if p.conn is conn:
+                name = getattr(p, '_profile_name', None)
+                if name and name != '-- 新規 --':
+                    label = name
+                break
+        viewer = MiniLogViewer(conn, path, label, color_idx)
         if not self.grid.assign(viewer):
             QMessageBox.information(
                 self, "グリッド満杯",
