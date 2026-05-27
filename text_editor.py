@@ -18,6 +18,9 @@ from PyQt6.QtWidgets import (
     QSplitter, QListWidget, QListWidgetItem,
     QMessageBox, QGridLayout, QComboBox, QInputDialog,
     QTreeWidget, QTreeWidgetItem, QSpinBox, QTextBrowser, QFrame,
+    QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
+    QAbstractItemView, QProgressDialog, QStyledItemDelegate, QStyle,
+    QStyleOptionViewItem, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal, QSize, QThread, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import (
@@ -44,7 +47,7 @@ _THEME_PRESETS = {
         'border':        '#444444',
         'control_bg':    '#3a3a3a',
         'control_hover': '#4a4a4a',
-        'line_highlight':'#3a3a3a',
+        'line_highlight':'#4d5b73',   # 元 #3a3a3a (背景に同化) → 青みのある明るめに
         'gutter_bg':     '#2b2b2b',
         'gutter_fg':     '#606060',
     },
@@ -59,7 +62,7 @@ _THEME_PRESETS = {
         'border':        '#1f2d4a',
         'control_bg':    '#1f2d4a',
         'control_hover': '#2a3d60',
-        'line_highlight':'#1a2640',
+        'line_highlight':'#2c4476',   # 元 #1a2640 → よりはっきり
         'gutter_bg':     '#0e1525',
         'gutter_fg':     '#506080',
     },
@@ -74,7 +77,7 @@ _THEME_PRESETS = {
         'border':        '#444444',
         'control_bg':    '#2a2a2a',
         'control_hover': '#3a3a3a',
-        'line_highlight':'#202020',
+        'line_highlight':'#3a3a3a',   # 元 #202020 → くっきり
         'gutter_bg':     '#000000',
         'gutter_fg':     '#888888',
     },
@@ -89,7 +92,7 @@ _THEME_PRESETS = {
         'border':        '#3a3a3a',
         'control_bg':    '#3a3a3a',
         'control_hover': '#4a4a4a',
-        'line_highlight':'#303030',
+        'line_highlight':'#4a4a4a',   # 元 #303030 → より目立つ
         'gutter_bg':     '#1c1c1c',
         'gutter_fg':     '#666666',
     },
@@ -104,7 +107,7 @@ _THEME_PRESETS = {
         'border':        '#cccccc',
         'control_bg':    '#dcdcdc',
         'control_hover': '#c8c8c8',
-        'line_highlight':'#eef2f8',
+        'line_highlight':'#d6e6f5',   # 元 #eef2f8 (白に同化) → 青みのある淡色
         'gutter_bg':     '#f0f0f0',
         'gutter_fg':     '#888888',
     },
@@ -119,7 +122,7 @@ _THEME_PRESETS = {
         'border':        '#b8b298',
         'control_bg':    '#e4dcc3',
         'control_hover': '#d4cba8',
-        'line_highlight':'#eee8d5',
+        'line_highlight':'#d6cfb3',   # 元 #eee8d5 → 一段濃く
         'gutter_bg':     '#eee8d5',
         'gutter_fg':     '#93a1a1',
     },
@@ -296,7 +299,7 @@ class CodeEditor(QPlainTextEdit):
         else:
             candidates = [n for n in ordered if n < current]
             target = candidates[-1] if candidates else ordered[-1]
-        block = self.document().findBlockByLineNumber(target - 1)
+        block = self.document().findBlockByNumber(target - 1)
         if block.isValid():
             cur = self.textCursor()
             cur.setPosition(block.position())
@@ -326,7 +329,7 @@ class CodeEditor(QPlainTextEdit):
         else:
             candidates = [b for b in ordered if b < current]
             target = candidates[-1] if candidates else ordered[-1]
-        block = self.document().findBlockByLineNumber(target - 1)
+        block = self.document().findBlockByNumber(target - 1)
         if block.isValid():
             cur = self.textCursor()
             cur.setPosition(block.position())
@@ -385,6 +388,34 @@ class CodeEditor(QPlainTextEdit):
             cr.left(), cr.top(), self.line_number_area_width(), cr.height()
         )
 
+    def paintEvent(self, event):
+        # 通常の描画 (テキスト + 検索ハイライト等) を全て済ませてから
+        # 現在行に薄い黄色のオーバーレイを乗せる。
+        # super() 完了後に上から塗ることで、検索の黄色マッチがオーバーレイの
+        # アルファ越しに透けて見えるため、行内の検索結果が消えない。
+        super().paintEvent(event)
+        if self.isReadOnly():
+            return
+        try:
+            cur_rect = self.cursorRect()
+        except Exception:
+            return
+        from PyQt6.QtGui import QPainter as _QPainter
+        painter = _QPainter(self.viewport())
+        # 半透明の黄色で行全幅を塗る
+        line_rect_color = QColor(255, 235, 59, 32)  # #FFEB3B alpha 32/255 (ごく薄い)
+        painter.fillRect(
+            0, cur_rect.top(),
+            self.viewport().width(), cur_rect.height(),
+            line_rect_color,
+        )
+        # 左端に薄い黄色アクセントライン (太め) で視認性アップ
+        painter.fillRect(
+            0, cur_rect.top(), 2, cur_rect.height(),
+            QColor(255, 235, 59, 180),
+        )
+        painter.end()
+
     def line_number_area_paint_event(self, event):
         painter = QPainter(self.line_number_area)
         t = _theme()
@@ -404,14 +435,32 @@ class CodeEditor(QPlainTextEdit):
         bm_x  = gw + 2          # ブックマーク列
         num_x = bm_x + bw + 2   # 行番号列
 
+        # 現在のカーソル行 (1-based)
+        current_lineno = self.textCursor().blockNumber() + 1
+        current_accent = QColor("#FFEB3B")   # 検索ハイライトと同じ黄色
+
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 lineno = block_number + 1
+                is_current = (lineno == current_lineno)
+
+                # 現在行のガター背景を強調 (行番号列に薄い黄色帯)
+                if is_current:
+                    painter.fillRect(
+                        num_x - 2, top, area_w - (num_x - 2), line_h,
+                        QColor(255, 235, 59, 50),   # 黄 alpha 50/255 ≒ うっすら
+                    )
 
                 # 変更バー
                 kind = self._change_map.get(lineno)
                 if kind in self._GUTTER_COLORS:
                     painter.fillRect(0, top, gw, line_h, self._GUTTER_COLORS[kind])
+
+                # 現在行アクセントバー (左端の太い縦線、変更バーとは別位置に薄く重ねる)
+                if is_current:
+                    # 変更バーがある場合は右側に、ない場合は同じ位置に細く描画
+                    bar_x = gw if kind in self._GUTTER_COLORS else 0
+                    painter.fillRect(bar_x, top, 3, line_h, current_accent)
 
                 # ブックマーク（青菱形）
                 if lineno in self._bookmarks:
@@ -433,9 +482,14 @@ class CodeEditor(QPlainTextEdit):
                     painter.drawPolygon(diamond)
                     painter.restore()
 
-                # 行番号
-                painter.setPen(QColor(t['gutter_fg']))
-                painter.setFont(self.font())
+                # 行番号 (現在行は黄色 + 太字で強調)
+                if is_current:
+                    painter.setPen(QColor("#FFEB3B"))   # 検索ハイライトと同じ黄色
+                    f = QFont(self.font()); f.setBold(True)
+                    painter.setFont(f)
+                else:
+                    painter.setPen(QColor(t['gutter_fg']))
+                    painter.setFont(self.font())
                 painter.drawText(
                     num_x, top, area_w - num_x - 2, line_h,
                     Qt.AlignmentFlag.AlignRight,
@@ -451,16 +505,19 @@ class CodeEditor(QPlainTextEdit):
         self.highlight_current_line()
 
     def highlight_current_line(self):
-        extra = list(self._search_selections)
+        # ExtraSelections は後に追加したものほど上に重なって描画される。
+        # 検索の黄色マッチを「行ハイライト」に隠されないよう、行系の
+        # FullWidthSelection を先に追加し、最後に検索ハイライトを乗せる。
+        extra = []
 
-        # 変更行の薄い背景着色 (added/modified/deleted)
+        # 1. 変更行の薄い背景着色 (added/modified/deleted)
         if self._change_map:
             doc = self.document()
             for lineno, kind in self._change_map.items():
                 color = self._LINE_BG_COLORS.get(kind)
                 if not color:
                     continue
-                block = doc.findBlockByLineNumber(lineno - 1)
+                block = doc.findBlockByNumber(lineno - 1)
                 if not block.isValid():
                     continue
                 sel = QTextEdit.ExtraSelection()
@@ -471,15 +528,18 @@ class CodeEditor(QPlainTextEdit):
                 sel.cursor = cur
                 extra.append(sel)
 
-        # 現在行ハイライト
-        if not self.isReadOnly():
-            sel = QTextEdit.ExtraSelection()
-            sel.format.setBackground(QColor(_theme()['line_highlight']))
-            sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
-            sel.cursor = self.textCursor()
-            sel.cursor.clearSelection()
-            extra.append(sel)
+        # 2. 検索ハイライト
+        # 現在行ハイライト (FullWidthSelection 背景) は廃止した。
+        # Qt の FullWidthSelection は内部で別パスで描画されるため、
+        # 検索マッチの黄色背景を確実に覆ってしまい、検索結果が見えなくなる
+        # 不具合があった。代わりに左ガター側で「現在行アクセントバー」+
+        # 「行番号の色変え」で現在行を表現する (line_number_area_paint_event)。
+        extra.extend(self._search_selections)
+
         self.setExtraSelections(extra)
+        # カーソル行が変わったらガター側 (現在行アクセントバー / 行番号強調) も
+        # 再描画する必要がある
+        self.line_number_area.update()
 
 
 # ---------------------------------------------------------------------------
@@ -817,93 +877,150 @@ class InlineSearchBar(QWidget):
 
     def _build_ui(self):
         layout = QHBoxLayout()
-        layout.setContentsMargins(6, 2, 6, 2)
+        layout.setContentsMargins(6, 3, 6, 3)
         layout.setSpacing(4)
 
-        # --- 検索欄（履歴コンボ） ---
+        # トグル系ボタン (Aa / .*) 共通スタイル — Grepパネルと統一
+        toggle_style = (
+            "QPushButton { background:#3a3a3a; color:#a9b7c6; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
+            "QPushButton:checked { background:#2a4a8a; color:#fff; border:1px solid #4a8eff; }"
+            "QPushButton:hover { background:#4a4a4a; }"
+            "QPushButton:checked:hover { background:#3a5a9a; }"
+        )
+        # ナビ・履歴・操作系ボタン共通スタイル
+        btn_style = (
+            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; }"
+            "QPushButton:hover { background:#4a4a4a; color:#fff; }"
+        )
+
+        # --- 検索行 (🔍 [input] [📜] [▲] [▼] [matches]  [Aa] [.*]  ✕) ---
+        layout.addWidget(QLabel("🔍"))
         self.search_input = QComboBox()
         self.search_input.setEditable(True)
         self.search_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
-        self.search_input.lineEdit().setPlaceholderText("検索... (Enter: 次へ / Shift+Enter: 前へ)")
-        self.search_input.setMinimumWidth(200)
-        self.search_input.setMaximumWidth(280)
-        self.search_input.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        layout.addWidget(self.search_input)
+        self.search_input.lineEdit().setPlaceholderText(
+            "検索パターン (Enter: 次 / Shift+Enter: 前)"
+        )
+        self.search_input.setMinimumWidth(220)
+        self.search_input.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        layout.addWidget(self.search_input, 2)
 
-        # 履歴ドロップダウンを確実に開くためのボタン
         search_hist_btn = QPushButton("📜")
-        search_hist_btn.setFixedWidth(24)
+        search_hist_btn.setFixedWidth(26)
         search_hist_btn.setToolTip("検索履歴を開く")
+        search_hist_btn.setStyleSheet(btn_style)
         search_hist_btn.clicked.connect(self.search_input.showPopup)
         layout.addWidget(search_hist_btn)
 
         self.prev_btn = QPushButton("▲")
         self.prev_btn.setFixedWidth(26)
         self.prev_btn.setToolTip("前を検索 (Shift+Enter)")
+        self.prev_btn.setStyleSheet(btn_style)
         self.next_btn = QPushButton("▼")
         self.next_btn.setFixedWidth(26)
         self.next_btn.setToolTip("次を検索 (Enter)")
+        self.next_btn.setStyleSheet(btn_style)
         layout.addWidget(self.prev_btn)
         layout.addWidget(self.next_btn)
 
         self.match_label = QLabel("")
-        self.match_label.setFixedWidth(72)
-        self.match_label.setStyleSheet("color:#808080; font-size:10px;")
+        self.match_label.setMinimumWidth(80)
+        self.match_label.setStyleSheet("color:#9ED969; font-size:10px; padding-left:4px;")
         layout.addWidget(self.match_label)
 
-        layout.addWidget(self._sep())
+        # 置換セクション区切り (置換非表示時はこのセパレータも隠す)
+        self._replace_sep_before = self._sep()
+        layout.addWidget(self._replace_sep_before)
 
-        # --- 置換欄（履歴コンボ） ---
+        # --- 置換欄 ---
+        layout.addWidget(QLabel("↦"))   # 「マップ to」 を意味する記号 — 置換セクションの目印
+        self._replace_arrow_label = layout.itemAt(layout.count() - 1).widget()
+
         self.replace_input = QComboBox()
         self.replace_input.setEditable(True)
         self.replace_input.setInsertPolicy(QComboBox.InsertPolicy.NoInsert)
         self.replace_input.lineEdit().setPlaceholderText("置換後のテキスト")
         self.replace_input.setMinimumWidth(160)
-        self.replace_input.setMaximumWidth(220)
-        self.replace_input.setSizeAdjustPolicy(QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon)
-        layout.addWidget(self.replace_input)
+        self.replace_input.setSizeAdjustPolicy(
+            QComboBox.SizeAdjustPolicy.AdjustToMinimumContentsLengthWithIcon
+        )
+        layout.addWidget(self.replace_input, 1)
 
-        replace_hist_btn = QPushButton("📜")
-        replace_hist_btn.setFixedWidth(24)
-        replace_hist_btn.setToolTip("置換履歴を開く")
-        replace_hist_btn.clicked.connect(self.replace_input.showPopup)
-        layout.addWidget(replace_hist_btn)
+        self._replace_hist_btn = QPushButton("📜")
+        self._replace_hist_btn.setFixedWidth(26)
+        self._replace_hist_btn.setToolTip("置換履歴を開く")
+        self._replace_hist_btn.setStyleSheet(btn_style)
+        self._replace_hist_btn.clicked.connect(self.replace_input.showPopup)
+        layout.addWidget(self._replace_hist_btn)
 
         self.replace_btn = QPushButton("置換")
-        self.replace_btn.setFixedWidth(44)
+        self.replace_btn.setFixedWidth(48)
+        self.replace_btn.setToolTip("現在のマッチを置換")
+        self.replace_btn.setStyleSheet(btn_style)
         self.replace_all_btn = QPushButton("全置換")
-        self.replace_all_btn.setFixedWidth(52)
+        self.replace_all_btn.setFixedWidth(56)
+        self.replace_all_btn.setToolTip("全マッチを一括置換")
+        self.replace_all_btn.setStyleSheet(
+            "QPushButton { background:#3a6e3a; color:#e0f0e0; border:none;"
+            "              padding:3px 8px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#4a8e4a; }"
+        )
         layout.addWidget(self.replace_btn)
         layout.addWidget(self.replace_all_btn)
 
-        layout.addWidget(self._sep())
+        self._replace_sep_after = self._sep()
+        layout.addWidget(self._replace_sep_after)
 
-        # --- オプション ---
-        self.case_check = QCheckBox("Aa")
-        self.case_check.setToolTip("大文字小文字を区別する")
-        self.regex_check = QCheckBox(".*")
-        self.regex_check.setToolTip("正規表現")
+        # 置換セクションの子ウィジェット一覧 (set_replace_visible で一括表示切替)
+        self._replace_widgets = [
+            self._replace_sep_before, self._replace_arrow_label,
+            self.replace_input, self._replace_hist_btn,
+            self.replace_btn, self.replace_all_btn, self._replace_sep_after,
+        ]
+
+        # --- オプションをトグルボタン化 (Grepパネルと統一) ---
+        self.case_check = QPushButton("Aa")
+        self.case_check.setCheckable(True)
+        self.case_check.setFixedWidth(34)
+        self.case_check.setToolTip("大文字小文字を区別")
+        self.case_check.setStyleSheet(toggle_style)
+        self.regex_check = QPushButton(".*")
+        self.regex_check.setCheckable(True)
+        self.regex_check.setFixedWidth(34)
+        self.regex_check.setToolTip("正規表現として扱う")
+        self.regex_check.setStyleSheet(toggle_style)
         layout.addWidget(self.case_check)
         layout.addWidget(self.regex_check)
 
         layout.addStretch()
 
+        # --- 閉じる ---
         close_btn = QPushButton("✕")
-        close_btn.setFixedWidth(24)
+        close_btn.setFixedWidth(28)
+        close_btn.setToolTip("検索バーを閉じる (Esc)")
+        close_btn.setStyleSheet(
+            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#7a3a3a; color:#fff; border:1px solid #a55; }"
+        )
         layout.addWidget(close_btn)
 
         self.setLayout(layout)
-        # ※ QComboBox の矢印描画は環境差が大きいため CSS をシンプルに留め、
-        #    別途「📜」アイコンの専用「履歴」ボタンを後ろに置いて確実に開けるようにする。
+        # 全体スタイル (背景・コンボのみ)
         self.setStyleSheet("""
-            QWidget   { background: #333333; }
+            QWidget   { background: #2d2d2d; }
             QLabel    { color: #a9b7c6; }
-            QComboBox { background:#3a3a3a; color:#a9b7c6; border:1px solid #555;
-                        padding:1px 3px; }
+            QComboBox { background:#1e1e1e; color:#e0e0e0; border:1px solid #555;
+                        padding:2px 4px; border-radius:3px; }
+            QComboBox:focus { border:1px solid #4a8eff; }
             QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6;
-                                          selection-background-color:#214283; }
+                                          selection-background-color:#2a4a8a; }
         """)
-        self.setMaximumHeight(32)
+        self.setMaximumHeight(36)
 
         # デバウンスタイマー: タイプ後 N ms 経過してから検索実行
         self._debounce_timer = QTimer(self)
@@ -972,14 +1089,22 @@ class InlineSearchBar(QWidget):
 
     # --------------------------------------------------------------- 公開
 
-    def show_bar(self, initial_text: str = None):
-        """初期テキスト指定可。指定があれば検索欄に挿入してハイライト即実行。"""
+    def show_bar(self, initial_text: str = None, show_replace: bool = False):
+        """初期テキスト指定可。指定があれば検索欄に挿入してハイライト即実行。
+        show_replace: True で置換欄も表示 (Ctrl+H), False で検索のみ (Ctrl+F)。
+        """
         self.show()
+        self.set_replace_visible(show_replace)
         if initial_text:
             self.search_input.setCurrentText(initial_text)
         self.search_input.lineEdit().setFocus()
         self.search_input.lineEdit().selectAll()
         self._update_highlights()
+
+    def set_replace_visible(self, visible: bool):
+        """置換欄 (replace input / hist / 置換 / 全置換ボタン / セパレータ) の表示切替。"""
+        for w in self._replace_widgets:
+            w.setVisible(visible)
 
     def close_bar(self):
         self._editor.set_search_highlights([])
@@ -1381,17 +1506,77 @@ class FTPConnectDialog(QDialog):
         self.delete_btn.setEnabled(self.profile_combo.currentIndex() > 0)
 
     def info(self):
+        # 「-- 新規 --」を選んでいなければ、選択中のプロファイル名も返す
+        name = self.profile_combo.currentText()
+        profile_name = '' if name == '-- 新規 --' else name
         return {
             'host': self.host.text(),
             'port': int(self.port.text() or 21),
             'user': self.user.text(),
             'password': self.password.text(),
+            'profile_name': profile_name,
         }
 
 
 # ---------------------------------------------------------------------------
 # FTPパネル
 # ---------------------------------------------------------------------------
+
+class _FtpDownloadWorker(QThread):
+    """ftplib.retrbinary を別スレッドで実行し、進捗を通知するワーカー。
+    UI 側は QProgressDialog で進捗 / 速度 / キャンセルを扱う。
+    """
+    progress     = pyqtSignal(int)   # 累計取得バイト数
+    finished_ok  = pyqtSignal(str)   # 完了時: ローカルパス
+    finished_err = pyqtSignal(str)   # エラー時: 例外メッセージ
+
+    def __init__(self, ftp, remote_name: str, local_path: str, parent=None):
+        super().__init__(parent)
+        self._ftp = ftp
+        self._remote_name = remote_name
+        self._local_path = local_path
+        self._cancelled = False
+        self._downloaded = 0
+
+    def cancel(self):
+        self._cancelled = True
+
+    def run(self):
+        try:
+            with open(self._local_path, 'wb') as f:
+                def _on_chunk(chunk: bytes):
+                    if self._cancelled:
+                        # retrbinary のコールバック内で例外を投げると中断できる
+                        raise RuntimeError("CANCELLED_BY_USER")
+                    f.write(chunk)
+                    self._downloaded += len(chunk)
+                    self.progress.emit(self._downloaded)
+                self._ftp.retrbinary(f'RETR {self._remote_name}', _on_chunk)
+            self.finished_ok.emit(self._local_path)
+        except RuntimeError as e:
+            if 'CANCELLED_BY_USER' in str(e):
+                # 中途半端な一時ファイルは削除
+                try: os.remove(self._local_path)
+                except Exception: pass
+                self.finished_err.emit("ユーザーがキャンセルしました")
+            else:
+                self.finished_err.emit(str(e))
+        except Exception as e:
+            try: os.remove(self._local_path)
+            except Exception: pass
+            self.finished_err.emit(str(e))
+
+
+def _fmt_bytes(n: int) -> str:
+    """バイト数を人間に読みやすい単位 (B/KB/MB/GB) で整形する。"""
+    if n < 1024:
+        return f"{n} B"
+    for unit in ('KB', 'MB', 'GB'):
+        n /= 1024
+        if n < 1024:
+            return f"{n:.1f} {unit}"
+    return f"{n:.1f} TB"
+
 
 class FTPPanel(QWidget):
     file_downloaded      = pyqtSignal(str, str)  # content, filename (互換用)
@@ -1401,11 +1586,13 @@ class FTPPanel(QWidget):
         super().__init__(parent)
         self.ftp = None
         self.current_path = '/'
+        # 接続中の保存済みプロファイル名 (空文字 = 一時接続/--新規--)
+        self._active_profile_name: str = ''
         # ローカルパスを渡して「未保存編集あり」かを返すコールバック (MainWindow が注入)
         self._is_modified_cb = lambda _local_path: False
 
     def set_modification_checker(self, fn):
-        """MainWindow から呼ぶ: 引数local_path → bool (未保存編集あり) を返す関数"""
+        """MainWindow から呼ぶ: 引数local_path → bool (未保存編集あり) を返す関数 + UI を構築"""
         self._is_modified_cb = fn
 
         layout = QVBoxLayout()
@@ -1429,6 +1616,14 @@ class FTPPanel(QWidget):
         layout.addWidget(self.path_label)
 
         self.file_list = QListWidget()
+        # 複数選択を有効化 (Ctrl/Shift クリックで複数選択 → 一括ダウンロード可)
+        self.file_list.setSelectionMode(
+            QListWidget.SelectionMode.ExtendedSelection
+        )
+        self.file_list.setToolTip(
+            "Ctrl+クリック または Shift+クリック で複数選択可能\n"
+            "複数選択時は「開く / ダウンロード」ボタンでまとめて取得"
+        )
         layout.addWidget(self.file_list)
 
         self.open_btn = QPushButton("開く / ダウンロード")
@@ -1454,27 +1649,69 @@ class FTPPanel(QWidget):
             self.ftp = ftplib.FTP()
             self.ftp.connect(info['host'], info['port'], timeout=10)
             self.ftp.login(info['user'], info['password'])
-            self.status_label.setText(f"接続中: {info['host']}")
-            self.status_label.setStyleSheet("color: #6A8759; padding: 2px;")
+            # 接続表示: 保存済みプロファイル名があればそれを優先、無ければホスト
+            display_name = info.get('profile_name') or info['host']
+            self.status_label.setText(f"接続中: {display_name}")
+            # 明るい緑にして視認性アップ (旧 #6A8759 は暗くて読みにくいため)
+            self.status_label.setStyleSheet(
+                "color: #9ED969; padding: 2px; font-weight: 600;"
+            )
+            self.status_label.setToolTip(f"ホスト: {info['host']}  ユーザー: {info['user']}")
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
-            self._list('/')
+
+            # 接続中プロファイル名を保持 (ディレクトリ変更時の永続化に使う)
+            self._active_profile_name = info.get('profile_name', '')
+
+            # プロファイルに last_dir があれば自動 cd を試みる
+            initial_dir = '/'
+            if self._active_profile_name:
+                profs = load_profiles()
+                saved_dir = (profs.get(self._active_profile_name, {}) or {}).get('last_dir')
+                if saved_dir:
+                    try:
+                        # cwd できるかテスト (失敗してもエラーにせず / にフォールバック)
+                        self.ftp.cwd(saved_dir)
+                        initial_dir = saved_dir
+                    except Exception:
+                        initial_dir = '/'
+            self._list(initial_dir)
         except Exception as e:
             QMessageBox.critical(self, "接続エラー", str(e))
 
     def _disconnect(self):
+        # 切断前に最新ディレクトリを永続化しておく
+        self._persist_last_dir()
         if self.ftp:
             try:
                 self.ftp.quit()
             except Exception:
                 pass
             self.ftp = None
+        self._active_profile_name = ''
         self.status_label.setText("未接続")
         self.status_label.setStyleSheet("color: #808080; padding: 2px;")
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
         self.file_list.clear()
         self.open_btn.setEnabled(False)
+
+    def _persist_last_dir(self):
+        """現在のディレクトリを接続中プロファイルに保存 (次回接続時の初期DIRに使う)。"""
+        name = self._active_profile_name
+        if not name:
+            return  # 一時接続は記憶しない
+        try:
+            profs = load_profiles()
+            if name not in profs:
+                return
+            # 同じ値なら書き込みスキップ (無駄な disk write を減らす)
+            if profs[name].get('last_dir') == self.current_path:
+                return
+            profs[name]['last_dir'] = self.current_path
+            save_profiles(profs)
+        except Exception:
+            pass
 
     def _list(self, path):
         if not self.ftp:
@@ -1484,6 +1721,8 @@ class FTPPanel(QWidget):
             self.current_path = self.ftp.pwd()
             self.path_label.setText(self.current_path)
             self.file_list.clear()
+            # 接続プロファイルが特定済みなら最新ディレクトリを永続化
+            self._persist_last_dir()
 
             if self.current_path != '/':
                 item = QListWidgetItem("[..] 親フォルダへ")
@@ -1525,17 +1764,62 @@ class FTPPanel(QWidget):
             self._download(name)
 
     def _on_selection(self):
+        """選択中にファイルが1つでも含まれていれば「開く/ダウンロード」を有効化。
+        フォルダ単独選択や未選択時は無効。複数件選択時はボタン名を切替。"""
         items = self.file_list.selectedItems()
-        ok = bool(items and items[0].data(Qt.ItemDataRole.UserRole)
-                  and items[0].data(Qt.ItemDataRole.UserRole)[0] == 'file')
-        self.open_btn.setEnabled(ok)
+        file_count = 0
+        for it in items:
+            d = it.data(Qt.ItemDataRole.UserRole)
+            if d and d[0] == 'file':
+                file_count += 1
+        self.open_btn.setEnabled(file_count > 0)
+        if file_count > 1:
+            self.open_btn.setText(f"開く / ダウンロード ({file_count} 件)")
+        else:
+            self.open_btn.setText("開く / ダウンロード")
 
     def _open_selected(self):
         items = self.file_list.selectedItems()
-        if items:
-            data = items[0].data(Qt.ItemDataRole.UserRole)
-            if data and data[0] == 'file':
-                self._download(data[1])
+        files = [it.data(Qt.ItemDataRole.UserRole)[1]
+                 for it in items
+                 if it.data(Qt.ItemDataRole.UserRole)
+                 and it.data(Qt.ItemDataRole.UserRole)[0] == 'file']
+        if not files:
+            return
+        if len(files) == 1:
+            self._download(files[0])
+        else:
+            self._download_many(files)
+
+    def _download_many(self, names):
+        """複数ファイルを順次ダウンロード (各ファイルにつき進捗ダイアログを表示)。
+        途中でキャンセルされたら以降の処理も中止。"""
+        total_n = len(names)
+        completed = []
+        for i, name in enumerate(names, 1):
+            # 状態ラベルに「i/N」を表示
+            self.status_label.setText(f"複数DL: {i}/{total_n} {name} を取得中...")
+            QApplication.processEvents()
+            # _download は内部で進捗ダイアログを出すので、ここでは1件ずつ呼ぶだけ
+            # 各 _download の最後で file_downloaded_path シグナルが発火 → タブで開く
+            try:
+                self._download(name)
+                completed.append(name)
+            except Exception as e:
+                QMessageBox.warning(self, "ダウンロードエラー", f"{name}: {e}")
+                # 続行確認
+                ans = QMessageBox.question(
+                    self, "続行確認",
+                    f"{name} のダウンロードに失敗しました。\n残り {total_n - i} 件のダウンロードを続けますか?",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    break
+        # 完了表示 (ステータス) — 接続中に戻す
+        display_name = self._active_profile_name or getattr(self.ftp, 'host', 'ftp')
+        self.status_label.setText(
+            f"接続中: {display_name}  (完了: {len(completed)}/{total_n} 件)"
+        )
 
     # サイズ閾値
     _SIZE_WARN = 5 * 1024 * 1024       # 5 MB
@@ -1596,15 +1880,106 @@ class FTPPanel(QWidget):
             if ans != QMessageBox.StandardButton.Yes:
                 return
 
-        try:
-            with open(local_path, 'wb') as f:
-                self.ftp.retrbinary(f'RETR {name}', f.write)
-        except Exception as e:
-            QMessageBox.warning(self, "ダウンロードエラー", str(e))
-            return
+        # 4. プログレスダイアログ + 別スレッドでダウンロード
+        # (大きいファイルでも UI が固まらないように)
+        # サイズ不明 (size=0) の時は最大値 0 でビジー表示
+        progress = QProgressDialog(
+            f"ダウンロード中: {name}",
+            "キャンセル",
+            0,
+            max(size, 0),
+            self,
+        )
+        progress.setWindowTitle("FTP ダウンロード")
+        progress.setMinimumDuration(0)
+        progress.setMinimumWidth(420)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setWindowModality(Qt.WindowModality.WindowModal)
+        progress.setStyleSheet(
+            "QProgressDialog { background:#2b2b2b; }"
+            "QLabel { color:#a9b7c6; }"
+            "QPushButton { background:#4a4a4a; color:#a9b7c6; border:none;"
+            "              padding:4px 12px; border-radius:2px; }"
+            "QPushButton:hover { background:#5a5a5a; }"
+            "QProgressBar { background:#1e1e1e; color:#fff; border:1px solid #555;"
+            "               border-radius:2px; text-align:center; }"
+            "QProgressBar::chunk { background:#4a8e4a; }"
+        )
 
-        # 4. ローカルパスでファイルを開く (`_load_file` 経由 → Ctrl+S で上書き可)
-        self.file_downloaded_path.emit(local_path, name)
+        worker = _FtpDownloadWorker(self.ftp, name, local_path, self)
+        # 経過時間 / 速度算出用
+        import time as _time
+        t_start = _time.monotonic()
+
+        def _on_progress(done: int):
+            elapsed = _time.monotonic() - t_start
+            speed_str = ""
+            eta_str = ""
+            if elapsed > 0.2:
+                speed = done / elapsed   # bytes/sec
+                speed_str = f"  ({_fmt_bytes(int(speed))}/s)"
+                if size > 0 and speed > 0:
+                    remaining = max(0, size - done)
+                    eta = remaining / speed
+                    eta_str = f"  残り {eta:.0f} 秒"
+            if size > 0:
+                pct = int(done * 100 / size) if size else 0
+                progress.setValue(done)
+                progress.setLabelText(
+                    f"ダウンロード中: {name}\n"
+                    f"{_fmt_bytes(done)} / {_fmt_bytes(size)}  ({pct}%){speed_str}{eta_str}"
+                )
+            else:
+                progress.setLabelText(
+                    f"ダウンロード中: {name}\n"
+                    f"{_fmt_bytes(done)}{speed_str}  (合計サイズ不明)"
+                )
+
+        worker.progress.connect(_on_progress)
+
+        # 完了/エラー処理 — Qt の queued signal はワーカースレッドから main
+        # スレッドにディスパッチされる。worker.isRunning() で待つだけだと
+        # スレッド終了直後にシグナル到達前のタイミングで抜けてしまうため、
+        # 「シグナルが届くまで」を完了条件にする (done フラグ方式)。
+        result = {'ok': False, 'err': '', 'path': '', 'done': False}
+
+        def _on_ok(path: str):
+            result['ok'] = True
+            result['path'] = path
+            result['done'] = True
+            progress.setValue(max(size, 1))
+            progress.close()
+
+        def _on_err(err: str):
+            result['err'] = err
+            result['done'] = True
+            progress.close()
+
+        worker.finished_ok.connect(_on_ok)
+        worker.finished_err.connect(_on_err)
+        progress.canceled.connect(worker.cancel)
+
+        worker.start()
+        # done フラグが立つまで Qt イベントループを回す
+        # (進捗ダイアログはモーダルなのでユーザーは他の FTP 操作を打てない)
+        while not result['done']:
+            QApplication.processEvents()
+            # CPU 100%を避けるため、進行中は短時間待機
+            if worker.isRunning():
+                worker.wait(30)
+            else:
+                # スレッドは終わってるが queued signal がまだ届いていない
+                # 数回 processEvents() を回せば届く
+                worker.wait(5)
+        # 最後にスレッドが完全に終了するのを待つ (リソースリーク防止)
+        worker.wait()
+
+        if result['ok']:
+            self.file_downloaded_path.emit(local_path, name)
+        else:
+            if result['err'] and 'キャンセル' not in result['err']:
+                QMessageBox.warning(self, "ダウンロードエラー", result['err'])
 
 
 # ---------------------------------------------------------------------------
@@ -1613,6 +1988,7 @@ class FTPPanel(QWidget):
 
 class BookmarkPanel(QWidget):
     jump_requested = pyqtSignal(object, int)  # EditorTab, lineno
+    close_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -1625,16 +2001,27 @@ class BookmarkPanel(QWidget):
         layout.setSpacing(2)
 
         header = QHBoxLayout()
-        header.addWidget(QLabel("ブックマーク一覧"))
+        header.addWidget(QLabel("🔖 ブックマーク一覧"))
         refresh_btn = QPushButton("更新")
         refresh_btn.setMaximumWidth(50)
         refresh_btn.clicked.connect(self._refresh)
         clear_btn = QPushButton("全削除")
         clear_btn.setMaximumWidth(60)
         clear_btn.clicked.connect(self._clear_all)
+        # 閉じるボタン (Grep パネルと同スタイル)
+        close_btn = QPushButton("✕")
+        close_btn.setFixedWidth(28)
+        close_btn.setToolTip("ブックマーク一覧を閉じる (Esc)")
+        close_btn.setStyleSheet(
+            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#7a3a3a; color:#fff; border:1px solid #a55; }"
+        )
+        close_btn.clicked.connect(self.close_requested.emit)
         header.addStretch()
         header.addWidget(refresh_btn)
         header.addWidget(clear_btn)
+        header.addWidget(close_btn)
         layout.addLayout(header)
 
         self.list_widget = QListWidget()
@@ -1646,6 +2033,13 @@ class BookmarkPanel(QWidget):
         layout.addWidget(hint)
         self.setLayout(layout)
 
+    def keyPressEvent(self, event):
+        # Esc キーで閉じる
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_requested.emit()
+            return
+        super().keyPressEvent(event)
+
     def set_tabs(self, tab_refs: list[tuple[str, object]]):
         self._tab_refs = tab_refs
         self._refresh()
@@ -1655,7 +2049,7 @@ class BookmarkPanel(QWidget):
         for label, tab in self._tab_refs:
             editor = tab.editor
             for lineno in sorted(editor._bookmarks):
-                block = editor.document().findBlockByLineNumber(lineno - 1)
+                block = editor.document().findBlockByNumber(lineno - 1)
                 preview = block.text().strip()[:60] if block.isValid() else ''
                 item = QListWidgetItem(f"  行 {lineno:>5}   {preview}")
                 item.setData(Qt.ItemDataRole.UserRole, (tab, lineno))
@@ -1748,66 +2142,248 @@ class GrepWorker(QThread):
 # Grepパネル（検索UI + 結果ツリー）
 # ---------------------------------------------------------------------------
 
+class _GrepMatchDelegate(QStyledItemDelegate):
+    """Grep 結果のマッチ部分を黄色背景でハイライト描画するデリゲート。
+    対象は QTreeWidget の column=1 (マッチ内容セル) のみ。
+    """
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._pattern: str = ''
+        self._case_sensitive: bool = False
+        self._is_regex: bool = False
+        self._compiled = None
+
+    def set_pattern(self, pattern: str, case_sensitive: bool, is_regex: bool):
+        self._pattern = pattern or ''
+        self._case_sensitive = case_sensitive
+        self._is_regex = is_regex
+        # 正規表現はコンパイルしておく (描画ごとの再パースを避ける)
+        self._compiled = None
+        if pattern and is_regex:
+            try:
+                flags = 0 if case_sensitive else re.IGNORECASE
+                self._compiled = re.compile(pattern, flags)
+            except re.error:
+                self._compiled = None
+
+    def _find_matches(self, text: str) -> list[tuple[int, int]]:
+        """マッチ位置の (start, end) リストを返す。"""
+        if not text or not self._pattern:
+            return []
+        spans: list[tuple[int, int]] = []
+        if self._is_regex:
+            if self._compiled is None:
+                return []
+            for m in self._compiled.finditer(text):
+                if m.start() != m.end():
+                    spans.append((m.start(), m.end()))
+        else:
+            hay = text if self._case_sensitive else text.lower()
+            ndl = self._pattern if self._case_sensitive else self._pattern.lower()
+            n = len(ndl)
+            if n == 0:
+                return []
+            i = 0
+            while True:
+                p = hay.find(ndl, i)
+                if p < 0:
+                    break
+                spans.append((p, p + n))
+                i = p + n
+        return spans
+
+    def paint(self, painter, option, index):
+        # マッチ内容列以外は通常描画
+        if index.column() != 1 or not self._pattern:
+            super().paint(painter, option, index)
+            return
+        text = index.data(Qt.ItemDataRole.DisplayRole) or ''
+        spans = self._find_matches(text)
+        if not spans:
+            super().paint(painter, option, index)
+            return
+
+        # 通常の背景・選択状態を先に描画
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        # テキスト部分は自前で描くので空に
+        original_text = opt.text
+        opt.text = ''
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+        # テキスト描画矩形を取得
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget
+        )
+        painter.save()
+        painter.setClipRect(text_rect)
+        painter.setFont(opt.font)
+
+        # 通常文字色 (選択中は強調色)
+        fg = opt.palette.color(
+            opt.palette.ColorGroup.Active,
+            opt.palette.ColorRole.HighlightedText if (opt.state & QStyle.StateFlag.State_Selected)
+            else opt.palette.ColorRole.Text
+        )
+        hl_bg = QColor("#FFEB3B")   # マッチ背景: 鮮やかな黄色
+        hl_fg = QColor("#1a1a1a")   # マッチ文字色: 黒
+        fm = painter.fontMetrics()
+
+        x = text_rect.left() + 2
+        y = text_rect.top()
+        h = text_rect.height()
+        baseline_y = y + (h + fm.ascent() - fm.descent()) // 2
+
+        # 描画: 通常部分 → ハイライト部分 → ... を順に塗る
+        last = 0
+        for s, e in spans:
+            # 直前の通常部分
+            if s > last:
+                seg = original_text[last:s]
+                painter.setPen(fg)
+                painter.drawText(x, baseline_y, seg)
+                x += fm.horizontalAdvance(seg)
+                if x > text_rect.right():
+                    break
+            # マッチ部分 (背景ベタ塗り + 太字)
+            seg = original_text[s:e]
+            w = fm.horizontalAdvance(seg)
+            painter.fillRect(x, y, w, h, hl_bg)
+            old_font = painter.font()
+            bold_font = QFont(old_font)
+            bold_font.setBold(True)
+            painter.setFont(bold_font)
+            painter.setPen(hl_fg)
+            painter.drawText(x, baseline_y, seg)
+            painter.setFont(old_font)
+            x += w
+            last = e
+            if x > text_rect.right():
+                break
+        # 末尾の残り
+        if last < len(original_text) and x <= text_rect.right():
+            painter.setPen(fg)
+            painter.drawText(x, baseline_y, original_text[last:])
+        painter.restore()
+
+
 class GrepPanel(QWidget):
-    open_file_requested = pyqtSignal(str, int)  # filepath, lineno
+    # ファイルパス, 行番号, マッチ行テキスト (リロード後にズレた場合の照合用)
+    open_file_requested = pyqtSignal(str, int, str)
+    close_requested = pyqtSignal()
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._worker = None
         self._file_items = {}
+        # 検索条件 (start_search 時に更新される)
+        self._search_pattern: str = ''
+        self._case_sensitive: bool = False
+        self._is_regex: bool = False
         self._build_ui()
 
     def _build_ui(self):
         layout = QVBoxLayout()
-        layout.setContentsMargins(2, 2, 2, 2)
-        layout.setSpacing(2)
+        layout.setContentsMargins(4, 4, 4, 4)
+        layout.setSpacing(4)
 
-        # 1行目：パターン + ファイルフィルタ
-        row1 = QHBoxLayout()
-        row1.addWidget(QLabel("検索:"))
+        # 1行目: フォルダ選択 (一番大事な「どこを検索するか」を最上段に)
+        row_dir = QHBoxLayout()
+        row_dir.setSpacing(4)
+        row_dir.addWidget(QLabel("📁"))
+        self.dir_input = QLineEdit()
+        self.dir_input.setPlaceholderText("検索フォルダ (... ボタンで選択)")
+        row_dir.addWidget(self.dir_input, 1)
+        self.browse_btn = QPushButton("...")
+        self.browse_btn.setFixedWidth(30)
+        self.browse_btn.setToolTip("フォルダを参照")
+        row_dir.addWidget(self.browse_btn)
+        layout.addLayout(row_dir)
+
+        # 2行目: 検索パターン + ファイル種別 + オプション + ボタン (全部1行に集約)
+        row_search = QHBoxLayout()
+        row_search.setSpacing(4)
+        row_search.addWidget(QLabel("🔍"))
         self.pattern_input = QLineEdit()
         self.pattern_input.setPlaceholderText("検索パターン")
-        row1.addWidget(self.pattern_input, 2)
-        row1.addWidget(QLabel("ファイル:"))
+        row_search.addWidget(self.pattern_input, 3)
+
+        # ファイル glob (コンパクトに)
         self.glob_input = QLineEdit("*")
-        self.glob_input.setMaximumWidth(130)
-        self.glob_input.setPlaceholderText("*.py, *.txt")
-        row1.addWidget(self.glob_input)
-        layout.addLayout(row1)
+        self.glob_input.setFixedWidth(90)
+        self.glob_input.setPlaceholderText("*.log")
+        self.glob_input.setToolTip("対象ファイルパターン (例: *.log, *.py)")
+        row_search.addWidget(self.glob_input)
 
-        # 2行目：フォルダ選択
-        row2 = QHBoxLayout()
-        row2.addWidget(QLabel("フォルダ:"))
-        self.dir_input = QLineEdit()
-        self.dir_input.setPlaceholderText("検索するフォルダを選択...")
-        row2.addWidget(self.dir_input, 1)
-        self.browse_btn = QPushButton("...")
-        self.browse_btn.setMaximumWidth(32)
-        row2.addWidget(self.browse_btn)
-        layout.addLayout(row2)
+        # オプションをトグルボタン化 (チェックボックスより視覚的にスッキリ)
+        self.case_check = QPushButton("Aa")
+        self.case_check.setCheckable(True)
+        self.case_check.setFixedWidth(34)
+        self.case_check.setToolTip("大文字小文字を区別")
+        self.regex_check = QPushButton(".*")
+        self.regex_check.setCheckable(True)
+        self.regex_check.setFixedWidth(34)
+        self.regex_check.setToolTip("正規表現として扱う")
+        toggle_style = (
+            "QPushButton { background:#3a3a3a; color:#a9b7c6; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
+            "QPushButton:checked { background:#2a4a8a; color:#fff; border:1px solid #4a8eff; }"
+            "QPushButton:hover { background:#4a4a4a; }"
+            "QPushButton:checked:hover { background:#3a5a9a; }"
+        )
+        self.case_check.setStyleSheet(toggle_style)
+        self.regex_check.setStyleSheet(toggle_style)
+        row_search.addWidget(self.case_check)
+        row_search.addWidget(self.regex_check)
 
-        # 3行目：オプション + 実行ボタン
-        row3 = QHBoxLayout()
-        self.case_check = QCheckBox("大文字小文字区別")
-        self.regex_check = QCheckBox("正規表現")
-        self.search_btn = QPushButton("検索")
-        self.stop_btn = QPushButton("停止")
+        # メインアクション (緑強調)
+        self.search_btn = QPushButton("▶ 検索")
+        self.search_btn.setFixedWidth(72)
+        self.search_btn.setStyleSheet(
+            "QPushButton { background:#3a6e3a; color:#e0f0e0;"
+            "              border:none; padding:3px 10px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#4a8e4a; }"
+            "QPushButton:disabled { background:#3a3a3a; color:#666; }"
+        )
+        row_search.addWidget(self.search_btn)
+        self.stop_btn = QPushButton("■")
         self.stop_btn.setEnabled(False)
+        self.stop_btn.setFixedWidth(30)
+        self.stop_btn.setToolTip("検索を停止")
+        row_search.addWidget(self.stop_btn)
+
+        # 件数表示 (右端、控えめに)
         self.result_label = QLabel("")
-        row3.addWidget(self.case_check)
-        row3.addWidget(self.regex_check)
-        row3.addWidget(self.search_btn)
-        row3.addWidget(self.stop_btn)
-        row3.addStretch()
-        row3.addWidget(self.result_label)
-        layout.addLayout(row3)
+        self.result_label.setStyleSheet("color:#9ED969; padding-left:8px; min-width:90px;")
+        row_search.addWidget(self.result_label)
+
+        # 閉じるボタン (Grepパネル自体を非表示にする)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedWidth(28)
+        self.close_btn.setToolTip("Grepパネルを閉じる (Esc)")
+        self.close_btn.setStyleSheet(
+            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
+            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#7a3a3a; color:#fff; border:1px solid #a55; }"
+        )
+        row_search.addWidget(self.close_btn)
+        layout.addLayout(row_search)
 
         # 結果ツリー
         self.tree = QTreeWidget()
         self.tree.setHeaderLabels(["ファイル / 行番号", "マッチ内容"])
-        self.tree.setColumnWidth(0, 280)
+        self.tree.setColumnWidth(0, 340)
         self.tree.setRootIsDecorated(True)
+        # ジャンプ: ダブルクリック / Enter (activated) / シングルクリック の全てで対応
+        # シングルクリック対応により VS Code 等と同じ感覚で素早く移動できる
         self.tree.itemDoubleClicked.connect(self._on_double_click)
+        self.tree.itemActivated.connect(self._on_double_click)
+        self.tree.itemClicked.connect(self._on_double_click)
+        # マッチ箇所を黄色背景でハイライトするデリゲートを「マッチ内容」列に適用
+        self._match_delegate = _GrepMatchDelegate(self.tree)
+        self.tree.setItemDelegateForColumn(1, self._match_delegate)
         layout.addWidget(self.tree)
 
         self.setLayout(layout)
@@ -1816,6 +2392,14 @@ class GrepPanel(QWidget):
         self.search_btn.clicked.connect(self.start_search)
         self.stop_btn.clicked.connect(self._stop_search)
         self.pattern_input.returnPressed.connect(self.start_search)
+        self.close_btn.clicked.connect(self.close_requested.emit)
+
+    def keyPressEvent(self, event):
+        # Esc キーで Grep パネルを閉じる
+        if event.key() == Qt.Key.Key_Escape:
+            self.close_requested.emit()
+            return
+        super().keyPressEvent(event)
 
     def set_directory(self, path):
         if path:
@@ -1842,6 +2426,17 @@ class GrepPanel(QWidget):
         self.search_btn.setEnabled(False)
         self.stop_btn.setEnabled(True)
 
+        # マッチハイライト用にデリゲートへ現在の検索条件を伝える
+        self._match_delegate.set_pattern(
+            pattern,
+            self.case_check.isChecked(),
+            self.regex_check.isChecked(),
+        )
+        # _on_result で行を切り詰める際に使うため、パネル側にも検索条件を保持
+        self._search_pattern = pattern
+        self._case_sensitive = self.case_check.isChecked()
+        self._is_regex = self.regex_check.isChecked()
+
         self._worker = GrepWorker(
             directory, pattern,
             self.glob_input.text() or '*',
@@ -1859,20 +2454,75 @@ class GrepPanel(QWidget):
         self.search_btn.setEnabled(True)
         self.stop_btn.setEnabled(False)
 
+    # 表示用にマッチ周辺だけを切り出す長さ
+    _TRIM_HEAD = 30   # マッチ前に確保するコンテキスト (文字数)
+    _TRIM_TAIL = 200  # マッチ後に残す長さ
+
+    def _trim_around_match(self, line: str) -> str:
+        """長い行はマッチ箇所周辺だけを切り出して表示する。"""
+        line = line.strip()
+        if not self._search_pattern or len(line) < 200:
+            return line
+        # マッチ位置を取得
+        match_start = -1
+        match_end = -1
+        try:
+            if self._is_regex:
+                flags = 0 if self._case_sensitive else re.IGNORECASE
+                m = re.search(self._search_pattern, line, flags)
+                if m and m.start() != m.end():
+                    match_start, match_end = m.start(), m.end()
+            else:
+                hay = line if self._case_sensitive else line.lower()
+                ndl = self._search_pattern if self._case_sensitive else self._search_pattern.lower()
+                p = hay.find(ndl)
+                if p >= 0:
+                    match_start, match_end = p, p + len(ndl)
+        except Exception:
+            return line[: self._TRIM_HEAD + self._TRIM_TAIL]
+
+        if match_start < 0:
+            return line[: self._TRIM_HEAD + self._TRIM_TAIL]
+
+        # マッチ前のコンテキスト
+        if match_start > self._TRIM_HEAD:
+            prefix = '… ' + line[match_start - self._TRIM_HEAD:match_start]
+        else:
+            prefix = line[:match_start]
+        # マッチ後のコンテキスト
+        tail_end = match_end + self._TRIM_TAIL
+        if tail_end < len(line):
+            suffix = line[match_end:tail_end] + ' …'
+        else:
+            suffix = line[match_end:]
+        return prefix + line[match_start:match_end] + suffix
+
     def _on_result(self, filepath, lineno, line):
         if filepath not in self._file_items:
             item = QTreeWidgetItem(self.tree)
             item.setText(0, filepath)
-            item.setForeground(0, QColor("#6897BB"))
-            item.setData(0, Qt.ItemDataRole.UserRole, ('file', filepath, 0))
+            item.setForeground(0, QColor("#82AAFF"))
+            f = item.font(0); f.setBold(True); item.setFont(0, f)
+            item.setData(0, Qt.ItemDataRole.UserRole, ('file', filepath, 0, ''))
             self._file_items[filepath] = item
 
         parent = self._file_items[filepath]
         child = QTreeWidgetItem(parent)
-        child.setText(0, f"  行 {lineno}")
-        child.setText(1, line.strip())
-        child.setForeground(0, QColor("#808080"))
-        child.setData(0, Qt.ItemDataRole.UserRole, ('line', filepath, lineno))
+        # ファイル名 (basename) を併記しておく事で、ファイルヘッダーがスクロール
+        # で見えなくなっても「どのファイルの何行目か」が一目で分かるようにする
+        basename = os.path.basename(filepath)
+        child.setText(0, f"  {basename}: {lineno}")
+        # 長い行はマッチ周辺だけを表示する (マッチ部分は必ず可視に)
+        display_line = self._trim_around_match(line)
+        child.setText(1, display_line)
+        child.setForeground(0, QColor("#a0a0a0"))
+        # ホバー時にフルパス + フルマッチ行をツールチップ表示 (切り詰めた中身もここで確認できる)
+        tip = f"{filepath}\n行 {lineno}\n\n{line.rstrip()}"
+        child.setToolTip(0, tip)
+        child.setToolTip(1, tip)
+        # マッチ行のテキストも保存 (ファイル更新で行番号がズレた時の照合用)
+        # ジャンプ判定用なので 元の (切り詰めていない) 行 を保持する
+        child.setData(0, Qt.ItemDataRole.UserRole, ('line', filepath, lineno, line.rstrip()))
         parent.setExpanded(True)
 
     def _on_finished(self, count):
@@ -1884,7 +2534,10 @@ class GrepPanel(QWidget):
     def _on_double_click(self, item, _col):
         data = item.data(0, Qt.ItemDataRole.UserRole)
         if data and data[0] == 'line':
-            self.open_file_requested.emit(data[1], data[2])
+            filepath = data[1]
+            lineno = data[2]
+            line_text = data[3] if len(data) > 3 else ''
+            self.open_file_requested.emit(filepath, lineno, line_text)
 
 
 # ---------------------------------------------------------------------------
@@ -2185,6 +2838,10 @@ class MainWindow(QMainWindow):
         self.setMinimumSize(800, 500)
         self.resize(1200, 800)
 
+        # 起動元プロファイル名 (ssh_log_viewer から --profile で渡される)
+        # DB実行ダイアログで「最初に選択する接続プロファイル」として使う
+        self._origin_profile: str = ''
+
         # 外部ファイル変更検知
         self._fs_watcher = QFileSystemWatcher(self)
         self._fs_watcher.fileChanged.connect(self._on_external_change)
@@ -2224,10 +2881,12 @@ class MainWindow(QMainWindow):
 
         self.grep_panel = GrepPanel()
         self.grep_panel.open_file_requested.connect(self._open_file_at_line)
+        self.grep_panel.close_requested.connect(self._hide_grep_panel)
         self.grep_panel.hide()
 
         self.bookmark_panel = BookmarkPanel()
         self.bookmark_panel.jump_requested.connect(self._jump_to_bookmark)
+        self.bookmark_panel.close_requested.connect(self._hide_bookmark_panel)
         self.bookmark_panel.hide()
 
         # 下部エリアを横スプリッターで Grep | Bookmark に分割
@@ -2246,6 +2905,9 @@ class MainWindow(QMainWindow):
         self.splitter.setStretchFactor(1, 1)
         self.setCentralWidget(self.splitter)
 
+        # クイックアクセスツールバー (アイコンで主要機能を素早く起動)
+        self._setup_toolbar()
+
         self.pos_label = QLabel("行: 1  列: 1")
         # 言語切替コンボ (ステータスバーで現在の言語を確認・変更)
         self.lang_combo = QComboBox()
@@ -2259,6 +2921,77 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.lang_combo)
         self.setStatusBar(sb)
 
+    def _setup_toolbar(self):
+        """主要機能のアイコンを並べたクイックアクセスツールバー。
+        メニューを開かなくても FTPパネル切替・設定・SQL抽出・検索 などを
+        ワンクリックで呼び出せる。
+        """
+        from PyQt6.QtWidgets import QToolBar
+        tb = QToolBar("Quick Access")
+        tb.setMovable(False)
+        tb.setIconSize(QSize(18, 18))
+        tb.setStyleSheet(
+            "QToolBar { background:#2a2a2a; border:none; spacing:2px; padding:2px; }"
+            "QToolButton { background:transparent; color:#c0c0c0; border:1px solid transparent;"
+            "              padding:4px 8px; border-radius:3px; font-size:13px; }"
+            "QToolButton:hover { background:#3a3a3a; border:1px solid #555; color:#fff; }"
+            "QToolButton:checked { background:#2a4a8a; border:1px solid #4a8eff; color:#fff; }"
+            "QToolBar::separator { background:#444; width:1px; margin:4px 4px; }"
+        )
+
+        # FTP パネル トグル (チェック式)
+        self._ftp_toolbar_action = QAction("📁 FTP", self)
+        self._ftp_toolbar_action.setCheckable(True)
+        self._ftp_toolbar_action.setToolTip("FTPパネルを表示/非表示 (Ctrl+T)")
+        self._ftp_toolbar_action.triggered.connect(self._toggle_ftp)
+        tb.addAction(self._ftp_toolbar_action)
+
+        tb.addSeparator()
+
+        # 検索 (トグル式)
+        self._search_toolbar_action = QAction("🔍 検索", self)
+        self._search_toolbar_action.setCheckable(True)
+        self._search_toolbar_action.setToolTip("検索バーを表示/非表示 (Ctrl+F)")
+        self._search_toolbar_action.triggered.connect(self._toggle_search_bar)
+        tb.addAction(self._search_toolbar_action)
+
+        # Grep (トグル式)
+        self._grep_toolbar_action = QAction("🔎 Grep", self)
+        self._grep_toolbar_action.setCheckable(True)
+        self._grep_toolbar_action.setToolTip("Grep検索パネルを表示/非表示 (Ctrl+Shift+F)")
+        self._grep_toolbar_action.triggered.connect(self._toggle_grep_panel)
+        tb.addAction(self._grep_toolbar_action)
+
+        # SQL抽出 (モーダル一発起動)
+        act_sql = QAction("📋 SQL抽出", self)
+        act_sql.setToolTip("ログからSQL抽出・整形 (Ctrl+Shift+Q)")
+        act_sql.triggered.connect(self._show_sql_extract)
+        tb.addAction(act_sql)
+
+        tb.addSeparator()
+
+        # ブックマーク一覧 (トグル式)
+        self._bookmark_toolbar_action = QAction("🔖 ブックマーク", self)
+        self._bookmark_toolbar_action.setCheckable(True)
+        self._bookmark_toolbar_action.setToolTip("ブックマーク一覧を表示/非表示 (Ctrl+B)")
+        self._bookmark_toolbar_action.triggered.connect(self._toggle_bookmark_panel)
+        tb.addAction(self._bookmark_toolbar_action)
+
+        # 右寄せのスペーサー
+        spacer = QWidget()
+        spacer.setSizePolicy(
+            QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred
+        )
+        tb.addWidget(spacer)
+
+        # 設定
+        act_settings = QAction("⚙ 設定", self)
+        act_settings.setToolTip("設定 (Ctrl+,)")
+        act_settings.triggered.connect(self._open_settings)
+        tb.addAction(act_settings)
+
+        self.addToolBar(tb)
+
     def _setup_menu(self):
         mb = self.menuBar()
 
@@ -2271,6 +3004,11 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "名前を付けて保存(&A)...", QKeySequence("Ctrl+Shift+S"), self.save_file_as)
         self._add_action(fm, "全て保存(&L)", QKeySequence("Ctrl+Alt+S"), self.save_all)
         self._add_action(fm, "全て保存して終了(&X)", QKeySequence("Ctrl+Alt+Q"), self.save_all_and_exit)
+        fm.addSeparator()
+        # 設定系 (Windows系アプリの一般的配置: ファイル末尾 or 編集末尾)
+        self._add_action(fm, "📤 設定をエクスポート...", QKeySequence(), self._export_settings)
+        self._add_action(fm, "📥 設定をインポート...", QKeySequence(), self._import_settings)
+        self._add_action(fm, "⚙ 設定(&P)...", QKeySequence("Ctrl+,"), self._open_settings)
         fm.addSeparator()
         self._add_action(fm, "終了(&Q)", QKeySequence("Ctrl+Q"), self.close)
 
@@ -2288,8 +3026,8 @@ class MainWindow(QMainWindow):
         self._add_action(em, "貼り付け(&V)", QKeySequence.StandardKey.Paste,
                          lambda: self.current_editor() and self.current_editor().paste())
         em.addSeparator()
-        self._add_action(em, "検索・置換(&H)...", QKeySequence("Ctrl+H"), self._show_search)
         self._add_action(em, "検索(&F)...", QKeySequence("Ctrl+F"), self._show_search)
+        self._add_action(em, "検索・置換(&H)...", QKeySequence("Ctrl+H"), self._show_replace)
         self._add_action(em, "選択語を検索(Ctrl+F3)", QKeySequence("Ctrl+F3"), self._search_selection_next)
         self._add_action(em, "ファイル内Grep検索(&G)...", QKeySequence("Ctrl+Shift+F"), self._show_grep)
         em.addSeparator()
@@ -2316,21 +3054,13 @@ class MainWindow(QMainWindow):
         act.setShortcut(QKeySequence("Ctrl+T"))
         act.triggered.connect(self._toggle_ftp)
         vm.addAction(act)
+        # Grep パネルは編集メニュー側 (検索系) に既に登録済みのため
+        # 表示メニューには置かない。チェック式と相性が悪く、検索バーとの
+        # 排他切替で状態が同期しなくなる問題を防ぐ。
 
-        grep_act = QAction("Grepパネル(&G)", self)
-        grep_act.setCheckable(True)
-        grep_act.setShortcut(QKeySequence("Ctrl+Shift+F"))
-        grep_act.triggered.connect(self._show_grep)
-        vm.addAction(grep_act)
-
-        # ツールメニュー
+        # ツールメニュー (作業系の機能のみを残す)
         tm = mb.addMenu("ツール(&T)")
         self._add_action(tm, "ログからSQL抽出・整形(&S)...", QKeySequence("Ctrl+Shift+Q"), self._show_sql_extract)
-        tm.addSeparator()
-        self._add_action(tm, "📤 設定をエクスポート...", QKeySequence(), self._export_settings)
-        self._add_action(tm, "📥 設定をインポート...", QKeySequence(), self._import_settings)
-        tm.addSeparator()
-        self._add_action(tm, "⚙ 設定(&P)...", QKeySequence("Ctrl+,"), self._open_settings)
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -2873,10 +3603,12 @@ class MainWindow(QMainWindow):
 
     # --- その他のスロット ---
 
-    def _show_search(self):
+    def _show_search(self, show_replace: bool = False):
         tab = self.current_tab()
         if not tab:
             return
+        # Grep パネルとの同時表示を避けて状態の混乱を防ぐ
+        self._hide_grep_panel()
         # 選択中なら自動入力 (改行を含む選択は最初の行だけ)
         sel = tab.editor.textCursor().selectedText()
         # Qt の selectedText は改行を U+2029 で返す
@@ -2884,7 +3616,15 @@ class MainWindow(QMainWindow):
             if sep in sel:
                 sel = sel.split(sep)[0]
                 break
-        tab.search_bar.show_bar(initial_text=sel if sel else None)
+        tab.search_bar.show_bar(
+            initial_text=sel if sel else None,
+            show_replace=show_replace,
+        )
+        self._sync_toolbar_states()
+
+    def _show_replace(self):
+        """検索・置換 (Ctrl+H) — 検索バーを置換欄も含めて開く。"""
+        self._show_search(show_replace=True)
 
     def _search_selection_next(self):
         """選択語を即検索して次の一致へジャンプ (バーを開かず素早く)"""
@@ -2903,12 +3643,98 @@ class MainWindow(QMainWindow):
         tab.search_bar.find_next()
 
     def _show_grep(self):
+        # 通常検索 (InlineSearchBar) との同時表示を避けて状態の混乱を防ぐ
+        self._hide_inline_search()
         self.grep_panel.show()
         self.bottom_splitter.show()
         tab = self.current_tab()
         if tab and tab.file_path:
             self.grep_panel.set_directory(os.path.dirname(tab.file_path))
         self.grep_panel.pattern_input.setFocus()
+        self._sync_toolbar_states()
+
+    def _hide_grep_panel(self):
+        """Grep パネルを隠す (Bookmark パネルも非表示なら下部スプリッターごと隠す)。"""
+        try:
+            if self.grep_panel.isVisible():
+                self.grep_panel.hide()
+            if (not self.grep_panel.isVisible()
+                    and not self.bookmark_panel.isVisible()):
+                self.bottom_splitter.hide()
+        except Exception:
+            pass
+        self._sync_toolbar_states()
+
+    def _hide_bookmark_panel(self):
+        """ブックマークパネルを隠す (Grep パネルも非表示なら下部スプリッターごと隠す)。"""
+        try:
+            if self.bookmark_panel.isVisible():
+                self.bookmark_panel.hide()
+            if (not self.grep_panel.isVisible()
+                    and not self.bookmark_panel.isVisible()):
+                self.bottom_splitter.hide()
+        except Exception:
+            pass
+        self._sync_toolbar_states()
+
+    # --- ツールバートグル ---
+
+    def _toggle_grep_panel(self):
+        if self.grep_panel.isVisible():
+            self._hide_grep_panel()
+        else:
+            self._show_grep()
+        self._sync_toolbar_states()
+
+    def _toggle_bookmark_panel(self):
+        if self.bookmark_panel.isVisible():
+            self._hide_bookmark_panel()
+        else:
+            self._show_bookmarks()
+        self._sync_toolbar_states()
+
+    def _toggle_search_bar(self):
+        tab = self.current_tab()
+        if not tab or not hasattr(tab, 'search_bar'):
+            return
+        if tab.search_bar.isVisible():
+            tab.search_bar.close_bar()
+        else:
+            self._show_search()
+        self._sync_toolbar_states()
+
+    def _sync_toolbar_states(self):
+        """ツールバーのトグルチェック状態を実際の表示状態と同期する。"""
+        if hasattr(self, '_grep_toolbar_action'):
+            self._grep_toolbar_action.blockSignals(True)
+            self._grep_toolbar_action.setChecked(self.grep_panel.isVisible())
+            self._grep_toolbar_action.blockSignals(False)
+        if hasattr(self, '_bookmark_toolbar_action'):
+            self._bookmark_toolbar_action.blockSignals(True)
+            self._bookmark_toolbar_action.setChecked(self.bookmark_panel.isVisible())
+            self._bookmark_toolbar_action.blockSignals(False)
+        if hasattr(self, '_search_toolbar_action'):
+            tab = self.current_tab()
+            search_visible = bool(
+                tab and hasattr(tab, 'search_bar') and tab.search_bar.isVisible()
+            )
+            self._search_toolbar_action.blockSignals(True)
+            self._search_toolbar_action.setChecked(search_visible)
+            self._search_toolbar_action.blockSignals(False)
+
+    def _hide_inline_search(self):
+        """全タブのインライン検索バーを閉じる。"""
+        for i in range(self.tabs.count()):
+            tab = self.tabs.widget(i)
+            if hasattr(tab, 'search_bar') and tab.search_bar.isVisible():
+                try:
+                    tab.search_bar.hide()
+                    # 検索ハイライトもクリア
+                    if hasattr(tab.editor, 'set_search_highlights'):
+                        tab.editor.set_search_highlights([])
+                except Exception:
+                    pass
+        self._sync_toolbar_states()
 
     # --- ブックマーク操作 ---
 
@@ -2957,6 +3783,7 @@ class MainWindow(QMainWindow):
         self.bookmark_panel.show()
         self.bottom_splitter.show()
         self._refresh_bookmarks()
+        self._sync_toolbar_states()
 
     def _show_sql_extract(self):
         tab = self.current_tab()
@@ -2991,27 +3818,159 @@ class MainWindow(QMainWindow):
             self.tabs.setCurrentIndex(idx)
         self._jump_to_line(tab.editor, lineno)
 
-    def _open_file_at_line(self, filepath, lineno):
-        # 既に開いているか確認
+    def _open_file_at_line(self, filepath, lineno, line_text: str = ''):
+        # パスの差異 (相対/絶対, 区切り文字) を吸収して既存タブを検索
+        try:
+            target = os.path.normcase(os.path.normpath(os.path.abspath(filepath)))
+        except Exception:
+            target = filepath
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
-            if isinstance(tab, EditorTab) and tab.file_path == filepath:
+            if not isinstance(tab, EditorTab) or not tab.file_path:
+                continue
+            try:
+                cur_path = os.path.normcase(os.path.normpath(os.path.abspath(tab.file_path)))
+            except Exception:
+                cur_path = tab.file_path
+            if cur_path == target:
                 self.tabs.setCurrentIndex(i)
-                self._jump_to_line(tab.editor, lineno)
+                # grep は最新のディスク内容に対して行番号を返すので、
+                # タブ内エディタの内容が古い (ログが追記された等) ままだと
+                # 行番号がズレる。ジャンプ前にディスクと内容を比較して
+                # 必要ならリロードする。
+                self._reload_if_stale(tab, filepath)
+                self._jump_to_line_smart(tab.editor, lineno, line_text)
                 return
         # 新しく開く
         self._load_file(filepath)
         tab = self.current_tab()
         if tab:
-            self._jump_to_line(tab.editor, lineno)
+            self._jump_to_line_smart(tab.editor, lineno, line_text)
+
+    def _jump_to_line_smart(self, editor, lineno: int, line_text: str = ''):
+        """行番号 + 行テキストの両方を使ってロバストにジャンプ。
+        - line_text が空: 通常の行番号ジャンプ
+        - line_text あり: 行番号の位置を起点に、近傍 → 全文 の順でテキスト検索
+          一致した行にジャンプ。これでログ追記でズレた行番号でも正しい行に行ける。
+        """
+        if not line_text:
+            self._jump_to_line(editor, lineno)
+            return
+        doc = editor.document()
+        if doc is None:
+            return
+        total = doc.blockCount()
+        # まず行番号位置の内容を見て、一致していればそのまま使う
+        target_idx = max(0, min(lineno - 1, total - 1))
+        target_text = line_text.rstrip()
+
+        def _line_at(idx: int) -> str:
+            b = doc.findBlockByNumber(idx)
+            return b.text() if b.isValid() else ''
+
+        # 1. 行番号位置で正確一致
+        if _line_at(target_idx).rstrip() == target_text:
+            self._jump_to_line(editor, target_idx + 1)
+            return
+
+        # 2. 近傍 ±200 行で探索 (ログの追記で多少ズレた程度を想定)
+        WINDOW = 200
+        lo = max(0, target_idx - WINDOW)
+        hi = min(total, target_idx + WINDOW + 1)
+        for idx in range(lo, hi):
+            if _line_at(idx).rstrip() == target_text:
+                self._jump_to_line(editor, idx + 1)
+                self.statusBar().showMessage(
+                    f"行番号がズレていたためテキスト一致でジャンプ: "
+                    f"{lineno} → {idx + 1}", 4000,
+                )
+                return
+
+        # 3. 全文を 1 回スキャン (大規模ファイルでも数千行/数十万行は OK)
+        for idx in range(total):
+            if _line_at(idx).rstrip() == target_text:
+                self._jump_to_line(editor, idx + 1)
+                self.statusBar().showMessage(
+                    f"全文一致でジャンプ: {lineno} → {idx + 1}", 4000,
+                )
+                return
+
+        # 4. 完全一致が無い → 部分一致でフォールバック
+        needle = target_text.strip()
+        if needle:
+            for idx in range(total):
+                if needle in _line_at(idx):
+                    self._jump_to_line(editor, idx + 1)
+                    self.statusBar().showMessage(
+                        f"部分一致でジャンプ: {lineno} → {idx + 1}", 4000,
+                    )
+                    return
+
+        # 5. それでも見つからなければ行番号通りジャンプ (行数オーバーでも clamp 済)
+        self._jump_to_line(editor, lineno)
+        self.statusBar().showMessage(
+            "マッチ行が見つかりませんでした (ファイル内容が大きく変わった可能性)",
+            4000,
+        )
+
+    def _reload_if_stale(self, tab, filepath: str):
+        """ディスクのファイル内容とタブの内容が異なる時、未保存編集が無ければ自動リロード。
+        grep / 外部ジャンプ時にエディタの行番号とディスクの行番号を一致させるためのヘルパー。
+        """
+        try:
+            if tab.editor.document().isModified():
+                # 未保存編集ありの場合は触らない (ユーザー編集を失わない)
+                return
+            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
+                disk_content = f.read()
+        except Exception:
+            return
+        cur_content = tab.editor.toPlainText()
+        if disk_content == cur_content:
+            return
+        # 内容が変わっている → リロード
+        # 自己書き込み起因の watcher 誤検知を避けるため、書き込み追跡セットには触らない
+        tab.editor.setPlainText(disk_content)
+        try:
+            tab._original_lines = disk_content.splitlines()
+        except Exception:
+            pass
+        tab.editor.document().setModified(False)
+        try:
+            tab.highlighter.rehighlight()
+        except Exception:
+            pass
+        self.statusBar().showMessage(
+            f"{os.path.basename(filepath)} を最新内容にリロードしました (grep結果の行番号と一致)",
+            4000,
+        )
 
     def _jump_to_line(self, editor, lineno):
-        block = editor.document().findBlockByLineNumber(lineno - 1)
-        if block.isValid():
+        """指定行 (1-based) にカーソルを移してビューを中央スクロール。
+        - 検索バーやGrepパネルから呼ばれた直後はフォーカスや描画タイミングが
+          噛み合わないことがあるため、即時 + QTimer.singleShot(0) の二段階で
+          確実に反映させる。
+        """
+        def _do_jump():
+            doc = editor.document()
+            if doc is None:
+                return
+            total = doc.blockCount()
+            ln = max(1, min(lineno, total))
+            block = doc.findBlockByNumber(ln - 1)
+            if not block.isValid():
+                return
             cursor = editor.textCursor()
+            cursor.clearSelection()
             cursor.setPosition(block.position())
             editor.setTextCursor(cursor)
+            editor.setFocus(Qt.FocusReason.OtherFocusReason)
+            editor.ensureCursorVisible()
             editor.centerCursor()
+        _do_jump()
+        # 直後の各種シグナル処理 (highlight_current_line 等) が走った後に
+        # もう一度センタリングしてズレを防ぐ
+        QTimer.singleShot(0, _do_jump)
 
     def _show_goto_line(self):
         """ダイアログで行番号を入力して指定行にジャンプ"""
@@ -3033,6 +3992,11 @@ class MainWindow(QMainWindow):
             self.ftp_panel.hide()
         else:
             self.ftp_panel.show()
+        # ツールバーのチェック状態を実状態に同期
+        if hasattr(self, '_ftp_toolbar_action'):
+            self._ftp_toolbar_action.blockSignals(True)
+            self._ftp_toolbar_action.setChecked(self.ftp_panel.isVisible())
+            self._ftp_toolbar_action.blockSignals(False)
 
     def _on_content_changed(self):
         tab = self.current_tab()
@@ -3047,6 +4011,9 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _):
         self._update_cursor()
         self._sync_language_combo()
+        # 検索バーは各タブが個別に持つので、タブ切替時にトグル状態を同期
+        if hasattr(self, '_sync_toolbar_states'):
+            self._sync_toolbar_states()
 
     def _sync_language_combo(self):
         """現在のタブの言語をステータスバーのコンボに反映 (シグナル抑止)"""
@@ -3092,12 +4059,23 @@ class MainWindow(QMainWindow):
 # SQL抽出・整形ダイアログ
 # ---------------------------------------------------------------------------
 
+# ログ行ヘッダ (PID/レベル/日時) を取り除くプレフィックスパターン
+# 例: "<2862093>[DBG]2024/07/04 13:03:46.656 Execute SELECT ..."
+#     → "Execute SELECT ..." まで剥がす
+_LOG_PREFIX_RE = re.compile(
+    r'^\s*'
+    r'(?:<\d+>\s*)?'                                                # <PID>
+    r'(?:\[\w+\]\s*)?'                                              # [LEVEL]
+    r'(?:\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)?\s*)?',  # YYYY/MM/DD HH:MM:SS.mmm
+    re.IGNORECASE,
+)
+
 # ログからSQLを抽出するための既知プレフィックスと継続行パターン
 _SQL_PREFIXES = [
     r'Hibernate\s*:\s*',
     r'SQL\s*:\s*',
     r'==>\s*Preparing\s*:\s*',
-    r'(?:Executing|Executed)\s+(?:query|statement|SQL)\s*:\s*',
+    r'(?:Executing|Executed|Execute)\s+(?:query|statement|SQL)?\s*:?\s*',  # Execute, Executing, Executed
     r'JDBC\s*\[Query\]\s*:\s*',
     r'query\s*:\s*',
     r'statement\s*:\s*',
@@ -3115,11 +4093,34 @@ _SQL_START_KW = re.compile(
     re.IGNORECASE,
 )
 _LOG_LINE_START = re.compile(
-    r'^\d{4}[-/]\d{2}[-/]\d{2}|^\s*\d{2}:\d{2}:\d{2}|\b(ERROR|WARN|INFO|DEBUG|TRACE)\b'
+    r'^\s*<\d+>\s*(?:\[\w+\])?\s*\d{4}[-/]\d{2}[-/]\d{2}|'   # <PID>[LEVEL]YYYY/MM/DD
+    r'^\s*\[\w+\]\s*\d{4}[-/]\d{2}[-/]\d{2}|'                # [LEVEL]YYYY/MM/DD
+    r'^\s*\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}|'     # YYYY-MM-DD HH:MM:SS
+    r'^\s*\d{4}[-/]\d{2}[-/]\d{2}|'                          # YYYY-MM-DD
+    r'^\s*\d{2}:\d{2}:\d{2}|'                                # HH:MM:SS at line start
+    r'^\s*(?:ERROR|CRITICAL|FATAL|WARN(?:ING)?|INFO|DEBUG|TRACE)\b',  # 行頭のレベル単独
+    re.IGNORECASE,
 )
 
 
+_SQLPARSE_AVAILABLE: bool | None = None
+
+
+def _check_sqlparse() -> bool:
+    """sqlparse の有無を一度だけチェックして結果をキャッシュ"""
+    global _SQLPARSE_AVAILABLE
+    if _SQLPARSE_AVAILABLE is None:
+        try:
+            import sqlparse  # noqa: F401
+            _SQLPARSE_AVAILABLE = True
+        except ImportError:
+            _SQLPARSE_AVAILABLE = False
+    return _SQLPARSE_AVAILABLE
+
+
 def _try_format_sql(sql: str, indent: int, keyword_case: str) -> str:
+    if not _check_sqlparse():
+        return sql   # 未インストール時は素のSQLを返す
     try:
         import sqlparse
         return sqlparse.format(
@@ -3163,6 +4164,7 @@ def _extract_sql_from_log(log_text: str, extra_prefixes: list[str]) -> list[dict
 
     for lineno, line in enumerate(lines, 1):
         stripped = line.strip()
+        is_log_line_start = bool(_LOG_LINE_START.match(stripped))
 
         # パラメータバインド行を収集（現在のSQL用）
         if current_sql_parts:
@@ -3180,21 +4182,28 @@ def _extract_sql_from_log(log_text: str, extra_prefixes: list[str]) -> list[dict
                             current_params[i] = val
                     break
 
-        # プレフィックスを除去してSQLを探す
-        body = prefix_re.sub('', stripped, count=1).strip() if prefix_re.search(stripped) else stripped
+        # ログ行ヘッダ (<PID>[LEVEL]DATE TIME) を剥がしてから SQL プレフィックスも剥がす
+        body = _LOG_PREFIX_RE.sub('', stripped, count=1).strip()
+        body = prefix_re.sub('', body, count=1).strip() if prefix_re.search(body) else body
 
-        if _SQL_START_KW.search(body):
-            # 前のSQLを確定
+        if _SQL_START_KW.search(body) and is_log_line_start:
+            # 新規SQL: 直前のSQL継続中なら一度確定してから新規スタート
+            # (ログ行ヘッダ付きで SQL が始まったときのみ新規扱い、SQL内の SELECT 等は無視)
             flush()
             current_lineno = lineno
             current_sql_parts.append(body)
         elif current_sql_parts:
-            # 継続行かどうか
-            if _LOG_LINE_START.match(stripped) or not stripped:
-                # 新しいログ行 or 空行 → SQL終了
+            if is_log_line_start or not stripped:
+                # 新しいログ行 (別の処理ログ) or 空行 → SQL終了
                 flush()
             else:
+                # SQL の継続行 (折り返し)
                 current_sql_parts.append(body)
+        elif _SQL_START_KW.search(body):
+            # ログ行ヘッダなしで始まる SQL (Hibernate: の直後など)
+            flush()
+            current_lineno = lineno
+            current_sql_parts.append(body)
 
     flush()
     return results
@@ -3213,6 +4222,1466 @@ def _substitute_params(sql: str, params: dict) -> str:
     return result
 
 
+# ---------------------------------------------------------------------------
+# DB 実行ダイアログ — SSH 経由で sqlplus/mysql/psql 等を実行し SELECT 結果を取得
+# ---------------------------------------------------------------------------
+
+_DB_PROFILES_PATH = os.path.join(os.path.expanduser('~'), '.ssh_log_viewer_profiles.json')
+
+# ヒアドキュメントの区切り EOF をシングルクォートで囲む (<<'EOF') ことで
+# bash の変数展開を無効化する。Oracle の "M_CONDITION$RECIPE" のような
+# テーブル名に含まれる $ がシェルに食われるのを防ぐ。
+_DB_CMD_PRESETS = {
+    "Oracle (sqlplus, 通常表示)": (
+        "sqlplus -S USER/PASS@SID <<'EOF'\n"
+        "set sqlblanklines on define off\n"
+        "set linesize 200 pagesize 50 trimspool on\n"
+        "{SQL};\n"
+        "exit\nEOF"
+    ),
+    "Oracle (sqlplus, CSV出力)": (
+        "sqlplus -S USER/PASS@SID <<'EOF'\n"
+        "set sqlblanklines on define off\n"
+        "set markup csv on quote on\n"
+        "set feedback off pagesize 0 trimspool on\n"
+        "{SQL};\n"
+        "exit\nEOF"
+    ),
+    "Oracle (sqlplus, 縦表示)": (
+        "sqlplus -S USER/PASS@SID <<'EOF'\n"
+        "set sqlblanklines on define off\n"
+        "set linesize 32767 pagesize 0 feedback off heading off\n"
+        "column dummy noprint\n"
+        "select '----- record -----' dummy, t.* from ({SQL}) t;\n"
+        "exit\nEOF"
+    ),
+    "MySQL/MariaDB":  'mysql -u USER -pPASS -h localhost DBNAME -e "{SQL}"',
+    "PostgreSQL":     'PGPASSWORD=PASS psql -h localhost -U USER -d DBNAME -c "{SQL}"',
+    "SQLite":         'sqlite3 /path/to/db.sqlite "{SQL}"',
+    "SQL Server (sqlcmd)": 'sqlcmd -S localhost -U USER -P PASS -d DBNAME -Q "{SQL}"',
+}
+
+
+def _clean_sqlplus_output(text: str) -> str:
+    """SQL*Plus 出力からクエリ結果だけを抽出する。
+    - 起動バナー (SQL*Plus Release / Copyright / Connected to: 等) を除去
+    - 行頭の `SQL>` プロンプトと multi-line 継続プロンプト (2, 3, ...) を除去
+    - `Disconnected from Oracle ...` 以降の終了メッセージを除去
+    - sqlplus 系出力でなければ無加工で返す
+    - sqlplus と判定できれば、結果が空になっても空文字を返す
+      (= 「0件」として後段の UI 側で扱えるようにする)
+    """
+    if not text:
+        return text
+    # sqlplus 出力の特徴が無ければ素通し
+    is_sqlplus = ('SQL*Plus' in text) or ('SQL>' in text)
+    if not is_sqlplus:
+        return text
+
+    lines = text.splitlines()
+    result: list[str] = []
+    in_query = False
+
+    # 行頭の連続した "SQL>" や continuation prompts (空白+数字+空白) をまとめて除去
+    prompt_re = re.compile(r'^(?:SQL>\s*|\s*\d+\s+)+')
+    trailing_prompt_re = re.compile(r'\s*SQL>\s*$')
+    # "SQL> Disconnected from ..." パターンを含む混在行から
+    # Disconnected 部分を除去するための正規表現
+    disconnect_strip_re = re.compile(r'\s*SQL>\s*Disconnected from.*$|\s*Disconnected from.*$')
+
+    for line in lines:
+        # 行末に Disconnected が混在しているケース (例:
+        # "SQL> SQL>  2 ... 9 SQL> Disconnected from Oracle ...") に対応:
+        # 行頭の プロンプト部分と末尾の Disconnected 以降を両方除去してから
+        # 残りに意味があれば追加。残らないなら以降は打ち切り。
+        if 'Disconnected from' in line:
+            stripped = prompt_re.sub('', line)
+            stripped = disconnect_strip_re.sub('', stripped)
+            if stripped.strip():
+                if in_query or 'SQL>' in line:
+                    result.append(stripped.rstrip())
+            break
+
+        if not in_query:
+            # 最初に SQL> が登場した行から結果開始
+            if 'SQL>' in line:
+                in_query = True
+                cleaned = prompt_re.sub('', line)
+                cleaned = trailing_prompt_re.sub('', cleaned)
+                if cleaned.strip():
+                    result.append(cleaned.rstrip())
+            continue
+
+        cleaned = prompt_re.sub('', line)
+        cleaned = trailing_prompt_re.sub('', cleaned)
+        result.append(cleaned.rstrip())
+
+    # 前後の空行除去
+    while result and not result[0].strip():
+        result.pop(0)
+    while result and not result[-1].strip():
+        result.pop()
+
+    # sqlplus 出力と判定できた場合、空でもそのまま空文字を返す
+    # (UI側で「0件」表示にする)
+    return '\n'.join(result)
+
+
+def _load_db_profiles() -> dict:
+    """ssh_log_viewer と共通の接続プロファイル設定ファイルを読み込む。"""
+    try:
+        with open(_DB_PROFILES_PATH, 'r', encoding='utf-8') as f:
+            return json.load(f)
+    except Exception:
+        return {}
+
+
+def _save_db_profiles(profiles: dict):
+    try:
+        with open(_DB_PROFILES_PATH, 'w', encoding='utf-8') as f:
+            json.dump(profiles, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+class DBExecuteDialog(QDialog):
+    """SSH 接続したサーバーのシェル上で sqlplus 等を実行して SELECT 結果を取得する。
+
+    - 接続情報は ssh_log_viewer 側のプロファイル (.ssh_log_viewer_profiles.json) を流用
+    - DB実行コマンドは {SQL} プレースホルダ付きテンプレートでプロファイル毎に保存可能
+    - 安全側: SELECT/WITH 以外で始まる文は確認ダイアログ
+    """
+
+    def __init__(self, sql: str, default_profile: str = '', parent=None,
+                 navigator=None):
+        super().__init__(parent)
+        self.setWindowTitle("SQL 実行 (SSH経由)")
+        self.setMinimumSize(900, 650)
+        self.resize(1050, 720)
+        # タイトルバーに 最小化/最大化 ボタンを表示する
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
+        self._initial_sql = sql
+        self._default_profile = default_profile or ''
+        self._profiles = _load_db_profiles()
+        # ナビゲータ (SqlExtractDialog 等。get_sql_count / get_formatted_sql_at /
+        # get_current_index / navigate_to を持つオブジェクト)
+        self._navigator = navigator
+        self._build_ui()
+        self._refresh_profile_combo()
+        self._update_nav_buttons()
+
+    def _build_ui(self):
+        main = QVBoxLayout()
+        main.setSpacing(4)
+        main.setContentsMargins(8, 8, 8, 8)
+
+        # ─── プロファイル選択 ─────────────────────────────────────────────
+        prof_row = QHBoxLayout()
+        prof_row.setSpacing(6)
+        prof_row.addWidget(QLabel("接続プロファイル:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(240)
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        prof_row.addWidget(self.profile_combo)
+
+        prof_row.addSpacing(6)
+        # 折りたたみトグルボタン (デフォルト: 折りたたみ済)
+        self.cmd_toggle_btn = QPushButton("▶ DB実行コマンド設定")
+        self.cmd_toggle_btn.setToolTip(
+            "DB実行コマンドのテンプレート編集欄を表示/非表示します。\n"
+            "通常運用時は折りたたんで OK。プロファイル毎の DB実行コマンドが\n"
+            "保存されていれば、ここを開かなくても実行できます。"
+        )
+        self.cmd_toggle_btn.setCheckable(True)
+        self.cmd_toggle_btn.setChecked(False)
+        self.cmd_toggle_btn.clicked.connect(self._toggle_cmd_section)
+        prof_row.addWidget(self.cmd_toggle_btn)
+
+        prof_row.addSpacing(6)
+        prof_row.addWidget(QLabel("DBプリセット:"))
+        self.preset_combo = QComboBox()
+        self.preset_combo.addItem("（選択）")
+        for name in _DB_CMD_PRESETS:
+            self.preset_combo.addItem(name)
+        self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
+        prof_row.addWidget(self.preset_combo)
+        prof_row.addStretch()
+        main.addLayout(prof_row, 0)
+
+        # ─── DB実行コマンドテンプレート (折りたたみ可能) ─────────────────
+        self.cmd_section = QWidget()
+        cmd_section_layout = QVBoxLayout(self.cmd_section)
+        cmd_section_layout.setContentsMargins(0, 0, 0, 0)
+        cmd_section_layout.setSpacing(2)
+
+        cmd_section_layout.addWidget(QLabel("DB実行コマンド (テンプレート, {SQL} を実SQLで置換):"))
+        self.cmd_input = QPlainTextEdit()
+        self.cmd_input.setFont(QFont("Consolas", 10))
+        self.cmd_input.setMaximumHeight(110)
+        self.cmd_input.setPlaceholderText(
+            "例:  sqlplus -S USER/PASS@SID <<EOF\n"
+            "     set pagesize 200 linesize 200;\n"
+            "     {SQL};\n"
+            "     exit\nEOF"
+        )
+        cmd_section_layout.addWidget(self.cmd_input)
+
+        cmd_btn_row = QHBoxLayout()
+        cmd_btn_row.addStretch()
+        save_btn = QPushButton("コマンドをプロファイルに保存")
+        save_btn.setToolTip("現在の接続プロファイルに DB実行コマンドテンプレートを保存します")
+        save_btn.clicked.connect(self._save_cmd_to_profile)
+        cmd_btn_row.addWidget(save_btn)
+        cmd_section_layout.addLayout(cmd_btn_row)
+
+        # デフォルトでは非表示
+        self.cmd_section.setVisible(False)
+        main.addWidget(self.cmd_section)
+
+        # ─── SQL 入力 ────────────────────────────────────────────────────
+        sql_header = QHBoxLayout()
+        sql_header.addWidget(QLabel("実行する SQL (SELECT / WITH 推奨, 末尾の ; は不要):"))
+
+        # ナビゲーション: SqlExtractDialog 由来の SQL リストを順次切替
+        # <<  <  [番号入力 / 件数表示]  >  >>
+        # (シンボル文字が描画フォントで欠ける環境向けに ASCII 表記)
+        self.nav_first_btn = QPushButton("<<")
+        self.nav_first_btn.setMinimumWidth(38)
+        self.nav_first_btn.setToolTip("先頭のSQLへジャンプ (Ctrl+Home)")
+        self.nav_first_btn.clicked.connect(self._nav_first)
+        self.nav_prev_btn = QPushButton("<")
+        self.nav_prev_btn.setMinimumWidth(34)
+        self.nav_prev_btn.setToolTip("前のSQLへ (Ctrl+←)")
+        self.nav_prev_btn.clicked.connect(self._nav_prev)
+
+        # 直接入力: 番号スピンボックス (矢印は非表示、Enter で確定)
+        self.nav_index_spin = QSpinBox()
+        self.nav_index_spin.setMinimum(1)
+        self.nav_index_spin.setMaximum(1)
+        self.nav_index_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.nav_index_spin.setFixedWidth(70)
+        self.nav_index_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.nav_index_spin.setToolTip("SQL番号を直接入力 (Enter で確定)")
+        self.nav_index_spin.editingFinished.connect(self._nav_jump_to_input)
+        self.nav_total_lbl = QLabel("/ 1")
+        self.nav_total_lbl.setStyleSheet("color:#a9b7c6;")
+
+        self.nav_next_btn = QPushButton(">")
+        self.nav_next_btn.setMinimumWidth(34)
+        self.nav_next_btn.setToolTip("次のSQLへ (Ctrl+→)")
+        self.nav_next_btn.clicked.connect(self._nav_next)
+        self.nav_last_btn = QPushButton(">>")
+        self.nav_last_btn.setMinimumWidth(38)
+        self.nav_last_btn.setToolTip("末尾のSQLへジャンプ (Ctrl+End)")
+        self.nav_last_btn.clicked.connect(self._nav_last)
+
+        sql_header.addSpacing(8)
+        sql_header.addWidget(self.nav_first_btn)
+        sql_header.addWidget(self.nav_prev_btn)
+        sql_header.addWidget(self.nav_index_spin)
+        sql_header.addWidget(self.nav_total_lbl)
+        sql_header.addWidget(self.nav_next_btn)
+        sql_header.addWidget(self.nav_last_btn)
+
+        # 互換用 (古い名前を参照しているコードがあれば動くように)
+        self.nav_counter_lbl = self.nav_total_lbl
+
+        # ショートカット
+        from PyQt6.QtGui import QShortcut, QKeySequence as _QKS
+        self._nav_sc_first = QShortcut(_QKS("Ctrl+Home"), self)
+        self._nav_sc_first.activated.connect(self._nav_first)
+        self._nav_sc_last = QShortcut(_QKS("Ctrl+End"), self)
+        self._nav_sc_last.activated.connect(self._nav_last)
+        self._nav_sc_prev = QShortcut(_QKS("Ctrl+Left"), self)
+        self._nav_sc_prev.activated.connect(self._nav_prev)
+        self._nav_sc_next = QShortcut(_QKS("Ctrl+Right"), self)
+        self._nav_sc_next.activated.connect(self._nav_next)
+
+        sql_header.addStretch()
+        self.dry_run_chk = QCheckBox("ドライラン (生成コマンドのみ表示)")
+        self.dry_run_chk.setToolTip("実行はせず、置換後のコマンド文字列を結果欄に表示します")
+        sql_header.addWidget(self.dry_run_chk)
+        main.addLayout(sql_header, 0)
+
+        self.sql_input = QPlainTextEdit()
+        self.sql_input.setFont(QFont("Consolas", 10))
+        self.sql_input.setPlainText(self._initial_sql)
+        # SQL入力欄: 入力可能を示す明るめの枠線で結果欄と区別
+        self.sql_input.setObjectName("sqlInput")
+        self.sql_input.setStyleSheet(
+            "QPlainTextEdit#sqlInput { border: 2px solid #4a90c8; background:#1e1e1e; }"
+        )
+        self.sql_input.setToolTip("ここが SQL 入力欄です (実行結果欄ではありません)")
+        # SQL シンタックスハイライト (LogViewer/SqlExtract と同じ配色)
+        try:
+            self.sql_input_highlighter = SyntaxHighlighter(self.sql_input.document(), 'sql')
+        except Exception:
+            self.sql_input_highlighter = None
+        main.addWidget(self.sql_input, 1)
+
+        # ─── 実行ボタン行 ────────────────────────────────────────────────
+        run_row = QHBoxLayout()
+        self.run_btn = QPushButton("▶ 実行  (Ctrl+Enter)")
+        self.run_btn.setToolTip("選択中のプロファイルへ SSH 接続し、テンプレートに SQL を埋め込んで実行します\n(Ctrl+Enter でも実行可)")
+        self.run_btn.clicked.connect(self._execute)
+        # 目立つ緑系の強調スタイル
+        self.run_btn.setMinimumHeight(34)
+        self.run_btn.setMinimumWidth(160)
+        run_font = self.run_btn.font()
+        run_font.setBold(True)
+        run_font.setPointSize(max(10, run_font.pointSize() + 1))
+        self.run_btn.setFont(run_font)
+        self.run_btn.setStyleSheet(
+            "QPushButton {"
+            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #4caf50, stop:1 #2e7d32);"
+            " color: #ffffff; border: 1px solid #1b5e20; border-radius: 4px;"
+            " padding: 4px 18px;"
+            "}"
+            "QPushButton:hover {"
+            " background: qlineargradient(x1:0,y1:0,x2:0,y2:1, stop:0 #66bb6a, stop:1 #388e3c);"
+            " border: 1px solid #2e7d32;"
+            "}"
+            "QPushButton:pressed {"
+            " background: #2e7d32; border: 1px solid #1b5e20;"
+            "}"
+            "QPushButton:disabled {"
+            " background: #4a4a4a; color: #888; border: 1px solid #333;"
+            "}"
+        )
+        # Ctrl+Enter で実行できるショートカットも提供
+        from PyQt6.QtGui import QShortcut, QKeySequence as _QKS
+        self._run_shortcut = QShortcut(_QKS("Ctrl+Return"), self)
+        self._run_shortcut.activated.connect(self._execute)
+        self._run_shortcut2 = QShortcut(_QKS("Ctrl+Enter"), self)
+        self._run_shortcut2.activated.connect(self._execute)
+        run_row.addWidget(self.run_btn)
+
+        run_row.addWidget(QLabel("実行方式:"))
+        self.exec_mode_combo = QComboBox()
+        self.exec_mode_combo.addItem("SFTP一時スクリプト + bash -l (推奨)", "sftp")
+        self.exec_mode_combo.addItem("bash -l + stdin", "stdin")
+        self.exec_mode_combo.addItem("デフォルトシェルに直接投げる", "direct")
+        self.exec_mode_combo.setToolTip(
+            "推奨: SFTP一時スクリプト方式\n"
+            "  /tmp に #!/bin/bash -l スクリプトを書いて実行 → 削除。\n"
+            "  引用符/csh/heredoc等の全シェル問題を回避できる最も確実な方法。\n\n"
+            "bash -l + stdin:\n"
+            "  bash -l を起動して stdin にコマンドを流し込む。\n\n"
+            "デフォルトシェルに直接:\n"
+            "  リモートのデフォルトシェル (bash/csh等) にそのままコマンドを投げる。\n"
+            "  csh/tcsh の場合は引用符問題が出る可能性あり。"
+        )
+        self.exec_mode_combo.setMinimumWidth(220)
+        run_row.addWidget(self.exec_mode_combo)
+
+        run_row.addStretch()
+        self.status_lbl = QLabel("")
+        self.status_lbl.setStyleSheet("color:#808080;")
+        run_row.addWidget(self.status_lbl)
+        main.addLayout(run_row, 0)
+
+        # ─── オプション行 (2行目) ──────────────────────────────────────────
+        opt_row = QHBoxLayout()
+        opt_row.setSpacing(8)
+
+        self.clean_output_chk = QCheckBox("結果のみ表示")
+        self.clean_output_chk.setChecked(True)
+        self.clean_output_chk.setToolTip(
+            "sqlplus の banner / SQL> プロンプト / 接続切断メッセージ等を除去し、\n"
+            "クエリ結果だけを表示します。\n"
+            "OFFにすると生のSSH出力を表示 (デバッグ向け)"
+        )
+        opt_row.addWidget(self.clean_output_chk)
+
+        opt_row.addSpacing(6)
+        opt_row.addWidget(QLabel("上限件数:"))
+        self.row_limit_combo = QComboBox()
+        # 表示ラベル / 実際の値 (0 = 無制限)
+        for label, value in (("100 件", 100), ("500 件", 500), ("1000 件", 1000),
+                              ("5000 件", 5000), ("10000 件", 10000), ("無制限", 0)):
+            self.row_limit_combo.addItem(label, value)
+        # デフォルト 1000 件
+        self.row_limit_combo.setCurrentIndex(2)
+        self.row_limit_combo.setMinimumWidth(100)
+        self.row_limit_combo.setToolTip(
+            "結果を最大何件まで表示するか。\n"
+            "上限超過時は表示を切り詰めて警告を出します。\n"
+            "(SQL自体は全件実行されます。UI凍結防止用のクライアント側上限です)\n"
+            "無制限は大量データで UI が固まる可能性があります"
+        )
+        opt_row.addWidget(self.row_limit_combo)
+
+        opt_row.addSpacing(6)
+        self.echo_cmd_chk = QCheckBox("送信コマンドも結果に表示")
+        self.echo_cmd_chk.setToolTip("デバッグ用: 実際にSSH送信したコマンド文字列を結果欄の先頭に出力します")
+        opt_row.addWidget(self.echo_cmd_chk)
+
+        opt_row.addStretch()
+        main.addLayout(opt_row, 0)
+
+        # ─── 結果表示 ────────────────────────────────────────────────────
+        result_header = QHBoxLayout()
+        result_lbl = QLabel("実行結果 (読み取り専用):")
+        result_lbl.setStyleSheet("color:#a9b7c6; font-weight:600;")
+        result_header.addWidget(result_lbl)
+        result_header.addStretch()
+
+        # 縦表示モード用のレコードナビゲーション (1件詳細表示の時のみ可視)
+        # シンボル文字が描画フォントで欠ける環境向けに ASCII (<<, <, >, >>) に変更
+        self.rec_first_btn = QPushButton("<<")
+        self.rec_first_btn.setMinimumWidth(36)
+        self.rec_first_btn.setToolTip("先頭のレコード")
+        self.rec_first_btn.clicked.connect(lambda: self._goto_record(0))
+        self.rec_prev_btn = QPushButton("<")
+        self.rec_prev_btn.setMinimumWidth(34)
+        self.rec_prev_btn.setToolTip("前のレコード")
+        self.rec_prev_btn.clicked.connect(lambda: self._goto_record(self._current_record - 1))
+        self.rec_index_spin = QSpinBox()
+        self.rec_index_spin.setMinimum(1)
+        self.rec_index_spin.setMaximum(1)
+        self.rec_index_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.rec_index_spin.setFixedWidth(70)
+        self.rec_index_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rec_index_spin.editingFinished.connect(
+            lambda: self._goto_record(self.rec_index_spin.value() - 1)
+        )
+        self.rec_total_lbl = QLabel("/ 1")
+        self.rec_total_lbl.setStyleSheet("color:#a9b7c6;")
+        self.rec_next_btn = QPushButton(">")
+        self.rec_next_btn.setMinimumWidth(34)
+        self.rec_next_btn.setToolTip("次のレコード")
+        self.rec_next_btn.clicked.connect(lambda: self._goto_record(self._current_record + 1))
+        self.rec_last_btn = QPushButton(">>")
+        self.rec_last_btn.setMinimumWidth(36)
+        self.rec_last_btn.setToolTip("末尾のレコード")
+        self.rec_last_btn.clicked.connect(lambda: self._goto_record(self._record_count() - 1))
+        for w in (self.rec_first_btn, self.rec_prev_btn, self.rec_index_spin,
+                  self.rec_total_lbl, self.rec_next_btn, self.rec_last_btn):
+            w.setVisible(False)
+            result_header.addWidget(w)
+
+        result_header.addSpacing(8)
+        result_header.addWidget(QLabel("表示形式:"))
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("📊 全件 (横・グリッド)", "grid")
+        self.view_mode_combo.addItem("📋 全件 (縦・転置)", "vertical_all")
+        self.view_mode_combo.addItem("🔍 1件詳細 (縦)", "vertical")
+        self.view_mode_combo.addItem("テキスト", "text")
+        self.view_mode_combo.setToolTip(
+            "全件(横): 通常のグリッド表示。1行=1レコード、横スクロール\n"
+            "全件(縦・転置): 列名を左ヘッダーに、各レコードを横方向の列として表示\n"
+            "1件詳細(縦): 選択した1レコードのみを項目|値で縦表示 (◁▷で巡回)\n"
+            "テキスト: 生の出力をそのまま表示"
+        )
+        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        result_header.addWidget(self.view_mode_combo)
+        main.addLayout(result_header)
+
+        # 縦表示モード時に表示するレコードのインデックス
+        self._current_record: int = 0
+        # 解析済み行列のキャッシュ (グリッド再描画 / 縦表示で再利用)
+        self._parsed_rows: list[list[str]] = []
+
+        # スタック: 0=テキスト / 1=グリッド
+        self.result_stack = QStackedWidget()
+        self.result_view = QPlainTextEdit()
+        self.result_view.setFont(QFont("Consolas", 10))
+        self.result_view.setReadOnly(True)
+        self.result_view.setObjectName("resultView")
+        self.result_view.setStyleSheet(
+            "QPlainTextEdit#resultView { border: 1px dashed #666; background:#181818; }"
+        )
+        self.result_view.setToolTip("ここは実行結果表示欄です (読み取り専用 / SQL入力欄ではありません)")
+        self.result_stack.addWidget(self.result_view)
+
+        self.result_table = QTableWidget()
+        self.result_table.setAlternatingRowColors(True)
+        self.result_table.setSortingEnabled(False)  # データ投入時は OFF、後で ON
+        # 読み取り専用 (ダブルクリックでも編集できなくする)
+        self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
+        # viewport (テーブル右側の空白領域含む) もダークに染める
+        self.result_table.setStyleSheet(
+            "QTableWidget { background:#1e1e1e; color:#d0d0d0; border:1px dashed #666;"
+            " gridline-color:#444; alternate-background-color:#252525; }"
+            "QTableWidget QTableCornerButton::section { background:#2f2f2f; border:1px solid #444; }"
+            "QHeaderView { background:#2f2f2f; }"
+            "QHeaderView::section { background:#2f2f2f; color:#c0c0c0; border:1px solid #444;"
+            " padding:2px 6px; font-weight:600; }"
+            # 縦/横ヘッダーともに緑系で視認性を上げる
+            "QHeaderView::section:horizontal { background:#2f2f2f; color:#9ED969;"
+            " font-weight:700; padding:2px 8px; }"
+            "QHeaderView::section:vertical { background:#2f2f2f; color:#9ED969;"
+            " font-weight:700; padding:2px 8px; text-align:left; }"
+            "QTableWidget::item:selected { background:#2a4a8a; color:#fff; }"
+        )
+        # viewport 自体のパレットも明示的にダーク化 (Qt 既定の白を上書き)
+        from PyQt6.QtGui import QPalette
+        pal = self.result_table.viewport().palette()
+        pal.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#252525"))
+        pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e1e"))
+        self.result_table.viewport().setPalette(pal)
+        self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
+        # 最終列が余白を埋めるようストレッチ
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.verticalHeader().setVisible(True)
+        self.result_stack.addWidget(self.result_table)
+        # 起動時はグリッド表示 (stack index 1 = result_table)
+        self.result_stack.setCurrentIndex(1)
+        main.addWidget(self.result_stack, 2)
+
+        # 直近の出力を保持 (表示形式切替時にパースし直すため)
+        self._last_output_text: str = ''
+
+        # ─── 下部ボタン ──────────────────────────────────────────────────
+        bottom = QHBoxLayout()
+        copy_sql_btn = QPushButton("SQLをコピー")
+        copy_sql_btn.setToolTip("上の SQL 入力欄の内容全てをクリップボードへ")
+        copy_sql_btn.clicked.connect(self._copy_sql)
+        copy_btn = QPushButton("結果をコピー")
+        copy_btn.setToolTip("下の実行結果欄の内容全てをクリップボードへ")
+        copy_btn.clicked.connect(self._copy_result)
+        clear_btn = QPushButton("結果クリア")
+        clear_btn.clicked.connect(lambda: self.result_view.clear())
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.close)
+        bottom.addWidget(copy_sql_btn)
+        bottom.addWidget(copy_btn)
+        bottom.addWidget(clear_btn)
+        bottom.addStretch()
+        bottom.addWidget(close_btn)
+        main.addLayout(bottom, 0)
+
+        self.setLayout(main)
+
+        # テーマ適用 (SqlExtractDialog と同じダーク基調)
+        self.setStyleSheet("""
+            QDialog { background: #2b2b2b; }
+            QLabel  { color: #a9b7c6; }
+            QPushButton { background:#4a4a4a; color:#a9b7c6; border:none; padding:4px 10px; border-radius:2px; }
+            QPushButton:hover { background:#5a5a5a; }
+            QPushButton:disabled { color:#666; }
+            QComboBox { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
+            QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6; selection-background-color:#214283; }
+            QPlainTextEdit { background:#1e1e1e; color:#a9b7c6; border:1px solid #444;
+                             selection-background-color:#214283; }
+            QCheckBox { color:#a9b7c6; }
+        """)
+
+    # ─── 折りたたみトグル ─────────────────────────────────────────────────
+
+    def _toggle_cmd_section(self):
+        """DB実行コマンド編集セクションの表示/非表示を切り替える。"""
+        visible = self.cmd_toggle_btn.isChecked()
+        self.cmd_section.setVisible(visible)
+        self.cmd_toggle_btn.setText(
+            "▼ DB実行コマンド設定" if visible else "▶ DB実行コマンド設定"
+        )
+
+    # ─── SQL ナビゲーション (◁▷) ─────────────────────────────────────────
+
+    def _nav_widgets(self):
+        """ナビゲーション関連ウィジェットを一括で扱うためのヘルパー。"""
+        return [
+            self.nav_first_btn, self.nav_prev_btn,
+            self.nav_index_spin, self.nav_total_lbl,
+            self.nav_next_btn, self.nav_last_btn,
+        ]
+
+    def _update_nav_buttons(self):
+        """ナビゲータの状態に応じてボタン/入力欄の有効/可視を更新。"""
+        nav = self._navigator
+        if nav is None or not hasattr(nav, 'get_sql_count'):
+            for w in self._nav_widgets():
+                w.setVisible(False)
+            return
+        total = nav.get_sql_count()
+        idx = nav.get_current_index()
+        if total <= 1 or idx < 0:
+            for w in self._nav_widgets():
+                w.setVisible(False)
+            return
+        for w in self._nav_widgets():
+            w.setVisible(True)
+        # スピンボックスは循環的な変更を避けるため signal を一時的にブロック
+        self.nav_index_spin.blockSignals(True)
+        self.nav_index_spin.setMinimum(1)
+        self.nav_index_spin.setMaximum(total)
+        self.nav_index_spin.setValue(idx + 1)
+        self.nav_index_spin.blockSignals(False)
+        self.nav_total_lbl.setText(f"/ {total}")
+        self.nav_first_btn.setEnabled(idx > 0)
+        self.nav_prev_btn.setEnabled(idx > 0)
+        self.nav_next_btn.setEnabled(idx < total - 1)
+        self.nav_last_btn.setEnabled(idx < total - 1)
+
+    def _nav_set_index(self, new_idx: int):
+        """ナビゲータを new_idx に移動して SQL 入力欄を差し替える。"""
+        nav = self._navigator
+        if nav is None:
+            return
+        total = nav.get_sql_count()
+        if not (0 <= new_idx < total):
+            return
+        # 親ダイアログ側の選択も同期 (戻った時の表示一貫性のため)
+        nav.navigate_to(new_idx)
+        formatted, lineno = nav.get_formatted_sql_at(new_idx)
+        self.sql_input.setPlainText(formatted)
+        # 結果欄は前 SQL のものなので明示的にクリア
+        self.result_view.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        self._last_output_text = ''
+        self.status_lbl.setText(f"SQL を切り替え: {new_idx + 1} / {total} (log行 {lineno})")
+        self._update_nav_buttons()
+
+    def _nav_jump(self, delta: int):
+        nav = self._navigator
+        if nav is None:
+            return
+        self._nav_set_index(nav.get_current_index() + delta)
+
+    def _nav_prev(self):
+        self._nav_jump(-1)
+
+    def _nav_next(self):
+        self._nav_jump(+1)
+
+    def _nav_first(self):
+        self._nav_set_index(0)
+
+    def _nav_last(self):
+        nav = self._navigator
+        if nav is None:
+            return
+        total = nav.get_sql_count()
+        if total > 0:
+            self._nav_set_index(total - 1)
+
+    def _nav_jump_to_input(self):
+        """直接入力された SQL 番号にジャンプ。1-based → 0-based 変換。"""
+        nav = self._navigator
+        if nav is None:
+            return
+        new_idx = self.nav_index_spin.value() - 1
+        # 既に同じ位置ならスキップ (起動直後の editingFinished 等を吸収)
+        if new_idx == nav.get_current_index():
+            return
+        self._nav_set_index(new_idx)
+
+    # ─── プロファイル切り替え ─────────────────────────────────────────────
+
+    def _refresh_profile_combo(self):
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        names = list(self._profiles.keys())
+        for n in names:
+            self.profile_combo.addItem(n)
+        if self._default_profile and self._default_profile in self._profiles:
+            self.profile_combo.setCurrentText(self._default_profile)
+        elif names:
+            self.profile_combo.setCurrentIndex(0)
+        self.profile_combo.blockSignals(False)
+        self._on_profile_changed(self.profile_combo.currentText())
+
+    def _on_profile_changed(self, name: str):
+        prof = self._profiles.get(name, {})
+        cmd = prof.get('db_exec_cmd', '') or ''
+        self.cmd_input.setPlainText(cmd)
+        host = prof.get('host', '')
+        user = prof.get('user', '')
+        if host:
+            self.status_lbl.setText(f"接続先: {user}@{host}")
+        else:
+            self.status_lbl.setText("プロファイル未選択")
+
+    def _on_preset_changed(self, idx: int):
+        if idx <= 0:
+            return
+        name = self.preset_combo.currentText()
+        tmpl = _DB_CMD_PRESETS.get(name, '')
+        if tmpl:
+            self.cmd_input.setPlainText(tmpl)
+            # プリセットを選んだら設定セクションを自動展開
+            # (USER/PASS/SID を書き換えてもらう必要があるため)
+            if not self.cmd_toggle_btn.isChecked():
+                self.cmd_toggle_btn.setChecked(True)
+                self._toggle_cmd_section()
+        # 選択直後にリセット (繰り返しプリセット指定を可能にする)
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+
+    def _save_cmd_to_profile(self):
+        name = self.profile_combo.currentText()
+        if not name or name not in self._profiles:
+            QMessageBox.warning(self, "プロファイル未選択",
+                "保存先の接続プロファイルが選択されていません。")
+            return
+        self._profiles[name]['db_exec_cmd'] = self.cmd_input.toPlainText()
+        _save_db_profiles(self._profiles)
+        self.status_lbl.setText(f"保存しました: {name}")
+
+    # ─── 実行 ─────────────────────────────────────────────────────────────
+
+    # 読み取り専用ホワイトリスト (これ以外の SQL は実行をブロック)
+    _READ_ONLY_KEYWORDS = frozenset({'SELECT', 'WITH', 'EXPLAIN', 'DESC', 'DESCRIBE', 'SHOW'})
+    # 更新系のキーワード (検出用)
+    _MODIFY_KEYWORDS = frozenset({
+        'INSERT', 'UPDATE', 'DELETE', 'MERGE', 'TRUNCATE',
+        'DROP', 'CREATE', 'ALTER', 'RENAME',
+        'GRANT', 'REVOKE',
+        'COMMIT', 'ROLLBACK', 'SAVEPOINT', 'SET',
+        'LOCK', 'CALL', 'EXEC', 'EXECUTE', 'BEGIN', 'DECLARE',
+    })
+
+    def _strip_leading_comments(self, sql: str) -> str:
+        """SQL 先頭の -- 行コメントと /* */ ブロックコメントを剥がす。"""
+        s = sql.lstrip()
+        while True:
+            if s.startswith('--'):
+                nl = s.find('\n')
+                s = s[nl + 1:] if nl >= 0 else ''
+                s = s.lstrip()
+                continue
+            if s.startswith('/*'):
+                end = s.find('*/')
+                s = s[end + 2:] if end >= 0 else ''
+                s = s.lstrip()
+                continue
+            break
+        return s
+
+    def _first_keyword(self, sql: str) -> str:
+        """SQL 先頭の英単語を大文字で返す。コメント除去後に判定。"""
+        s = self._strip_leading_comments(sql)
+        m = re.match(r'(\w+)', s)
+        return m.group(1).upper() if m else ''
+
+    def _strip_sql_strings_and_comments(self, sql: str) -> str:
+        """SQL から文字列リテラルとコメントを除去 (検査用)。
+        FOR UPDATE などのキーワード検出時に、コメントや文字列内のヒットで
+        偽陽性を起こさないようにする。
+        """
+        # 行コメント -- ... 改行
+        s = re.sub(r'--[^\n]*', ' ', sql)
+        # ブロックコメント /* ... */
+        s = re.sub(r'/\*.*?\*/', ' ', s, flags=re.DOTALL)
+        # 文字列リテラル '...' ('' のエスケープを含む簡易処理)
+        s = re.sub(r"'(?:[^']|'')*'", "''", s)
+        # 識別子クォート "..." (Oracle/PostgreSQL)
+        s = re.sub(r'"(?:[^"]|"")*"', '""', s)
+        return s
+
+    def _detect_locking_clause(self, sql: str) -> str:
+        """SELECT ... FOR UPDATE / FOR SHARE 等のロック取得句を検出する。
+        検出した場合は表示用の文字列を返す。検出しなければ ''。
+        """
+        cleaned = self._strip_sql_strings_and_comments(sql)
+        # FOR UPDATE / FOR SHARE / FOR KEY SHARE / FOR NO KEY UPDATE
+        patterns = [
+            (r'\bFOR\s+UPDATE\b(?:\s+OF\s+\w+(?:\s*,\s*\w+)*)?'
+             r'(?:\s+(?:NOWAIT|WAIT\s+\d+|SKIP\s+LOCKED))?', 'FOR UPDATE'),
+            (r'\bFOR\s+SHARE\b', 'FOR SHARE'),
+            (r'\bFOR\s+KEY\s+SHARE\b', 'FOR KEY SHARE'),
+            (r'\bFOR\s+NO\s+KEY\s+UPDATE\b', 'FOR NO KEY UPDATE'),
+        ]
+        for pat, label in patterns:
+            m = re.search(pat, cleaned, re.IGNORECASE)
+            if m:
+                return f"{label} (位置: '{m.group(0)}')"
+        return ''
+
+    def _execute(self):
+        sql_raw = self.sql_input.toPlainText().strip()
+        sql = sql_raw.rstrip(';').strip()
+        if not sql:
+            QMessageBox.warning(self, "SQL 未入力", "実行する SQL を入力してください。")
+            return
+
+        # 安全性チェック: 読み取り系以外は実行を完全ブロック
+        first_word = self._first_keyword(sql)
+        if first_word not in self._READ_ONLY_KEYWORDS:
+            # 種別を分かりやすく案内
+            if first_word in self._MODIFY_KEYWORDS:
+                reason = f"更新系の SQL です (先頭: {first_word})。"
+            elif first_word:
+                reason = f"未知/許可されていない先頭キーワードです (先頭: {first_word})。"
+            else:
+                reason = "SQL の先頭キーワードを検出できません。"
+            QMessageBox.critical(
+                self, "実行ブロック",
+                "⛔ 参照系以外の SQL は実行できません。\n\n"
+                f"{reason}\n\n"
+                "本ツールでは安全のため、以下の先頭キーワードのみ許可しています:\n"
+                "    SELECT / WITH / EXPLAIN / DESC / DESCRIBE / SHOW\n\n"
+                "INSERT / UPDATE / DELETE / MERGE / DDL 等は実行できません。\n"
+                "更新が必要な場合は別ツール (SQL*Plus を直接 SSH ターミナル等) で\n"
+                "管理者承認のもと実施してください。"
+            )
+            return
+
+        # 追加チェック: SELECT FOR UPDATE / FOR SHARE 等のロック取得もブロック
+        # (他トランザクションをブロックして本番影響を出す恐れがあるため)
+        lock_match = self._detect_locking_clause(sql)
+        if lock_match:
+            QMessageBox.critical(
+                self, "実行ブロック",
+                "⛔ 行ロックを取得する SELECT は実行できません。\n\n"
+                f"検出: {lock_match}\n\n"
+                "FOR UPDATE / FOR SHARE 等は対象行に排他/共有ロックを掛けるため、\n"
+                "他トランザクションをブロックして本番障害の原因になり得ます。\n"
+                "純粋な参照のみが許可されています。\n\n"
+                "対処: 該当句を削除してください\n"
+                "  例)  SELECT ... FOR UPDATE   →   SELECT ...\n"
+                "ロック取得が必要な場合は別ツールで管理者承認のもと実施してください。"
+            )
+            return
+
+        cmd_template = self.cmd_input.toPlainText().strip()
+        if not cmd_template:
+            QMessageBox.warning(self, "コマンド未設定",
+                "DB実行コマンドテンプレートを入力してください。\n"
+                "右上の「DBプリセット」から雛形を選べます。")
+            return
+        if '{SQL}' not in cmd_template:
+            QMessageBox.warning(self, "テンプレートエラー",
+                "コマンドテンプレートに {SQL} プレースホルダーが含まれていません。")
+            return
+
+        # SQL 内のダブルクォートをエスケープ (シェル展開対策)
+        escaped_sql = sql.replace('\\', '\\\\').replace('"', '\\"')
+        # 改行は LF に正規化 (CRLF だと heredoc の終端 EOF が一致しない)
+        escaped_sql = escaped_sql.replace('\r\n', '\n').replace('\r', '\n')
+        # SQL*Plus は既定で空行を文末扱いするため SQL 中の空行 (空白のみ含む)
+        # を全部除去する。整形時の見栄え用の空行であってセマンティクスは
+        # 変わらない。他DB (mysql/psql/sqlite等) でも問題なし。
+        escaped_sql = re.sub(r'(?m)^[ \t]*\n', '', escaped_sql)
+        cmd_body = cmd_template.replace('{SQL}', escaped_sql)
+        # テンプレート自体の CRLF も除去
+        cmd_body = cmd_body.replace('\r\n', '\n').replace('\r', '\n')
+        # 安全弁: heredoc が <<EOF (クォート無し) になっていると bash が
+        # $RECIPE 等の変数を展開してしまうため、自動で <<'EOF' に補正する。
+        # 既に <<'EOF' / <<"EOF" / <<-EOF 等になっていればそのまま。
+        cmd_body = re.sub(
+            r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
+            lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}",
+            cmd_body,
+        )
+        # 安全弁: sqlplus を呼ぶテンプレートで `set sqlblanklines on` が
+        # 無いと SQL 中の空行で文が切れる。heredoc 開始直後に挿入する。
+        if 'sqlplus' in cmd_body and 'sqlblanklines' not in cmd_body.lower():
+            cmd_body = re.sub(
+                r"(<<-?'?[A-Za-z_][A-Za-z0-9_]*'?\s*\n)",
+                r"\1set sqlblanklines on define off\n",
+                cmd_body,
+                count=1,
+            )
+        # 安全弁: `set markup csv on quote off` だとデータ値内の `,` で
+        # CSV パースが崩れるため、自動で `quote on` に補正する。
+        cmd_body = re.sub(
+            r'(?i)(set\s+markup\s+csv\s+on\s+quote\s+)off\b',
+            r'\1on',
+            cmd_body,
+        )
+
+        exec_mode = self.exec_mode_combo.currentData() or "sftp"
+
+        if self.dry_run_chk.isChecked():
+            if exec_mode == "sftp":
+                dry = (
+                    "[DRY RUN] 実行方式: SFTP一時スクリプト + bash -l\n\n"
+                    "  /tmp/sora_db_exec_<timestamp>.sh を作成し中身は以下:\n"
+                    "----- ↓ script ↓ -----\n"
+                    "#!/bin/bash --login\n"
+                    "set -o pipefail\n"
+                    f"{cmd_body}\n"
+                    "----- ↑ script ↑ -----\n\n"
+                    "  実行: bash --login /tmp/sora_db_exec_xxx.sh"
+                )
+            elif exec_mode == "stdin":
+                dry = (
+                    "[DRY RUN] 実行方式: bash -l + stdin\n\n"
+                    "  exec_command: bash -l\n"
+                    "  stdin:\n"
+                    "----- ↓ stdin ↓ -----\n"
+                    f"{cmd_body}\n"
+                    "----- ↑ stdin ↑ -----"
+                )
+            else:
+                dry = (
+                    "[DRY RUN] 実行方式: デフォルトシェルに直接\n\n"
+                    "  exec_command:\n"
+                    f"{cmd_body}"
+                )
+            self._set_result_text(dry)
+            self.status_lbl.setText("ドライラン完了")
+            return
+
+        prof_name = self.profile_combo.currentText()
+        prof = self._profiles.get(prof_name)
+        if not prof:
+            QMessageBox.warning(self, "プロファイル未選択",
+                "接続プロファイルを選択してください。")
+            return
+
+        try:
+            import paramiko
+        except ImportError:
+            QMessageBox.critical(self, "paramiko 未インストール",
+                "SSH 接続には paramiko が必要です:\n    pip install paramiko")
+            return
+
+        self.run_btn.setEnabled(False)
+        self.status_lbl.setText(f"実行中: {prof_name} ...")
+        self.result_view.setPlainText(f"-- 接続中: {prof_name} --\n")
+        # 接続中は中間状態なので _last_output_text は更新しない
+        QApplication.processEvents()
+
+        host = prof.get('host', '')
+        port = int(prof.get('port', 22) or 22)
+        user = prof.get('user', '')
+        password = prof.get('password', '')
+        key_path = prof.get('key_path', '')
+
+        client = None
+        script_path = None
+        try:
+            client = paramiko.SSHClient()
+            client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            if key_path and os.path.isfile(key_path):
+                client.connect(host, port=port, username=user,
+                               key_filename=key_path, timeout=15,
+                               look_for_keys=False, allow_agent=False)
+            else:
+                client.connect(host, port=port, username=user,
+                               password=password, timeout=15,
+                               look_for_keys=False, allow_agent=False)
+
+            # ─── モード別に実行 ───────────────────────────────────────────
+            if exec_mode == "sftp":
+                # SFTP で /tmp に一時スクリプトを書き込み bash -l で実行
+                import time as _time
+                script_path = f"/tmp/sora_db_exec_{int(_time.time() * 1000)}_{os.getpid()}.sh"
+                script_content = (
+                    "#!/bin/bash --login\n"
+                    "set -o pipefail\n"
+                    + cmd_body
+                    + ("\n" if not cmd_body.endswith("\n") else "")
+                )
+                sftp = client.open_sftp()
+                try:
+                    with sftp.open(script_path, "w") as f:
+                        f.write(script_content)
+                    sftp.chmod(script_path, 0o700)
+                finally:
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+
+                run_cmd = f"bash --login {script_path}"
+                stdin_ch, stdout, stderr = client.exec_command(
+                    run_cmd, timeout=180, get_pty=False
+                )
+                out = stdout.read().decode('utf-8', errors='replace')
+                err = stderr.read().decode('utf-8', errors='replace')
+                exit_code = stdout.channel.recv_exit_status()
+                sent_cmd = run_cmd
+
+            elif exec_mode == "stdin":
+                sent_cmd = "bash -l"
+                stdin_ch, stdout, stderr = client.exec_command(
+                    sent_cmd, timeout=180, get_pty=False
+                )
+                stdin_ch.write(cmd_body)
+                if not cmd_body.endswith('\n'):
+                    stdin_ch.write('\n')
+                stdin_ch.flush()
+                try:
+                    stdin_ch.channel.shutdown_write()
+                except Exception:
+                    pass
+                out = stdout.read().decode('utf-8', errors='replace')
+                err = stderr.read().decode('utf-8', errors='replace')
+                exit_code = stdout.channel.recv_exit_status()
+
+            else:  # direct
+                sent_cmd = cmd_body
+                stdin_ch, stdout, stderr = client.exec_command(
+                    sent_cmd, timeout=180, get_pty=False
+                )
+                out = stdout.read().decode('utf-8', errors='replace')
+                err = stderr.read().decode('utf-8', errors='replace')
+                exit_code = stdout.channel.recv_exit_status()
+
+            # 出力後処理 (sqlplus banner / プロンプト / 切断メッセージを除去)
+            clean = self.clean_output_chk.isChecked()
+            display_out = _clean_sqlplus_output(out) if clean else out
+
+            # 上限件数の適用 (UI凍結防止のクライアント側カット)
+            row_limit = self.row_limit_combo.currentData() or 0
+            truncated_count = 0
+            if row_limit > 0 and display_out:
+                lines = display_out.splitlines()
+                # CSV っぽい場合は 1行目=ヘッダーなので +1 行確保
+                has_csv_header = (
+                    len(lines) >= 1
+                    and ',' in lines[0]
+                    and not lines[0].strip().startswith('-')
+                )
+                keep_lines = row_limit + (1 if has_csv_header else 0)
+                if len(lines) > keep_lines:
+                    truncated_count = len(lines) - keep_lines
+                    display_out = '\n'.join(lines[:keep_lines])
+
+            parts = []
+            if self.echo_cmd_chk.isChecked():
+                parts.append(f"-- [実行方式: {exec_mode}] --")
+                parts.append(f"-- [SSH exec_command] --")
+                parts.append(sent_cmd)
+                if exec_mode == "sftp" and script_path:
+                    parts.append(f"-- [一時スクリプト: {script_path}] --")
+                    parts.append(script_content)
+                elif exec_mode == "stdin":
+                    parts.append("-- [stdin に流し込んだ本体] --")
+                    parts.append(cmd_body)
+                parts.append("")
+            if clean:
+                # クリーンモードでは見出しを最小限に
+                if display_out.strip():
+                    parts.append(display_out.rstrip())
+                else:
+                    parts.append("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+                if truncated_count > 0:
+                    parts.append(
+                        f"\n⚠ 表示を上限 {row_limit} 件で切り詰めました "
+                        f"(残り {truncated_count} 行は非表示)。\n"
+                        f"   全件確認したい場合は『上限件数』を増やすか、"
+                        f"SQL側で ROWNUM/FETCH FIRST で絞ってください。"
+                    )
+                if err.strip():
+                    parts.append("\n-- [STDERR] --")
+                    parts.append(err.rstrip())
+                if exit_code != 0:
+                    parts.append(f"\n-- exit code: {exit_code} --")
+            else:
+                parts.append("-- [STDOUT] --")
+                parts.append(out.rstrip() if out.strip() else "(空)")
+                if truncated_count > 0:
+                    parts.append(
+                        f"\n⚠ 表示を上限 {row_limit} 件で切り詰めました "
+                        f"(残り {truncated_count} 行は非表示)。"
+                    )
+                parts.append("\n-- [STDERR] --")
+                parts.append(err.rstrip() if err.strip() else "(空)")
+                parts.append(f"\n-- exit code: {exit_code} --")
+            if not out.strip() and not err.strip():
+                parts.append(
+                    "\n💡 出力が両方とも空です。考えられる原因:\n"
+                    "  ・sqlplus が PATH に無い (.bash_profile/.bashrc を確認)\n"
+                    "  ・接続文字列 (USER/PASS@SID) が無効\n"
+                    "  ・「送信コマンドも結果に表示」を ON にして詳細確認\n"
+                    "  ・別の「実行方式」を試す"
+                )
+            # テキスト欄は echo/clean を尊重した連結結果を表示。
+            # グリッドは "実際のSQL出力のみ" を解析対象にする (送信コマンドや
+            # banner 等のメタ情報はグリッド化されないようにする)。
+            full_text = '\n'.join(parts)
+            grid_source = display_out  # 常にクエリ出力本体だけを使う
+            self._last_output_text = grid_source
+            self.result_view.setPlainText(full_text)
+            if self.view_mode_combo.currentData() == "grid":
+                self._render_grid(grid_source)
+
+            # ステータスバーにも 0件 / 件数 を明示
+            row_hint = ""
+            if exit_code == 0:
+                if not display_out.strip():
+                    row_hint = " · ⚠ 0 件"
+                else:
+                    # CSV ぽければ data 行数 (header除く) を表示
+                    parsed = self._parse_csv_lines(display_out)
+                    if len(parsed) >= 2:
+                        row_hint = f" · {len(parsed) - 1} 件"
+            if truncated_count > 0:
+                row_hint += f" · ⚠ {truncated_count} 行切り詰め"
+            self.status_lbl.setText(
+                f"完了 (exit={exit_code}): {prof_name}{row_hint}"
+                if exit_code == 0 else
+                f"エラー (exit={exit_code}): {prof_name}"
+            )
+
+            # 一時スクリプト削除
+            if script_path:
+                try:
+                    sftp = client.open_sftp()
+                    sftp.remove(script_path)
+                    sftp.close()
+                except Exception:
+                    pass
+        except Exception as e:
+            self._set_result_text(f"接続/実行エラー:\n{e}")
+            self.status_lbl.setText("エラー")
+        finally:
+            try:
+                if client is not None:
+                    client.close()
+            except Exception:
+                pass
+            self.run_btn.setEnabled(True)
+
+    def _copy_result(self):
+        text = self.result_view.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_lbl.setText("結果をクリップボードにコピーしました")
+
+    def _copy_sql(self):
+        text = self.sql_input.toPlainText()
+        if text:
+            QApplication.clipboard().setText(text)
+            self.status_lbl.setText("SQL をクリップボードにコピーしました")
+
+    # ─── 表示形式切替 / グリッド描画 ─────────────────────────────────────
+
+    def _on_view_mode_changed(self, idx: int):
+        mode = self.view_mode_combo.currentData()
+        # レコードナビゲーションは 1件詳細 モードの時のみ可視
+        nav_visible = (mode == "vertical")
+        for w in (self.rec_first_btn, self.rec_prev_btn, self.rec_index_spin,
+                  self.rec_total_lbl, self.rec_next_btn, self.rec_last_btn):
+            w.setVisible(nav_visible)
+
+        text = self._last_output_text or self.result_view.toPlainText()
+        if mode == "grid":
+            self._render_grid(text)
+            self.result_stack.setCurrentIndex(1)
+        elif mode == "vertical_all":
+            self._render_vertical_all(text)
+            self.result_stack.setCurrentIndex(1)
+        elif mode == "vertical":
+            self._render_vertical(text)
+            self.result_stack.setCurrentIndex(1)
+        else:
+            self.result_stack.setCurrentIndex(0)
+
+    def _set_result_text(self, text: str):
+        """テキスト/グリッド両方の表示を更新する。"""
+        self._last_output_text = text
+        self.result_view.setPlainText(text)
+        # 現在の表示形式に応じて再描画
+        mode = self.view_mode_combo.currentData()
+        if mode == "grid":
+            self._render_grid(text)
+        elif mode == "vertical_all":
+            self._render_vertical_all(text)
+        elif mode == "vertical":
+            self._render_vertical(text)
+
+    def _parse_csv_lines(self, text: str) -> list[list[str]]:
+        """テキストから CSV または固定幅表形式を行列にパースする。
+        - 全体に `,` を含み CSV として読めれば csv.reader で読む
+          (`"..."` 内の改行を1フィールドとして正しく扱うため、テキスト全体を
+          そのまま投入する)
+        - CSV っぽくなければ空白2個以上で分割を試みる (sqlplus 通常表示)
+        - 先頭の `-- ...` などのコメント風行はスキップ
+        """
+        import csv
+        from io import StringIO
+
+        if not text or not text.strip():
+            return []
+
+        # 先頭のコメント/ノイズ行を剥がす (csv.reader に渡る前の前処理)
+        lines = text.splitlines()
+        first_data_idx = 0
+        for i, line in enumerate(lines):
+            s = line.strip()
+            if not s:
+                continue
+            if s.startswith('--'):
+                continue
+            if s.startswith('(') and s.endswith(')'):
+                continue
+            first_data_idx = i
+            break
+        clean_text = '\n'.join(lines[first_data_idx:])
+
+        if not clean_text.strip():
+            return []
+
+        # CSV 判定: 含まれる `,` 数で雑に判定 (全文に対して)
+        if clean_text.count(',') >= 1:
+            try:
+                reader = csv.reader(StringIO(clean_text))
+                rows = [row for row in reader if row]   # 空行は除外
+                # CSV として 2 列以上に分かれていれば成功とみなす
+                max_cols = max((len(r) for r in rows), default=0)
+                if max_cols >= 2:
+                    return rows
+            except Exception:
+                pass
+
+        # フォールバック: 空白2個以上で分割 (sqlplus 表形式の超ざっくり対応)
+        rows: list[list[str]] = []
+        for line in clean_text.splitlines():
+            if not line.strip():
+                continue
+            cells = re.split(r' {2,}|\t+', line.strip())
+            rows.append(cells)
+        return rows
+
+    def _render_grid(self, text: str):
+        """テキストをパースしてグリッドに描画。"""
+        self.result_table.setSortingEnabled(False)
+        self.result_table.clear()
+
+        def show_message(msg: str, color: str = "#e0a96b"):
+            """グリッドに1セルだけのメッセージ行を表示する。"""
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["メッセージ"])
+            self.result_table.setRowCount(1)
+            item = QTableWidgetItem(msg)
+            item.setForeground(QColor(color))
+            font = item.font()
+            font.setBold(True)
+            item.setFont(font)
+            self.result_table.setItem(0, 0, item)
+            self.result_table.resizeColumnsToContents()
+
+        if not text or not text.strip():
+            show_message("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            return
+
+        rows = self._parse_csv_lines(text)
+        if not rows:
+            show_message("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            return
+
+        # 1行しかなくヘッダーのみの可能性 (CSV ヘッダー + 0データ行)
+        if len(rows) == 1:
+            # 列名は確かに取れているがデータが無い
+            ncols = len(rows[0])
+            self.result_table.setColumnCount(ncols)
+            self.result_table.setHorizontalHeaderLabels(
+                [h.strip() or f"col{i+1}" for i, h in enumerate(rows[0])]
+            )
+            self.result_table.setRowCount(1)
+            placeholder = QTableWidgetItem("⚠ 0 件 / 該当データなし")
+            placeholder.setForeground(QColor("#e0a96b"))
+            f = placeholder.font(); f.setBold(True); placeholder.setFont(f)
+            self.result_table.setItem(0, 0, placeholder)
+            if ncols > 1:
+                self.result_table.setSpan(0, 0, 1, ncols)
+            self.result_table.resizeColumnsToContents()
+            return
+
+        # 最大列数に合わせる
+        ncols = max(len(r) for r in rows)
+        if ncols == 0:
+            show_message("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            return
+
+        # 1行目をヘッダーとして使う
+        header = rows[0] + [''] * (ncols - len(rows[0]))
+        body = rows[1:]
+
+        self.result_table.setColumnCount(ncols)
+        self.result_table.setHorizontalHeaderLabels([h.strip() or f"col{i+1}" for i, h in enumerate(header)])
+        self.result_table.setRowCount(len(body))
+        for r, row in enumerate(body):
+            for c in range(ncols):
+                val = row[c] if c < len(row) else ''
+                item = QTableWidgetItem(val)
+                self.result_table.setItem(r, c, item)
+        self.result_table.resizeColumnsToContents()
+        # 過剰に広い列は上限を設定
+        for c in range(ncols):
+            if self.result_table.columnWidth(c) > 400:
+                self.result_table.setColumnWidth(c, 400)
+        self.result_table.setSortingEnabled(True)
+        # 縦表示モード用に解析結果をキャッシュ
+        self._parsed_rows = rows
+
+    # ─── 1件詳細 (縦表示) モード ─────────────────────────────────────────
+
+    def _record_count(self) -> int:
+        """データレコード数 (ヘッダーを除く)。"""
+        if not self._parsed_rows or len(self._parsed_rows) < 2:
+            return 0
+        return len(self._parsed_rows) - 1
+
+    def _update_record_nav(self):
+        """レコードナビゲーション (番号入力欄/ボタン群) を現在の状態に同期。"""
+        total = self._record_count()
+        self.rec_index_spin.blockSignals(True)
+        self.rec_index_spin.setMinimum(1)
+        self.rec_index_spin.setMaximum(max(1, total))
+        self.rec_index_spin.setValue(self._current_record + 1 if total > 0 else 1)
+        self.rec_index_spin.blockSignals(False)
+        self.rec_total_lbl.setText(f"/ {total}")
+        self.rec_first_btn.setEnabled(self._current_record > 0)
+        self.rec_prev_btn.setEnabled(self._current_record > 0)
+        self.rec_next_btn.setEnabled(self._current_record < total - 1)
+        self.rec_last_btn.setEnabled(self._current_record < total - 1)
+
+    def _goto_record(self, idx: int):
+        """指定レコードに移動して縦表示を再描画 + ナビゲーション更新。"""
+        total = self._record_count()
+        if total <= 0:
+            return
+        idx = max(0, min(idx, total - 1))
+        self._current_record = idx
+        self._render_vertical_current()
+        self._update_record_nav()
+
+    def _render_vertical_all(self, text: str):
+        """全レコードを転置して表示 (列名=縦ヘッダー、各レコード=横列)。"""
+        self.result_table.setSortingEnabled(False)
+        # 一度クリアしてから新規プロパティを設定
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+
+        rows = self._parse_csv_lines(text) if text and text.strip() else []
+        self._parsed_rows = rows
+
+        if not rows:
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["メッセージ"])
+            self.result_table.setRowCount(1)
+            item = QTableWidgetItem("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            item.setForeground(QColor("#e0a96b"))
+            f = item.font(); f.setBold(True); item.setFont(f)
+            self.result_table.setItem(0, 0, item)
+            self.result_table.resizeColumnsToContents()
+            return
+
+        header = rows[0]
+        body = rows[1:]
+        n_fields = len(header)
+        n_records = len(body)
+
+        if n_records == 0:
+            # ヘッダーのみあってデータが無い場合
+            self.result_table.setRowCount(n_fields)
+            self.result_table.setColumnCount(1)
+            self.result_table.setVerticalHeaderLabels(
+                [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+            )
+            self.result_table.setHorizontalHeaderLabels(["値"])
+            for i in range(n_fields):
+                ph = QTableWidgetItem("⚠ 0 件 / 該当データなし")
+                ph.setForeground(QColor("#e0a96b"))
+                f = ph.font(); f.setBold(True); ph.setFont(f)
+                self.result_table.setItem(i, 0, ph)
+            self.result_table.resizeColumnsToContents()
+            return
+
+        # 転置: 行 = フィールド数、列 = レコード数
+        self.result_table.setRowCount(n_fields)
+        self.result_table.setColumnCount(n_records)
+        # 縦ヘッダーに列名 / 横ヘッダーにレコード番号
+        self.result_table.setVerticalHeaderLabels(
+            [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+        )
+        self.result_table.setHorizontalHeaderLabels(
+            [f"#{i + 1}" for i in range(n_records)]
+        )
+        # 各レコードを 1 列ぶんずつ流し込む
+        for col_idx, record in enumerate(body):
+            for row_idx in range(n_fields):
+                val = record[row_idx] if row_idx < len(record) else ''
+                self.result_table.setItem(row_idx, col_idx, QTableWidgetItem(val))
+
+        self.result_table.resizeColumnsToContents()
+        # 各列の上限を 400px に
+        for c in range(n_records):
+            if self.result_table.columnWidth(c) > 400:
+                self.result_table.setColumnWidth(c, 400)
+
+    def _render_vertical(self, text: str):
+        """テキストを解析して 1件詳細 (縦) モードで描画。"""
+        rows = self._parse_csv_lines(text) if text and text.strip() else []
+        self._parsed_rows = rows
+        total = self._record_count()
+        if self._current_record >= total:
+            self._current_record = max(0, total - 1)
+        self._render_vertical_current()
+        self._update_record_nav()
+
+    def _render_vertical_current(self):
+        """現在の _current_record だけを 全件(縦・転置) と同じ構造で描画。
+        縦ヘッダー = 列名、横ヘッダー = #N (現在のレコード番号)、1列のみ。
+        """
+        self.result_table.setSortingEnabled(False)
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        rows = self._parsed_rows
+
+        if not rows or len(rows) < 1:
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["#1"])
+            self.result_table.setRowCount(1)
+            item = QTableWidgetItem("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            item.setForeground(QColor("#e0a96b"))
+            f = item.font(); f.setBold(True); item.setFont(f)
+            self.result_table.setItem(0, 0, item)
+            self.result_table.resizeColumnsToContents()
+            return
+
+        header = rows[0]
+        body = rows[1:]
+        n_fields = len(header)
+
+        if not body:
+            # ヘッダーのみ (データ無し)
+            self.result_table.setRowCount(n_fields)
+            self.result_table.setColumnCount(1)
+            self.result_table.setVerticalHeaderLabels(
+                [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+            )
+            self.result_table.setHorizontalHeaderLabels(["#1"])
+            for i in range(n_fields):
+                ph = QTableWidgetItem("⚠ 0 件 / 該当データなし")
+                ph.setForeground(QColor("#e0a96b"))
+                f = ph.font(); f.setBold(True); ph.setFont(f)
+                self.result_table.setItem(i, 0, ph)
+            self.result_table.resizeColumnsToContents()
+            return
+
+        idx = min(self._current_record, len(body) - 1)
+        record = body[idx]
+
+        # 全件(縦・転置) と同じ構造: 縦ヘッダー=列名 / 横ヘッダー=#N / 1列のみ
+        self.result_table.setRowCount(n_fields)
+        self.result_table.setColumnCount(1)
+        self.result_table.setVerticalHeaderLabels(
+            [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+        )
+        self.result_table.setHorizontalHeaderLabels([f"#{idx + 1}"])
+
+        for i in range(n_fields):
+            val = record[i] if i < len(record) else ''
+            self.result_table.setItem(i, 0, QTableWidgetItem(val))
+        self.result_table.resizeColumnsToContents()
+        # 値列が広すぎる時は 600px に
+        if self.result_table.columnWidth(0) > 600:
+            self.result_table.setColumnWidth(0, 600)
+
+
+# ---------------------------------------------------------------------------
+# SQL 抽出・整形ダイアログ
+# ---------------------------------------------------------------------------
+
 class SqlExtractDialog(QDialog):
     open_sql_requested = pyqtSignal(str, str)  # content, filename
 
@@ -3221,10 +5690,26 @@ class SqlExtractDialog(QDialog):
         self.setWindowTitle(f"SQL抽出・整形 — {source_name}")
         self.setMinimumSize(1000, 650)
         self.resize(1200, 720)
+        # タイトルバーに 最小化/最大化 ボタンを表示する
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint
+        )
         self._log_content = log_content
         self._extracted: list[dict] = []
         self._build_ui()
         self._extract()
+        # sqlparse 未インストール時は警告
+        if not _check_sqlparse():
+            QMessageBox.information(
+                self, "sqlparse 未インストール",
+                "SQL整形ライブラリ sqlparse がインストールされていません。\n"
+                "「再整形」を押しても元のSQLがそのまま表示されます。\n\n"
+                "整形を有効化するには:\n"
+                "    pip install sqlparse\n"
+                "を実行してアプリを再起動してください。"
+            )
 
     def _build_ui(self):
         main = QVBoxLayout()
@@ -3232,37 +5717,65 @@ class SqlExtractDialog(QDialog):
         main.setContentsMargins(6, 6, 6, 6)
 
         # ─── オプションバー ───────────────────────────────────────────
-        opt_bar = QHBoxLayout()
-        opt_bar.addWidget(QLabel("追加プレフィックス:"))
+        # ─── 1行目: 抽出パラメータ + 再抽出ボタン + 件数 ───
+        row1 = QHBoxLayout()
+        row1.setSpacing(6)
+        row1.addWidget(QLabel("📋 追加プレフィックス:"))
         self.prefix_input = QLineEdit()
-        self.prefix_input.setPlaceholderText("例: MyPrefix:, Exec:")
-        opt_bar.addWidget(self.prefix_input, 2)
+        self.prefix_input.setPlaceholderText("例: MyPrefix:, Exec:  (カンマ区切り)")
+        self.prefix_input.setToolTip(
+            "SQL検出時に剥がす独自プレフィックスを追加 (デフォルト: Hibernate:/SQL:/Execute 等)"
+        )
+        row1.addWidget(self.prefix_input, 1)
 
-        opt_bar.addWidget(QLabel("キーワード:"))
+        row1.addSpacing(8)
+
+        extract_btn = QPushButton("🔄 再抽出")
+        extract_btn.setToolTip("プレフィックスを更新して全件抽出をやり直す")
+        extract_btn.clicked.connect(self._extract)
+        row1.addWidget(extract_btn)
+
+        self.count_label = QLabel("0 件")
+        self.count_label.setStyleSheet("color:#808080;font-weight:600;padding:0 4px;")
+        self.count_label.setMinimumWidth(50)
+        row1.addWidget(self.count_label)
+        main.addLayout(row1, 0)
+
+        # ─── 2行目: 整形オプション (キーワードケース / インデント / パラメータ置換) ───
+        row2 = QHBoxLayout()
+        row2.setSpacing(6)
+        row2.addWidget(QLabel("整形:"))
+
+        row2.addWidget(QLabel("キーワード"))
         self.kw_combo = QComboBox()
         self.kw_combo.addItems(["upper", "lower", "capitalize"])
-        opt_bar.addWidget(self.kw_combo)
+        self.kw_combo.setToolTip(
+            "SQLキーワード (SELECT/FROM等) の大小文字統一:\n"
+            "upper: SELECT FROM\nlower: select from\ncapitalize: Select From"
+        )
+        self.kw_combo.setFixedWidth(110)
+        row2.addWidget(self.kw_combo)
 
-        opt_bar.addWidget(QLabel("インデント:"))
+        row2.addSpacing(8)
+        row2.addWidget(QLabel("インデント"))
         self.indent_spin = QSpinBox()
         self.indent_spin.setRange(2, 8)
         self.indent_spin.setValue(4)
-        self.indent_spin.setMaximumWidth(50)
-        opt_bar.addWidget(self.indent_spin)
+        self.indent_spin.setMaximumWidth(60)
+        self.indent_spin.setToolTip("インデントのスペース数 (2〜8)")
+        row2.addWidget(self.indent_spin)
 
+        row2.addSpacing(12)
         self.subst_check = QCheckBox("パラメータ置換")
-        self.subst_check.setToolTip("?プレースホルダーをバインド値で置換する")
+        self.subst_check.setToolTip(
+            "Hibernate/MyBatisログの ? プレースホルダーをバインド値で置換する\n"
+            "(値直埋め込み形式のログでは効果なし)"
+        )
         self.subst_check.setChecked(True)
-        opt_bar.addWidget(self.subst_check)
+        row2.addWidget(self.subst_check)
 
-        extract_btn = QPushButton("再抽出")
-        extract_btn.clicked.connect(self._extract)
-        opt_bar.addWidget(extract_btn)
-
-        self.count_label = QLabel("0 件")
-        self.count_label.setStyleSheet("color: #808080;")
-        opt_bar.addWidget(self.count_label)
-        main.addLayout(opt_bar, 0)
+        row2.addStretch()
+        main.addLayout(row2, 0)
 
         # ─── メインスプリッター：左=リスト / 右=プレビュー ───────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -3274,6 +5787,8 @@ class SqlExtractDialog(QDialog):
         ll.setSpacing(2)
         ll.addWidget(QLabel("抽出されたSQL:"))
         self.sql_list = QListWidget()
+        self.sql_list.setAlternatingRowColors(True)
+        self.sql_list.setUniformItemSizes(True)
         self.sql_list.currentRowChanged.connect(self._on_row_changed)
         ll.addWidget(self.sql_list)
 
@@ -3305,13 +5820,29 @@ class SqlExtractDialog(QDialog):
         open_all_btn = QPushButton("全件を1タブで開く")
         open_all_btn.clicked.connect(self._open_all)
         preview_header.addWidget(open_all_btn)
+        # DB実行 (SSH 経由で sqlplus 等を実行して結果取得)
+        db_exec_btn = QPushButton("▶ DB実行")
+        db_exec_btn.setToolTip(
+            "現在プレビュー中のSQLをSSH経由でDBに投げて結果を取得します\n"
+            "(接続プロファイル + DB実行コマンドテンプレートが必要)"
+        )
+        db_exec_btn.setStyleSheet(
+            "QPushButton { background:#3a6e3a; color:#e0f0e0; padding:2px 10px; }"
+            "QPushButton:hover { background:#4a8e4a; }"
+        )
+        db_exec_btn.clicked.connect(self._open_db_execute)
+        preview_header.addWidget(db_exec_btn)
         rl.addLayout(preview_header)
 
         self.preview = QPlainTextEdit()
         self.preview.setFont(QFont("Consolas", 10))
+        t = _theme()
         self.preview.setStyleSheet(
-            "background:#2b2b2b; color:#a9b7c6; border:none; selection-background-color:#214283;"
+            f"background:{t['editor_bg']}; color:{t['text']}; border:none; "
+            f"selection-background-color:{t['selection']};"
         )
+        # SQL シンタックスハイライト (LogViewer と同じ配色)
+        self.preview_highlighter = SyntaxHighlighter(self.preview.document(), 'sql')
         rl.addWidget(self.preview)
 
         # パラメータ情報ラベル
@@ -3339,10 +5870,11 @@ class SqlExtractDialog(QDialog):
             QLabel  { color: #a9b7c6; }
             QPushButton { background:#4a4a4a; color:#a9b7c6; border:none; padding:2px 8px; border-radius:2px; }
             QPushButton:hover { background:#5a5a5a; }
-            QListWidget { background:#1e1e1e; color:#a9b7c6; border:none; }
-            QListWidget::item { padding:1px 2px; }
-            QListWidget::item:selected { background:#214283; }
-            QListWidget::item:hover { background:#3a3a3a; }
+            QListWidget { background:#1e1e1e; color:#e0e0e0; border:none;
+                          alternate-background-color:#252525; font-family:Consolas, monospace; font-size:12px; }
+            QListWidget::item { padding:4px 6px; border-bottom:1px solid #2a2a2a; }
+            QListWidget::item:selected { background:#2a4a8a; color:#ffffff; }
+            QListWidget::item:hover { background:#34425e; }
             QLineEdit { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
             QComboBox { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
             QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6; selection-background-color:#214283; }
@@ -3361,20 +5893,36 @@ class SqlExtractDialog(QDialog):
 
     def _update_list(self):
         self.sql_list.clear()
+        # 視認性の高い明るい配色 (ダーク背景に対するコントラスト重視)
         for i, entry in enumerate(self._extracted):
             preview = entry['sql'][:70].replace('\n', ' ')
             if len(entry['sql']) > 70:
                 preview += '…'
             has_params = bool(entry['params'])
             marker = ' [?]' if '?' in entry['sql'] and has_params else ''
-            item = QListWidgetItem(f"  {i+1:>3}.{marker}  {preview}")
-            item.setToolTip(f"ログ行 {entry['lineno']}")
+            # 種別ラベル (先頭にバッジ風に表示)
+            sql_kind = ''
+            color = QColor("#e0e0e0")  # デフォルトはほぼ白
             if re.match(r'\s*(SELECT|WITH)\b', entry['sql'], re.IGNORECASE):
-                item.setForeground(QColor("#6A8759"))
+                sql_kind = 'SEL'
+                color = QColor("#9ED969")          # 明るい緑
             elif re.match(r'\s*(INSERT|MERGE)\b', entry['sql'], re.IGNORECASE):
-                item.setForeground(QColor("#6897BB"))
-            elif re.match(r'\s*(UPDATE|DELETE)\b', entry['sql'], re.IGNORECASE):
-                item.setForeground(QColor("#E8B26A"))
+                sql_kind = 'INS'
+                color = QColor("#82AAFF")          # 明るい青
+            elif re.match(r'\s*(UPDATE)\b', entry['sql'], re.IGNORECASE):
+                sql_kind = 'UPD'
+                color = QColor("#FFB454")          # 明るいオレンジ
+            elif re.match(r'\s*(DELETE)\b', entry['sql'], re.IGNORECASE):
+                sql_kind = 'DEL'
+                color = QColor("#FF6E6E")          # 明るい赤
+            kind_label = f"[{sql_kind}]" if sql_kind else "[?  ]"
+            item = QListWidgetItem(f" {i+1:>3}. {kind_label}{marker}  {preview}")
+            item.setToolTip(f"ログ行 {entry['lineno']}\n{entry['sql'][:300]}")
+            item.setForeground(color)
+            # 太字でさらに強調
+            f = item.font()
+            f.setPointSize(max(10, f.pointSize()))
+            item.setFont(f)
             self.sql_list.addItem(item)
         if self._extracted:
             self.sql_list.setCurrentRow(0)
@@ -3433,6 +5981,56 @@ class SqlExtractDialog(QDialog):
             QApplication.clipboard().setText(text)
             self.param_label.setText("クリップボードにコピーしました")
 
+    # ─── DB実行ダイアログ用ナビゲーション API ────────────────────────────
+
+    def get_sql_count(self) -> int:
+        """抽出済み SQL の総数を返す。"""
+        return len(self._extracted)
+
+    def get_current_index(self) -> int:
+        """現在選択中の SQL のインデックスを返す。未選択時は -1。"""
+        return self.sql_list.currentRow()
+
+    def get_formatted_sql_at(self, index: int) -> tuple[str, int]:
+        """指定インデックスの整形済み SQL とログ行番号を返す。
+        現在のオプション (kw_combo / indent_spin / subst_check) を適用する。
+        範囲外の場合は ('', -1)。
+        """
+        if not (0 <= index < len(self._extracted)):
+            return ('', -1)
+        entry = self._extracted[index]
+        sql = entry['sql']
+        if self.subst_check.isChecked() and entry['params']:
+            sql = _substitute_params(sql, entry['params'])
+        formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText())
+        return (formatted, entry['lineno'])
+
+    def navigate_to(self, index: int):
+        """SQL リストの選択を index に移動 (プレビューも追随する)。"""
+        if 0 <= index < len(self._extracted):
+            self.sql_list.setCurrentRow(index)
+
+    def _open_db_execute(self):
+        """現在プレビューしているSQLをDB実行ダイアログに渡す。"""
+        sql = self.preview.toPlainText().strip()
+        if not sql:
+            QMessageBox.information(self, "SQL未選択",
+                "実行するSQLが選択されていません。\n左のリストから選んで「再整形」を押してください。")
+            return
+        # 親 (MainWindow) から起動元プロファイル名を取得
+        default_profile = ''
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_origin_profile'):
+            default_profile = getattr(parent, '_origin_profile', '') or ''
+        # navigator = self を渡すと DB実行ダイアログで ◁▷ ボタンが有効化される
+        dlg = DBExecuteDialog(
+            sql,
+            default_profile=default_profile,
+            parent=self,
+            navigator=self,
+        )
+        dlg.exec()
+
 
 # ---------------------------------------------------------------------------
 # エントリーポイント
@@ -3456,8 +6054,48 @@ if __name__ == '__main__':
         pass
     window = MainWindow()
     window.show()
-    # コマンドライン引数で指定されたファイルを開く (タブとして追加)
-    for arg in sys.argv[1:]:
-        if os.path.isfile(arg):
-            window._load_file(arg)
+
+    # コマンドライン引数:
+    #   file1 file2 ...          : 開くファイル
+    #   --search KEYWORD         : 開いた直後に検索バーで自動検索
+    #   --search=KEYWORD         : 同上
+    #   --profile NAME           : DB実行ダイアログで初期選択する接続プロファイル名
+    #   --profile=NAME           : 同上
+    args = sys.argv[1:]
+    files: list[str] = []
+    search_term: str | None = None
+    profile_name: str | None = None
+    i = 0
+    while i < len(args):
+        a = args[i]
+        if a == '--search' and i + 1 < len(args):
+            search_term = args[i + 1]
+            i += 2
+        elif a.startswith('--search='):
+            search_term = a[len('--search='):]
+            i += 1
+        elif a == '--profile' and i + 1 < len(args):
+            profile_name = args[i + 1]
+            i += 2
+        elif a.startswith('--profile='):
+            profile_name = a[len('--profile='):]
+            i += 1
+        elif os.path.isfile(a):
+            files.append(a)
+            i += 1
+        else:
+            i += 1
+
+    if profile_name:
+        window._origin_profile = profile_name
+
+    for f in files:
+        window._load_file(f)
+
+    # 検索キーワード指定があれば即時検索 (現在のタブに対して)
+    if search_term:
+        tab = window.current_tab()
+        if tab and hasattr(tab, 'search_bar'):
+            tab.search_bar.show_bar(initial_text=search_term)
+
     sys.exit(app.exec())

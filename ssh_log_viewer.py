@@ -311,6 +311,14 @@ class SSHConnection:
             kw['password'] = password
         c.connect(**kw)
         self.client = c
+        # 接続維持: 30秒毎にキープアライブパケットを送ってサーバー側の
+        # idle timeout 切断を防ぐ
+        try:
+            tr = c.get_transport()
+            if tr is not None:
+                tr.set_keepalive(30)
+        except Exception:
+            pass
         self.sftp   = c.open_sftp()
         self.label  = f"{user}@{host}"
         self._info  = dict(host=host, port=port, user=user,
@@ -328,22 +336,62 @@ class SSHConnection:
     def connected(self) -> bool:
         return self.client is not None
 
+    def _is_transport_alive(self) -> bool:
+        """SSH トランスポートが生きているかチェック。"""
+        if self.client is None:
+            return False
+        try:
+            tr = self.client.get_transport()
+            return tr is not None and tr.is_active() and tr.is_alive()
+        except Exception:
+            return False
+
+    def _reconnect(self):
+        """保存済み接続情報で再接続する。失敗時は例外を再送出。"""
+        info = dict(self._info or {})
+        try:
+            if self.sftp:
+                self.sftp.close()
+        except Exception:
+            pass
+        try:
+            if self.client:
+                self.client.close()
+        except Exception:
+            pass
+        self.client = None
+        self.sftp = None
+        if not info:
+            raise RuntimeError("再接続情報がありません")
+        self.connect(info.get('host', ''), info.get('port', 22),
+                     info.get('user', ''), info.get('password', ''),
+                     info.get('key_path', ''))
+
+    def _ensure_alive(self):
+        """通信前に transport の生死を確認し、死んでいれば1回だけ自動再接続。"""
+        if not self._is_transport_alive():
+            self._reconnect()
+
     def listdir(self, path: str):
+        self._ensure_alive()
         entries = self.sftp.listdir_attr(path)
         entries.sort(key=lambda a: (not stat_mod.S_ISDIR(a.st_mode), a.filename.lower()))
         return entries
 
     def read_tail(self, path: str, lines: int = 5000) -> str:
+        self._ensure_alive()
         _, out, _ = self.client.exec_command(
             f'tail -n {lines} "{path}" 2>/dev/null || cat "{path}" 2>/dev/null'
         )
         return out.read().decode('utf-8', errors='replace')
 
     def exec(self, cmd: str) -> str:
+        self._ensure_alive()
         _, out, _ = self.client.exec_command(cmd)
         return out.read().decode('utf-8', errors='replace')
 
     def open_tail_channel(self, path: str) -> '_TailChannel':
+        self._ensure_alive()
         transport = self.client.get_transport()
         chan = transport.open_session()
         # -F (= --follow=name --retry): ローテーションされても同じ名前を追従
@@ -351,13 +399,30 @@ class SSHConnection:
         return _SSHChannel(chan)
 
     def open_shell_channel(self) -> '_TailChannel':
+        self._ensure_alive()
         chan = self.client.invoke_shell(term='xterm', width=120, height=30)
         return _SSHChannel(chan)
 
     def download_bytes(self, path: str) -> bytes:
-        """リモートファイルを全文バイトで取得 (SFTP)。"""
-        with self.sftp.open(path, 'rb') as f:
-            return f.read()
+        """リモートファイルを全文バイトで取得 (SFTP)。
+        ソケット切断時は1回だけ自動再接続を試みる。
+        """
+        try:
+            self._ensure_alive()
+            with self.sftp.open(path, 'rb') as f:
+                return f.read()
+        except (EOFError, OSError, paramiko.SSHException) as e:
+            # 何らかの理由で SFTP が死んでいたら再接続を1度試す
+            msg = str(e).lower()
+            if 'closed' in msg or 'eof' in msg or 'broken' in msg or 'not connected' in msg \
+                    or isinstance(e, (EOFError, paramiko.SSHException)):
+                try:
+                    self._reconnect()
+                    with self.sftp.open(path, 'rb') as f:
+                        return f.read()
+                except Exception:
+                    raise
+            raise
 
 
 # ---------------------------------------------------------------------------
@@ -948,8 +1013,9 @@ class LogHighlighter(QSyntaxHighlighter):
 # ---------------------------------------------------------------------------
 
 class MiniLogViewer(QWidget):
-    tail_changed    = pyqtSignal(bool)
-    close_requested = pyqtSignal(object)
+    tail_changed     = pyqtSignal(bool)
+    close_requested  = pyqtSignal(object)
+    editor_requested = pyqtSignal(object, str)   # conn, path
 
     def __init__(self, conn: SSHConnection, path: str,
                  server_label: str, color_idx: int, parent=None):
@@ -996,6 +1062,8 @@ class MiniLogViewer(QWidget):
             ("▶", "Tail -F 開始 (リアルタイム追従 / ログローテーション自動追従)", None, 'tail'),
             ("■", "Tail 停止 (このセルのみ)", None, 'stop'),
             ("↺", "再読み込み", self._load, None),
+            ("📝", "Sora Editor で開く (Ctrl+E で次のエラー行へジャンプ可能)",
+                  lambda: self.editor_requested.emit(self.conn, self.filepath), None),
             ("✕", "閉じる", lambda: self.close_requested.emit(self), None),
         ]:
             btn = QPushButton(text)
@@ -1564,6 +1632,29 @@ class ServerPanel(QWidget):
         self.path_input.setText(path)
         self.tree.clear()
         self._fill(self.tree.invisibleRootItem(), path)
+        # ナビゲートしたディレクトリをプロファイルに自動永続化
+        self._persist_last_dir(path)
+
+    def _persist_last_dir(self, path: str):
+        """現在のディレクトリを接続中プロファイルの last_dir に保存。
+        - プロファイル名が無い (-- 新規 -- や手動接続) 場合は何もしない
+        - 値が前回と同じならスキップ (無駄な disk write を防ぐ)
+        - log_dir は手動「📌 保存」用に温存し、ここでは触らない
+        """
+        name = getattr(self, '_profile_name', '')
+        if not name or name == '-- 新規 --':
+            return
+        try:
+            profs = _load_profiles()
+            if name not in profs:
+                return
+            normalized = (path or '').rstrip('/') or '/'
+            if profs[name].get('last_dir') == normalized:
+                return
+            profs[name]['last_dir'] = normalized
+            _save_profiles(profs)
+        except Exception:
+            pass
 
     def _fill(self, parent, path: str):
         try:
@@ -1671,7 +1762,8 @@ class SSHConnectDialog(QDialog):
         g = QGridLayout()
         g.setSpacing(4)
         fields = [
-            ("ホスト:",      "host",     "",                      False),
+            ("ホスト:",      "host",     "接続先 (IP または FQDN)",  False),
+            ("ホスト名:",    "hostname", "アラートメール照合用 (例: cts7031)", False),
             ("ポート:",      "port",     "22",                    False),
             ("ユーザー:",    "user",     "",                      False),
             ("パスワード:",  "password", "",                      True),
@@ -1870,10 +1962,17 @@ class ProfileManagerDialog(QDialog):
         self.list.clear()
         for name, info in self._profiles.items():
             host = info.get('host', '')
+            hostname = info.get('hostname', '')
             user = info.get('user', '')
             proto = info.get('protocol', 'SSH')
-            item = QListWidgetItem(name)
-            item.setToolTip(f"[{proto}] {user}@{host}")
+            label = name
+            if hostname:
+                label = f"{name}  [{hostname}]"
+            item = QListWidgetItem(label)
+            tip = f"[{proto}] {user}@{host}"
+            if hostname and hostname != host:
+                tip += f"\n(別名/ホスト名: {hostname})"
+            item.setToolTip(tip)
             self.list.addItem(item)
 
     def _on_rename(self, item):
@@ -1917,6 +2016,337 @@ class ProfileManagerDialog(QDialog):
         reordered = {n: self._profiles[n] for n in names_in_order if n in self._profiles}
         _save_profiles(reordered)
         super().accept()
+
+
+# ---------------------------------------------------------------------------
+# アラートメール解析
+# ---------------------------------------------------------------------------
+
+def parse_alert_email(text: str) -> dict:
+    """製造系アラートメールから ノード/プロセス/時刻/ロット 等を抽出。
+    [key = value] / [key   = value] / 「key: value」 等を許容。"""
+    fields: dict = {}
+
+    def grab(pattern: str, key: str):
+        m = re.search(pattern, text, re.IGNORECASE)
+        if m:
+            fields[key] = m.group(1).strip()
+
+    # よくあるラベル → 統一キー
+    grab(r'(?:ノード|node|host|hostname)\s*[=:]\s*\[?\s*([^\s\]\n]+)',          'host')
+    grab(r'(?:プロセス|process|service|app)\s*[=:]\s*\[?\s*([^\s\]\n]+)',        'process')
+    grab(r'(?:ロット|lot|lot[_\s-]?id)\s*[=:]\s*\[?\s*([^\s\]\n]+)',             'lot')
+    grab(r'(?:大工程|工程|process[_\s-]?step|step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_major')
+    grab(r'(?:小工程|sub[_\s-]?step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_minor')
+
+    # 時刻: 2026/05/26 08:32:57 / 2026-05-26T08:32:57 等
+    m_ts = re.search(
+        r'(\d{4}[-/]\d{2}[-/]\d{2}[T\s]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?)', text
+    )
+    if m_ts:
+        fields['timestamp'] = m_ts.group(1)
+
+    # レベル (ERROR/WARN/INFO 等)
+    m_level = re.search(r'\b(ERROR|CRITICAL|FATAL|WARN(?:ING)?|INFO)\b', text)
+    if m_level:
+        fields['level'] = m_level.group(1).upper()
+
+    return fields
+
+
+class LogSelectionDialog(QDialog):
+    """複数のログ候補から開くものを選ぶダイアログ。
+    シングル選択で「開く」、複数選択で「選択を全て開く」が可能。"""
+
+    def __init__(self, search_dir: str, filenames: list[str], stat_map: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("対象ログを選択")
+        self.setMinimumSize(560, 380)
+        self._search_dir = search_dir
+        self._selected_paths: list[str] = []
+        self._build_ui(filenames, stat_map)
+
+    def _build_ui(self, filenames: list[str], stat_map: dict):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(6)
+
+        lbl = QLabel(
+            f"{self._search_dir} 配下で複数のログ候補が見つかりました。\n"
+            "現在のログ + 過去ローテーション含む候補一覧です:"
+        )
+        lay.addWidget(lbl)
+
+        self.list = QListWidget()
+        self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
+        from datetime import datetime
+        for fn in filenames:
+            st = stat_map.get(fn)
+            size = getattr(st, 'st_size', 0) if st else 0
+            mtime = getattr(st, 'st_mtime', 0) if st else 0
+            mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M') if mtime else '-'
+            size_str = self._fmt_size(size)
+            item = QListWidgetItem(f"{fn:<40} {size_str:>10}   {mtime_str}")
+            item.setData(Qt.ItemDataRole.UserRole, fn)
+            self.list.addItem(item)
+        if self.list.count():
+            self.list.setCurrentRow(0)
+        self.list.itemDoubleClicked.connect(self._on_open_selected)
+        lay.addWidget(self.list, 1)
+
+        hint = QLabel("Ctrl/Shift クリックで複数選択 → 「選択を全て開く」")
+        hint.setStyleSheet("color:#888;font-size:10px;")
+        lay.addWidget(hint)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        open_btn = QPushButton("📂 開く")
+        open_btn.clicked.connect(self._on_open_selected)
+        all_btn = QPushButton("📂 選択を全て開く")
+        all_btn.clicked.connect(self._on_open_all_selected)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(open_btn)
+        btns.addWidget(all_btn)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
+                          border:1px solid {t['border']}; font-family:Consolas; font-size:11px; }}
+            QListWidget::item {{ padding:3px 6px; }}
+            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:none; padding:5px 14px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+        """)
+
+    @staticmethod
+    def _fmt_size(b: int) -> str:
+        for unit in ('B', 'KB', 'MB', 'GB'):
+            if b < 1024:
+                return f"{b:.0f}{unit}"
+            b /= 1024
+        return f"{b:.0f}TB"
+
+    def _on_open_selected(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        fn = item.data(Qt.ItemDataRole.UserRole)
+        self._selected_paths = [f"{self._search_dir}/{fn}"]
+        self.accept()
+
+    def _on_open_all_selected(self):
+        items = self.list.selectedItems()
+        if not items:
+            return
+        self._selected_paths = [
+            f"{self._search_dir}/{it.data(Qt.ItemDataRole.UserRole)}"
+            for it in items
+        ]
+        self.accept()
+
+    def selected_paths(self) -> list[str]:
+        return self._selected_paths
+
+
+class LogPopup(QDialog):
+    """グリッドが満杯のときにフローティングウィンドウで MiniLogViewer を表示"""
+
+    def __init__(self, conn, path: str, server_label: str, color_idx: int, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"{server_label} · {os.path.basename(path)}")
+        self.resize(900, 500)
+        # 通常のウィンドウ (X / 最大化等あり)
+        self.setWindowFlags(self.windowFlags() | Qt.WindowType.Window)
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.setSpacing(0)
+        self.viewer = MiniLogViewer(conn, path, server_label, color_idx, self)
+        # セルの ✕ ボタンはウィンドウクローズに紐づける
+        self.viewer.close_requested.connect(lambda _=None: self.close())
+        # 📝 ボタン: 親 MainWindow の _open_in_text_editor へ
+        if parent is not None and hasattr(parent, '_open_in_text_editor'):
+            self.viewer.editor_requested.connect(parent._open_in_text_editor)
+        lay.addWidget(self.viewer)
+
+    def closeEvent(self, event):
+        try:
+            self.viewer.stop_tail()
+        except Exception:
+            pass
+        super().closeEvent(event)
+
+
+class AlertAnalysisDialog(QDialog):
+    """アラートメールをペーストして自動でサーバー特定・調査開始"""
+
+    investigation_requested = pyqtSignal(dict)   # 抽出結果 + 'profile_name'
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("アラート解析 — メールから一発調査")
+        self.setMinimumSize(640, 480)
+        self._parsed: dict = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(10, 10, 10, 10)
+        lay.setSpacing(8)
+
+        # 上: メール本文ペースト欄
+        lay.addWidget(QLabel("アラートメールを貼り付け:"))
+        self.input = QPlainTextEdit()
+        self.input.setPlaceholderText(
+            "例:\n"
+            "ERROR\n"
+            "ロット[TNF0056S00]の状態更新に失敗しました。...\n\n"
+            "時刻     = [2026/05/26 08:32:57]\n"
+            "プロセス = [ap2_ctlsvr2]\n"
+            "ノード   = [cts7031]\n"
+            "ロット   = [TNF0056S00]\n"
+        )
+        self.input.setMaximumHeight(180)
+        lay.addWidget(self.input)
+
+        # 解析ボタン
+        parse_row = QHBoxLayout()
+        parse_btn = QPushButton("🔍 解析")
+        parse_btn.clicked.connect(self._on_parse)
+        parse_row.addWidget(parse_btn)
+        parse_row.addStretch()
+        lay.addLayout(parse_row)
+
+        # 中: 抽出結果
+        lay.addWidget(QLabel("抽出結果:"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(3)
+        self._result_labels: dict[str, QLabel] = {}
+        for r, (key, label) in enumerate([
+            ('timestamp', '時刻:'), ('level', 'レベル:'),
+            ('host', 'ノード:'), ('process', 'プロセス:'),
+            ('lot', 'ロット:'), ('step_major', '大工程:'),
+            ('step_minor', '小工程:'),
+        ]):
+            grid.addWidget(QLabel(label), r, 0)
+            v = QLabel("—")
+            v.setStyleSheet("color:#888;")
+            v.setTextInteractionFlags(Qt.TextInteractionFlag.TextSelectableByMouse)
+            grid.addWidget(v, r, 1)
+            self._result_labels[key] = v
+        lay.addLayout(grid)
+
+        # サーバープロファイル候補
+        lay.addWidget(QLabel("一致するサーバープロファイル:"))
+        self.profile_list = QListWidget()
+        self.profile_list.setMaximumHeight(100)
+        lay.addWidget(self.profile_list)
+
+        # アクションボタン
+        action_row = QHBoxLayout()
+        action_row.addStretch()
+        self.go_btn = QPushButton("🚀 調査開始")
+        self.go_btn.setToolTip(
+            "選択中のサーバープロファイルに接続して、推定ログを開き、ロットIDでフィルタ"
+        )
+        self.go_btn.setEnabled(False)
+        self.go_btn.clicked.connect(self._on_investigate)
+        action_row.addWidget(self.go_btn)
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.reject)
+        action_row.addWidget(close_btn)
+        lay.addLayout(action_row)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QPlainTextEdit {{ background:{t['panel_bg']}; color:{t['text']};
+                             border:1px solid {t['border']}; font-family:Consolas; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
+                          border:1px solid {t['border']}; }}
+            QListWidget::item {{ padding:3px 6px; }}
+            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:none; padding:5px 14px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:disabled {{ color:{t['text_dim']}; }}
+        """)
+
+    def _on_parse(self):
+        text = self.input.toPlainText()
+        if not text.strip():
+            QMessageBox.information(self, "入力なし", "メール本文を貼り付けてください。")
+            return
+        self._parsed = parse_alert_email(text)
+        # 抽出結果を表示
+        for key, lbl in self._result_labels.items():
+            v = self._parsed.get(key)
+            if v:
+                lbl.setText(v)
+                lbl.setStyleSheet(f"color:{_theme()['text']};font-weight:600;")
+            else:
+                lbl.setText("(未検出)")
+                lbl.setStyleSheet(f"color:{_theme()['text_dim']};")
+
+        # プロファイル候補を検索
+        # マッチ優先度: hostname (alert用ホスト名フィールド) > host (接続先IP/FQDN)
+        self.profile_list.clear()
+        target = self._parsed.get('host', '').lower()
+        profiles = _load_profiles()
+        matches: list[str] = []
+        if target:
+            for name, info in profiles.items():
+                phost = (info.get('host') or '').lower()
+                pname = (info.get('hostname') or '').lower()
+                # hostname (alert照合用) を最優先、なければ host
+                if pname:
+                    if pname == target or target in pname or pname in target:
+                        matches.append(name)
+                        continue
+                if phost == target or target in phost or phost in target:
+                    matches.append(name)
+        if matches:
+            for name in matches:
+                info = profiles[name]
+                desc = info.get('hostname') or info.get('host')
+                item = QListWidgetItem(f"✓ {name}  ({desc})")
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.profile_list.addItem(item)
+            self.profile_list.setCurrentRow(0)
+            self.go_btn.setEnabled(True)
+        else:
+            # 候補なし: 全プロファイルを表示 (手動選択)
+            note = QListWidgetItem(
+                f"✗ 「{target}」に一致するプロファイルなし — 任意で選択:"
+            ) if target else QListWidgetItem("（ノード未抽出。任意で選択:）")
+            note.setFlags(Qt.ItemFlag.NoItemFlags)
+            note.setForeground(QColor('#FF7070'))
+            self.profile_list.addItem(note)
+            for name, info in profiles.items():
+                desc = info.get('hostname') or info.get('host') or ''
+                item = QListWidgetItem(f"  {name}  ({desc})")
+                item.setData(Qt.ItemDataRole.UserRole, name)
+                self.profile_list.addItem(item)
+            self.go_btn.setEnabled(bool(profiles))
+
+    def _on_investigate(self):
+        item = self.profile_list.currentItem()
+        if not item:
+            return
+        prof_name = item.data(Qt.ItemDataRole.UserRole)
+        if not prof_name:
+            return
+        payload = dict(self._parsed)
+        payload['profile_name'] = prof_name
+        self.investigation_requested.emit(payload)
+        self.accept()
 
 
 class WorkspaceManagerDialog(QDialog):
@@ -2419,6 +2849,7 @@ class MainWindow(QMainWindow):
         self.resize(1600, 900)
         self._panels: list[ServerPanel] = []
         self._terminals: list = []
+        self._log_popups: list = []   # フローティング表示の LogPopup
         self._setup_ui()
         self._apply_theme()
 
@@ -2444,24 +2875,28 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        btn_all_tail = QPushButton("▶ 全Tail")
-        btn_all_tail.setToolTip("全セルで tail -f を開始 (新しい行が自動追従されます)")
+        # 全Tail / 全停止 — アイコンのみで省スペース
+        btn_all_tail = QPushButton("▶")
+        btn_all_tail.setToolTip("全セルで Tail -F を開始 (新しい行が自動追従)")
+        btn_all_tail.setFixedWidth(28)
         btn_all_tail.clicked.connect(lambda: self.grid.start_all_tail())
         tb.addWidget(btn_all_tail)
 
-        btn_stop_all = QPushButton("■ 全停止")
-        btn_stop_all.setToolTip("全セルの tail -f を停止")
+        btn_stop_all = QPushButton("■")
+        btn_stop_all.setToolTip("全セルの Tail -F を停止")
+        btn_stop_all.setFixedWidth(28)
         btn_stop_all.clicked.connect(lambda: self.grid.stop_all_tail())
         tb.addWidget(btn_stop_all)
 
         tb.addSeparator()
 
-        gf_lbl = QLabel(" 共通フィルタ: ")
+        # 共通フィルタ (ラベルは🔎アイコンで省スペース)
+        gf_lbl = QLabel(" 🔎 ")
         gf_lbl.setToolTip("開いている全ログセルにまとめてフィルタを適用")
         tb.addWidget(gf_lbl)
         self.global_filter = QLineEdit()
         self.global_filter.setPlaceholderText("全セルに適用...")
-        self.global_filter.setFixedWidth(180)
+        self.global_filter.setFixedWidth(140)
         self.global_filter.setToolTip(
             "検索文字列または正規表現 — 「適用」で全セルに反映"
         )
@@ -2480,14 +2915,14 @@ class MainWindow(QMainWindow):
         tb.addWidget(self.global_level)
 
         apply_btn = QPushButton("適用")
-        apply_btn.setFixedWidth(44)
+        apply_btn.setFixedWidth(40)
         apply_btn.setToolTip("共通フィルタとレベルを全セルに反映")
         apply_btn.clicked.connect(self._apply_global_filter)
         tb.addWidget(apply_btn)
 
         tb.addSeparator()
 
-        add_server_btn = QPushButton("＋ サーバー接続")
+        add_server_btn = QPushButton("＋ 接続")
         add_server_btn.setToolTip(
             "新しいサーバーに SSH または Telnet で接続 (最大6台)"
         )
@@ -2496,50 +2931,45 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # ── ワークスペース (定型ログイン) ──────────────────────────────
-        ws_lbl = QLabel(" ワークスペース: ")
+        # ── ワークスペース (1ボタンでコンボ + メニュー) ─────────────────
+        ws_lbl = QLabel(" WS: ")
         ws_lbl.setToolTip(
-            "サーバー接続 + 開いたログの構成を保存しておき、ワンクリックで復元"
+            "ワークスペース: サーバー接続+開いたログ構成のセット"
         )
         tb.addWidget(ws_lbl)
         self.ws_combo = QComboBox()
-        self.ws_combo.setFixedWidth(140)
-        self.ws_combo.setToolTip("保存済みワークスペースを選んで「読込」")
+        self.ws_combo.setFixedWidth(130)
+        self.ws_combo.setToolTip("保存済みワークスペースを選択")
         tb.addWidget(self.ws_combo)
         self._refresh_workspace_combo()
 
-        ws_load_btn = QPushButton("読込")
-        ws_load_btn.setFixedWidth(44)
-        ws_load_btn.setToolTip(
-            "選択中のワークスペースを開く: "
-            "現在の接続を全切断 → 保存されたプロファイルで再接続 → ログを開く"
-        )
-        ws_load_btn.clicked.connect(self._load_workspace)
-        tb.addWidget(ws_load_btn)
-
-        ws_save_btn = QPushButton("保存")
-        ws_save_btn.setFixedWidth(44)
-        ws_save_btn.setToolTip("現在の接続/開いているログをワークスペースとして保存")
-        ws_save_btn.clicked.connect(self._save_workspace)
-        tb.addWidget(ws_save_btn)
-
-        ws_mgr_btn = QPushButton("管理")
-        ws_mgr_btn.setFixedWidth(44)
-        ws_mgr_btn.setToolTip("ワークスペースの並べ替え / 名前変更 / 削除")
-        ws_mgr_btn.clicked.connect(self._manage_workspaces)
-        tb.addWidget(ws_mgr_btn)
+        from PyQt6.QtWidgets import QMenu
+        ws_act_btn = QPushButton("▶")
+        ws_act_btn.setFixedWidth(28)
+        ws_act_btn.setToolTip("ワークスペース操作 (読込/保存/管理)")
+        ws_menu = QMenu(ws_act_btn)
+        act_load = ws_menu.addAction("📂 読込 (選択中を開く)")
+        act_save = ws_menu.addAction("💾 現在の状態を保存...")
+        ws_menu.addSeparator()
+        act_mgr  = ws_menu.addAction("⚙ 管理 (並替/改名/削除)...")
+        act_load.triggered.connect(self._load_workspace)
+        act_save.triggered.connect(self._save_workspace)
+        act_mgr.triggered.connect(self._manage_workspaces)
+        ws_act_btn.setMenu(ws_menu)
+        tb.addWidget(ws_act_btn)
 
         tb.addSeparator()
 
-        settings_btn = QPushButton("⚙ 設定")
-        settings_btn.setToolTip("フォントサイズ・テーマの設定")
-        settings_btn.clicked.connect(self._open_settings)
-        tb.addWidget(settings_btn)
+        alert_btn = QPushButton("🚨")
+        alert_btn.setFixedWidth(34)
+        alert_btn.setToolTip("アラート解析: 運用アラートメールを貼り付けて、該当サーバー/ログを自動で開く")
+        alert_btn.clicked.connect(self._open_alert_analysis)
+        tb.addWidget(alert_btn)
 
-        # 設定移行 (Export / Import) ボタン: ポップアップメニュー付き
-        from PyQt6.QtWidgets import QMenu
-        migrate_btn = QPushButton("📦 移行")
-        migrate_btn.setToolTip("プロファイル/ワークスペース/設定を JSON にエクスポート、または別PCのファイルをインポート")
+        # 設定移行 (Export / Import) — アイコンのみ
+        migrate_btn = QPushButton("📦")
+        migrate_btn.setFixedWidth(34)
+        migrate_btn.setToolTip("設定移行: プロファイル/ワークスペース/設定の Export / Import")
         migrate_menu = QMenu(migrate_btn)
         act_exp = migrate_menu.addAction("📤 エクスポート (JSONに保存)...")
         act_imp = migrate_menu.addAction("📥 インポート (JSONから読込)...")
@@ -2547,6 +2977,12 @@ class MainWindow(QMainWindow):
         act_imp.triggered.connect(self._import_settings)
         migrate_btn.setMenu(migrate_menu)
         tb.addWidget(migrate_btn)
+
+        settings_btn = QPushButton("⚙")
+        settings_btn.setFixedWidth(34)
+        settings_btn.setToolTip("設定: フォントサイズ・テーマ")
+        settings_btn.clicked.connect(self._open_settings)
+        tb.addWidget(settings_btn)
 
         # ── メイン分割 ────────────────────────────────────────────────
         splitter = QSplitter(Qt.Orientation.Horizontal)
@@ -2602,15 +3038,30 @@ class MainWindow(QMainWindow):
             conn.connect(info['host'], info['port'], info['user'],
                          info['password'], info.get('key_path', ''))
             color_idx  = len(self._panels)
-            log_dir    = info.get('log_dir', '/var/log') or '/var/log'
+            # 接続ダイアログで選択した保存済みプロファイル名から last_dir を参照
+            # (前回切断時に居たディレクトリで開く)
+            prof_name_init = dlg.combo.currentText() if dlg.combo.currentText() != '-- 新規 --' else ''
+            log_dir = info.get('log_dir', '/var/log') or '/var/log'
+            if prof_name_init:
+                try:
+                    profs = _load_profiles()
+                    last = (profs.get(prof_name_init, {}) or {}).get('last_dir')
+                    if last:
+                        log_dir = last
+                except Exception:
+                    pass
             panel = ServerPanel(conn, color_idx, log_dir, self)
             panel.file_open_requested.connect(self._open_log)
             panel.edit_open_requested.connect(self._open_in_text_editor)
             panel.disconnect_requested.connect(self._remove_server)
             panel.save_dir_requested.connect(self._save_log_dir)
             panel.terminal_requested.connect(self._open_terminal)
-            # プロファイル名を panel に記憶させてDIR更新時に使う
+            # プロファイル名を panel/conn に記憶させてDIR更新・DB実行で使う
             panel._profile_name = dlg.combo.currentText()
+            try:
+                conn._profile_name = dlg.combo.currentText()
+            except Exception:
+                pass
             panel.refresh_header_label()
             self._panels.append(panel)
             # 初回は placeholder を除去
@@ -2818,7 +3269,8 @@ class MainWindow(QMainWindow):
         user = info.get('user', '')
         password = info.get('password', '')
         key_path = info.get('key_path', '')
-        log_dir = info.get('log_dir', '/var/log') or '/var/log'
+        # last_dir があれば優先 (前回切断時のDIRを自動復元)、無ければ log_dir
+        log_dir = (info.get('last_dir') or info.get('log_dir') or '/var/log') or '/var/log'
 
         if not password and not (key_path and proto == 'SSH'):
             password, ok = QInputDialog.getText(
@@ -2839,6 +3291,10 @@ class MainWindow(QMainWindow):
         panel.save_dir_requested.connect(self._save_log_dir)
         panel.terminal_requested.connect(self._open_terminal)
         panel._profile_name = prof_name
+        try:
+            conn._profile_name = prof_name
+        except Exception:
+            pass
         panel.refresh_header_label()
         self._panels.append(panel)
         if self._no_server_label:
@@ -2849,11 +3305,10 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------ テキストエディタで開く
 
-    def _open_in_text_editor(self, conn, remote_path: str):
-        """リモートファイルをローカルにダウンロード → text_editor.py を起動。
-        - SSH: SFTP でバイナリ取得
-        - Telnet: base64 経由で取得
-        - .gz は自動解凍
+    def _open_in_text_editor(self, conn, remote_path: str, search: str = ''):
+        """リモートファイルをローカルにダウンロード → Sora Editor を起動。
+        - SSH: SFTP でバイナリ取得 / Telnet: base64 経由 / .gz は自動解凍
+        - search 指定時は Sora Editor 起動時に検索バー自動表示 (--search)
         """
         import tempfile
         import subprocess
@@ -2885,6 +3340,9 @@ class MainWindow(QMainWindow):
             self._status.setText("ダウンロード失敗")
             return
 
+        # DB実行ダイアログの初期プロファイルとして使う接続プロファイル名
+        profile_name = getattr(conn, '_profile_name', '') or ''
+
         # text_editor を起動: EXE 版とスクリプト版を自動判別
         try:
             if getattr(sys, 'frozen', False):
@@ -2900,17 +3358,25 @@ class MainWindow(QMainWindow):
                         f"ダウンロードファイル:\n{local_path}",
                     )
                     return
-                subprocess.Popen([editor_exe, local_path], cwd=exe_dir)
+                cmd = [editor_exe, local_path]
+                if search:
+                    cmd += ['--search', search]
+                if profile_name:
+                    cmd += ['--profile', profile_name]
+                subprocess.Popen(cmd, cwd=exe_dir)
             else:
                 # 通常スクリプト実行 → python text_editor.py
                 editor_script = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), 'text_editor.py'
                 )
-                subprocess.Popen(
-                    [sys.executable, editor_script, local_path],
-                    cwd=os.path.dirname(editor_script),
-                )
-            self._status.setText(f"テキストエディタで開きました: {local_name}")
+                cmd = [sys.executable, editor_script, local_path]
+                if search:
+                    cmd += ['--search', search]
+                if profile_name:
+                    cmd += ['--profile', profile_name]
+                subprocess.Popen(cmd, cwd=os.path.dirname(editor_script))
+            suffix = f" (検索: {search})" if search else ""
+            self._status.setText(f"📝 Sora Editor で開きました: {local_name}{suffix}")
         except Exception as e:
             QMessageBox.critical(
                 self, "起動エラー",
@@ -2921,6 +3387,253 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
+
+    # ---------------------------------------------- アラート解析
+
+    def _open_alert_analysis(self):
+        """アラートメール解析ダイアログを開く"""
+        dlg = AlertAnalysisDialog(self)
+        dlg.investigation_requested.connect(self._start_investigation)
+        dlg.show()
+
+    def _start_investigation(self, info: dict):
+        """解析結果を元にサーバー接続 → 推定ログを開く → ロットIDでフィルタ"""
+        prof_name = info.get('profile_name')
+        if not prof_name:
+            QMessageBox.warning(self, "選択なし", "プロファイルを選んでください。")
+            return
+        profiles = _load_profiles()
+        prof = profiles.get(prof_name)
+        if not prof:
+            QMessageBox.warning(self, "プロファイル不明",
+                f"「{prof_name}」が見つかりません。")
+            return
+
+        self._status.setText(f"🔎 調査中: {prof_name} に接続...")
+        QApplication.processEvents()
+
+        # 既に同じプロファイルで接続済みならそれを使う
+        panel = None
+        for p in self._panels:
+            if getattr(p, '_profile_name', None) == prof_name:
+                panel = p
+                break
+        if panel is None:
+            try:
+                self._connect_from_profile(prof_name, prof)
+                panel = self._panels[-1]
+            except Exception as e:
+                QMessageBox.critical(self, "接続エラー", str(e))
+                self._status.setText("⚠ 接続失敗")
+                return
+
+        # ログDIR + プロセス名 でファイル候補を組み立て、SFTP/exec で存在確認
+        proc = info.get('process', '')
+
+        # 検索基点ディレクトリ決定:
+        #   1. 左ツリーで選択中のフォルダ
+        #   2. パス入力欄に表示中のフォルダ
+        #   3. プロファイルの log_dir
+        search_dir = self._resolve_search_dir(panel, prof)
+
+        if not proc:
+            QMessageBox.warning(self, "プロセス未抽出",
+                "メールからプロセス名が抽出できませんでした。\n"
+                "左ツリーから手動でログを選んでください。")
+            return
+
+        self._status.setText(f"🔎 {search_dir} で {proc} のログを検索中...")
+        QApplication.processEvents()
+
+        # search_dir 配下を listdir して、プロセス名トークン (group02_ctlsvr1
+        # → ctlsvr 等) でローテーション含む候補リストを得る
+        found_path = None
+        stat_map: dict = {}
+        try:
+            entries = panel.conn.listdir(search_dir)
+            filenames = [
+                e.filename for e in entries
+                if not stat_mod.S_ISDIR(e.st_mode)
+            ]
+            # stat 情報も保持 (サイズ・mtime 表示用)
+            for e in entries:
+                if not stat_mod.S_ISDIR(e.st_mode):
+                    stat_map[e.filename] = e
+            matches = self._find_log_by_proc(filenames, proc)
+        except Exception:
+            matches = []
+
+        if len(matches) == 1:
+            # 候補1件 → そのまま開く
+            found_path = f"{search_dir}/{matches[0]}"
+        elif len(matches) >= 2:
+            # 候補複数 → 選択ダイアログ
+            dlg = LogSelectionDialog(search_dir, matches, stat_map, self)
+            if dlg.exec() == QDialog.DialogCode.Accepted:
+                selected = dlg.selected_paths()
+                if selected:
+                    # 複数選択時は全部開く処理を別ルートで
+                    if len(selected) >= 2:
+                        self._open_multiple_for_alert(panel, selected, info)
+                        return
+                    found_path = selected[0]
+
+        if not found_path:
+            # 何も見つからない → search_dir に移動してユーザー選択を促す
+            try:
+                panel._load(search_dir)
+            except Exception:
+                pass
+            QMessageBox.information(
+                self, "ログ自動特定失敗",
+                f"プロセス「{proc}」に対応するログが\n  {search_dir}\n に見つかりません。\n\n"
+                "左ツリーで対象のフォルダを選んでから\n"
+                "もう一度「🚨 アラート解析」→「調査開始」を実行するか、\n"
+                "ツリーから手動でログを選んでください。"
+            )
+            self._status.setText(
+                f"⚠ {proc} のログを自動特定できず → ツリーで対象フォルダを選択してください"
+            )
+            return
+
+        # ファイル特定 → Sora Editor で直接開く
+        # (LogViewer はアラート受信〜サーバー特定までの入口。実調査は Sora Editor で)
+        lot = info.get('lot') or ''
+        self._open_in_text_editor(panel.conn, found_path, search=lot)
+
+    def _open_multiple_for_alert(self, panel, paths: list[str], info: dict):
+        """選択された複数ログを Sora Editor で開く (各タブ + 検索)"""
+        lot = info.get('lot') or ''
+        for path in paths:
+            self._open_in_text_editor(panel.conn, path, search=lot)
+        self._status.setText(
+            f"📝 Sora Editor で {len(paths)} 件のログを開きました / lot={lot or '-'}"
+        )
+
+    @staticmethod
+    def _process_name_tokens(proc: str) -> list[str]:
+        """プロセス名から検索キーワードを派生 (長い順、重複除去)。
+        例: 'group02_ctlsvr1'
+             → ['group02_ctlsvr1', 'group02', 'ctlsvr1', 'ctlsvr']
+        """
+        keywords: list[str] = []
+        if not proc:
+            return keywords
+        keywords.append(proc)
+        for tok in proc.split('_'):
+            if not tok:
+                continue
+            keywords.append(tok)
+            # 末尾の数字 (インスタンス番号) を取り除いた形
+            stripped = re.sub(r'\d+$', '', tok)
+            if stripped and stripped != tok:
+                keywords.append(stripped)
+        # 重複除去・長い順
+        seen = set()
+        result = []
+        for k in sorted(keywords, key=len, reverse=True):
+            kl = k.lower()
+            if kl not in seen:
+                seen.add(kl)
+                result.append(k)
+        return result
+
+    @staticmethod
+    def _find_log_by_proc(filenames: list[str], proc: str) -> list[str]:
+        """ディレクトリ内のファイル一覧からプロセス名にマッチするログを推定。
+        対象は『.log を含むファイル』全般:
+          - foo.log                  (current log)
+          - foo.log.20250520         (rotation by date)
+          - foo.log.20250520165601   (rotation w/ time)
+          - foo.log.1 / foo.log.2    (logrotate numeric)
+          - foo.log-20250520         (dash variant)
+          - foo.log_old / foo.log.bak  等
+        日付サフィックスだけ (foo.20250714) や バリアント (foo_sun) は除外。
+        優先度順でリスト返却。
+        """
+        keywords = MainWindow._process_name_tokens(proc)
+        results: list[str] = []
+        seen: set[str] = set()
+
+        def add(fn: str):
+            if fn not in seen:
+                seen.add(fn)
+                results.append(fn)
+
+        # まず ".log を含む" ファイルだけに限定 (.gz除外)
+        log_files = [
+            f for f in filenames
+            if ('.log' in f.lower()) and not f.lower().endswith('.gz')
+        ]
+
+        for kw in keywords:
+            kwl = kw.lower()
+            # 1. 完全一致 "{kw}.log" を最優先
+            target = f'{kw}.log'.lower()
+            for f in log_files:
+                if f.lower() == target:
+                    add(f)
+            # 2. ".log" で終わる current log (kw 部分一致)
+            for f in log_files:
+                if f.lower().endswith('.log') and kwl in f.lower():
+                    add(f)
+            # 3. ローテーション系: .log + 後ろに何か (.log.YYYYMMDD, .log.1, .log-old, .log_bak 等)
+            for f in log_files:
+                if kwl in f.lower() and not f.lower().endswith('.log'):
+                    add(f)
+            if results:
+                # 最初のキーワードでヒットしたら他のトークンは試さない
+                break
+        return results
+
+    def _resolve_search_dir(self, panel, prof: dict) -> str:
+        """検索ベース DIR を決定:
+        1. 左ツリーで選択中の項目 (フォルダ or ファイルの親) を最優先
+        2. パス入力欄に表示中のパス
+        3. プロファイルの log_dir
+        4. /var/log (最終フォールバック)
+        """
+        # 1. ツリー選択
+        try:
+            sel = panel.tree.selectedItems()
+            if sel:
+                d = sel[0].data(0, Qt.ItemDataRole.UserRole)
+                if isinstance(d, dict):
+                    if d.get('is_dir'):
+                        return d.get('path').rstrip('/') or '/'
+                    # ファイル選択なら親ディレクトリ
+                    p = d.get('path', '')
+                    if p:
+                        parent = '/'.join(p.rstrip('/').split('/')[:-1]) or '/'
+                        return parent
+        except Exception:
+            pass
+        # 2. 入力欄の現在パス
+        try:
+            cur = panel.path_input.text().strip()
+            if cur:
+                return cur.rstrip('/') or '/'
+        except Exception:
+            pass
+        # 3. プロファイル
+        log_dir = prof.get('log_dir', '/var/log').rstrip('/') or '/var/log'
+        return log_dir
+
+    def _remote_file_exists(self, conn, path: str) -> bool:
+        """リモートに指定パスのファイルがあるか確認"""
+        # SSHConnection は SFTP を持つので stat で確認
+        try:
+            if hasattr(conn, 'sftp') and conn.sftp is not None:
+                conn.sftp.stat(path)
+                return True
+        except Exception:
+            return False
+        # Telnet 等 SFTP がない場合: test -f コマンドで判定
+        try:
+            out = conn.exec(f'test -f "{path}" && echo OK_EXISTS || echo NO').strip()
+            return 'OK_EXISTS' in out
+        except Exception:
+            return False
 
     # ---------------------------------------------- 設定移行 (Export / Import)
 
@@ -3060,13 +3773,19 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 2. 全ターミナルダイアログを閉じる
+        # 2. 全ターミナルダイアログ + ポップアップログを閉じる
         for dlg in list(self._terminals):
             try:
                 dlg.close()
             except Exception:
                 pass
         self._terminals.clear()
+        for pop in list(self._log_popups):
+            try:
+                pop.close()
+            except Exception:
+                pass
+        self._log_popups.clear()
 
         # 3. 全サーバー接続を明示的に切断 (SSHClient.close / Telnet socket close)
         for panel in list(self._panels):
@@ -3111,6 +3830,7 @@ class MainWindow(QMainWindow):
                     label = name
                 break
         viewer = MiniLogViewer(conn, path, label, color_idx)
+        viewer.editor_requested.connect(self._open_in_text_editor)
         if not self.grid.assign(viewer):
             QMessageBox.information(
                 self, "グリッド満杯",
