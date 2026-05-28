@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.4"
+__version__ = "1.1.5"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1519,6 +1519,11 @@ class ServerPanel(QWidget):
         path_row = QHBoxLayout()
         path_row.setContentsMargins(2, 1, 2, 1)
         path_row.setSpacing(2)
+        up_btn = QPushButton("⬆")
+        up_btn.setFixedSize(20, 18)
+        up_btn.setToolTip("親フォルダへ移動")
+        up_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-weight:bold;")
+        up_btn.clicked.connect(self._go_parent)
         self.path_input = QLineEdit(self._initial_path)
         self.path_input.setToolTip("リモートサーバーのフォルダパスを入力して Enter または → で移動")
         self.path_input.returnPressed.connect(lambda: self._load(self.path_input.text()))
@@ -1541,6 +1546,7 @@ class ServerPanel(QWidget):
         save_btn.clicked.connect(
             lambda: self.save_dir_requested.emit(self, self.path_input.text())
         )
+        path_row.addWidget(up_btn)
         path_row.addWidget(self.path_input, 1)
         path_row.addWidget(go_btn)
         path_row.addWidget(refresh_btn)
@@ -1587,6 +1593,8 @@ class ServerPanel(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.itemExpanded.connect(self._on_expand)
+        # フォルダをクリックしたらパス欄に反映 (📌保存・last_dir対象を一致させる)
+        self.tree.itemClicked.connect(self._on_tree_clicked)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
         layout.addWidget(self.tree, 1)
@@ -1657,6 +1665,19 @@ class ServerPanel(QWidget):
         self._quick_hint.setVisible(show_hints)
         self._tree_hint.setVisible(show_hints)
 
+    def _go_parent(self):
+        """現在表示中のフォルダの親フォルダへ移動する。"""
+        cur = self.path_input.text().strip() or '/'
+        # 末尾スラッシュを除去してから親を求める
+        cur = cur.rstrip('/')
+        if not cur or cur == '':
+            parent = '/'
+        else:
+            parent = cur.rsplit('/', 1)[0]
+            if parent == '':
+                parent = '/'   # ルート直下 (/foo) の親は /
+        self._load(parent)
+
     def _load(self, path: str):
         if path.strip() == '~':
             path = self.conn.exec('echo $HOME').strip()
@@ -1712,6 +1733,13 @@ class ServerPanel(QWidget):
         if d and d['is_dir'] and item.childCount() == 1 and item.child(0).text(0) == '...':
             item.takeChildren()
             self._fill(item, d['path'])
+
+    def _on_tree_clicked(self, item, _col):
+        """フォルダをクリックしたら、そのパスを path 欄に反映する。
+        これで「📌 でそのフォルダを初期DIRに保存」が正しく効く。"""
+        d = item.data(0, Qt.ItemDataRole.UserRole)
+        if d and d.get('is_dir'):
+            self.path_input.setText(d['path'])
 
     def _on_double_click(self, item, _col):
         d = item.data(0, Qt.ItemDataRole.UserRole)
@@ -2117,16 +2145,91 @@ def parse_alert_email(text: str) -> dict:
     return fields
 
 
+def _parse_rotation_dt(filename: str):
+    """ローテーションログ名から日時を抽出する。
+      ctlsvr1.log.20260528064257 → 2026-05-28 06:42:57
+      messvr.log.20260504        → 2026-05-04 00:00:00
+      messvr.log-20260504        → 同上
+    現行ログ (suffix無し) や日時が読めない場合は None。
+    """
+    from datetime import datetime
+    m = re.search(r'\.log[._-]?(\d{8,14})\b', filename, re.IGNORECASE)
+    if not m:
+        return None
+    d = m.group(1)
+    try:
+        y, mo, da = int(d[0:4]), int(d[4:6]), int(d[6:8])
+        h = int(d[8:10]) if len(d) >= 10 else 0
+        mi = int(d[10:12]) if len(d) >= 12 else 0
+        s = int(d[12:14]) if len(d) >= 14 else 0
+        return datetime(y, mo, da, h, mi, s)
+    except Exception:
+        return None
+
+
+def _parse_alert_dt(ts: str):
+    """アラートの時刻文字列を datetime に変換。失敗時 None。
+    例: '2026/05/28 16:29:43' / '2026-05-28T16:29:43'
+    """
+    if not ts:
+        return None
+    from datetime import datetime
+    m = re.search(
+        r'(\d{4})[-/](\d{2})[-/](\d{2})[T\s](\d{2}):(\d{2}):(\d{2})', ts
+    )
+    if not m:
+        return None
+    try:
+        return datetime(*(int(g) for g in m.groups()))
+    except Exception:
+        return None
+
+
+def _pick_log_for_alert(filenames: list[str], alert_dt):
+    """アラート時刻 alert_dt を含む可能性が最も高いログ名を返す。
+
+    ローテーション名の日時 = そのファイルが切り替わった (= その時刻までの
+    ログを格納している) 時刻とみなす。よって alert_dt を含むのは
+    「rotation日時 >= alert_dt のうち最小」のファイル。
+    該当が無ければ (= alert が最後のローテーション以降) 現行ログ (.log)。
+    現行ログも無ければ最新のローテーション。
+    """
+    if not alert_dt or not filenames:
+        return None
+    rotated = []   # (dt, filename)
+    current = []   # 現行ログ (.log で終わる、日時サフィックス無し)
+    for fn in filenames:
+        dt = _parse_rotation_dt(fn)
+        if dt is None:
+            if fn.lower().endswith('.log'):
+                current.append(fn)
+        else:
+            rotated.append((dt, fn))
+    # alert_dt 以上で最小の rotation = alert を含むファイル
+    after = sorted([(dt, fn) for dt, fn in rotated if dt >= alert_dt])
+    if after:
+        return after[0][1]
+    # 全ローテーションが alert より前 → 現行ログ
+    if current:
+        return current[0]
+    # 現行が無ければ最新のローテーション
+    if rotated:
+        return max(rotated, key=lambda x: x[0])[1]
+    return None
+
+
 class LogSelectionDialog(QDialog):
     """複数のログ候補から開くものを選ぶダイアログ。
     シングル選択で「開く」、複数選択で「選択を全て開く」が可能。"""
 
-    def __init__(self, search_dir: str, filenames: list[str], stat_map: dict, parent=None):
+    def __init__(self, search_dir: str, filenames: list[str], stat_map: dict,
+                 parent=None, alert_dt=None):
         super().__init__(parent)
         self.setWindowTitle("対象ログを選択")
         self.setMinimumSize(560, 380)
         self._search_dir = search_dir
         self._selected_paths: list[str] = []
+        self._alert_dt = alert_dt   # アラート時刻 (datetime) — 推定に使う
         self._build_ui(filenames, stat_map)
 
     def _build_ui(self, filenames: list[str], stat_map: dict):
@@ -2134,30 +2237,56 @@ class LogSelectionDialog(QDialog):
         lay.setContentsMargins(10, 10, 10, 10)
         lay.setSpacing(6)
 
-        lbl = QLabel(
+        # アラート時刻を含むと推定されるログを判定
+        best = _pick_log_for_alert(filenames, self._alert_dt) if self._alert_dt else None
+
+        head = (
             f"{self._search_dir} 配下で複数のログ候補が見つかりました。\n"
             "現在のログ + 過去ローテーション含む候補一覧です:"
         )
+        if best and self._alert_dt:
+            head += (
+                f"\n★ = アラート時刻 ({self._alert_dt:%Y-%m-%d %H:%M:%S}) を含むと推定したログ"
+            )
+        lbl = QLabel(head)
         lay.addWidget(lbl)
 
         self.list = QListWidget()
         self.list.setSelectionMode(QListWidget.SelectionMode.ExtendedSelection)
         from datetime import datetime
+        best_row = -1
         for fn in filenames:
             st = stat_map.get(fn)
             size = getattr(st, 'st_size', 0) if st else 0
             mtime = getattr(st, 'st_mtime', 0) if st else 0
             mtime_str = datetime.fromtimestamp(mtime).strftime('%Y-%m-%d %H:%M') if mtime else '-'
             size_str = self._fmt_size(size)
-            item = QListWidgetItem(f"{fn:<40} {size_str:>10}   {mtime_str}")
+            # ローテーション名から日時を取り出して併記 (あれば)
+            rot = _parse_rotation_dt(fn)
+            rot_str = rot.strftime('%Y-%m-%d %H:%M:%S') if rot else '(現行)'
+            marker = '★ ' if fn == best else '   '
+            item = QListWidgetItem(
+                f"{marker}{fn:<38} {size_str:>9}  ログ切替: {rot_str}"
+            )
             item.setData(Qt.ItemDataRole.UserRole, fn)
+            if fn == best:
+                item.setForeground(QColor("#9ED969"))
+                f = item.font(); f.setBold(True); item.setFont(f)
+                best_row = self.list.count()
             self.list.addItem(item)
-        if self.list.count():
+        # 推定ログがあればそれを初期選択、無ければ先頭
+        if best_row >= 0:
+            self.list.setCurrentRow(best_row)
+            self.list.scrollToItem(self.list.item(best_row))
+        elif self.list.count():
             self.list.setCurrentRow(0)
         self.list.itemDoubleClicked.connect(self._on_open_selected)
         lay.addWidget(self.list, 1)
 
-        hint = QLabel("Ctrl/Shift クリックで複数選択 → 「選択を全て開く」")
+        hint = QLabel(
+            "Ctrl/Shift クリックで複数選択 → 「選択を全て開く」"
+            "  /  ★=アラート時刻を含む推定ログ"
+        )
         hint.setStyleSheet("color:#888;font-size:10px;")
         lay.addWidget(hint)
 
@@ -2195,12 +2324,18 @@ class LogSelectionDialog(QDialog):
             b /= 1024
         return f"{b:.0f}TB"
 
+    def _full_path(self, fn: str) -> str:
+        # 既に絶対パス (再帰検索の結果など) ならそのまま、相対なら search_dir 連結
+        if fn.startswith('/'):
+            return fn
+        return f"{self._search_dir}/{fn}"
+
     def _on_open_selected(self):
         item = self.list.currentItem()
         if not item:
             return
         fn = item.data(Qt.ItemDataRole.UserRole)
-        self._selected_paths = [f"{self._search_dir}/{fn}"]
+        self._selected_paths = [self._full_path(fn)]
         self.accept()
 
     def _on_open_all_selected(self):
@@ -2208,7 +2343,7 @@ class LogSelectionDialog(QDialog):
         if not items:
             return
         self._selected_paths = [
-            f"{self._search_dir}/{it.data(Qt.ItemDataRole.UserRole)}"
+            self._full_path(it.data(Qt.ItemDataRole.UserRole))
             for it in items
         ]
         self.accept()
@@ -2254,7 +2389,7 @@ class AlertAnalysisDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("アラート解析 — メールから一発調査")
+        self.setWindowTitle("アラート調査 — メールから一発調査")
         self.setMinimumSize(640, 480)
         self._parsed: dict = {}
         self._build_ui()
@@ -2975,10 +3110,10 @@ class MainWindow(QMainWindow):
             "  background:#4a8e4a; border:1px solid #5aa05a;"
             "}"
             "QToolBar QPushButton[danger='true'] {"
-            "  background:#5a3a3a; color:#f0d0d0; border:1px solid #7a5a5a;"
+            "  background:#c0392b; color:#ffffff; border:1px solid #e05545; font-weight:600;"
             "}"
             "QToolBar QPushButton[danger='true']:hover {"
-            "  background:#7a3a3a; border:1px solid #a55;"
+            "  background:#e0432f; border:1px solid #ff6b5a;"
             "}"
             "QToolBar QComboBox, QToolBar QLineEdit {"
             "  background:#1e1e1e; color:#e0e0e0; border:1px solid #555;"
@@ -3083,7 +3218,7 @@ class MainWindow(QMainWindow):
         tb.addWidget(spacer)
 
         # ── 解析・運用ツール (右寄せ) ─────────────────────────────────
-        alert_btn = QPushButton("🚨 アラート解析")
+        alert_btn = QPushButton("🚨 アラート調査")
         alert_btn.setToolTip(
             "運用アラートメールを貼り付けて、該当サーバー/ログを自動で開く"
         )
@@ -3537,7 +3672,7 @@ class MainWindow(QMainWindow):
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
 
-    # ---------------------------------------------- アラート解析
+    # ---------------------------------------------- アラート調査
 
     def _open_alert_analysis(self):
         """アラートメール解析ダイアログを開く"""
@@ -3579,66 +3714,116 @@ class MainWindow(QMainWindow):
         # ログDIR + プロセス名 でファイル候補を組み立て、SFTP/exec で存在確認
         proc = info.get('process', '')
 
-        # 検索基点ディレクトリ決定:
-        #   1. 左ツリーで選択中のフォルダ
-        #   2. パス入力欄に表示中のフォルダ
-        #   3. プロファイルの log_dir
-        search_dir = self._resolve_search_dir(panel, prof)
-
         if not proc:
             QMessageBox.warning(self, "プロセス未抽出",
                 "メールからプロセス名が抽出できませんでした。\n"
                 "左ツリーから手動でログを選んでください。")
             return
 
-        self._status.setText(f"🔎 {search_dir} で {proc} のログを検索中...")
+        # 検索候補ディレクトリ (直下のみ・非再帰、優先順):
+        #   1. 左ツリー選択 / パス入力欄 / log_dir (= _resolve_search_dir)
+        #   2. この接続で既に開いているログセルのフォルダ (ワークスペースで
+        #      開いた group02/messvr 等。ログの実在場所が分かる)
+        search_dirs: list[str] = []
+        primary = self._resolve_search_dir(panel, prof)
+        if primary:
+            search_dirs.append(primary.rstrip('/') or '/')
+        try:
+            for v in self.grid.viewers():
+                if getattr(v, 'conn', None) is panel.conn:
+                    d = '/'.join(v.filepath.rstrip('/').split('/')[:-1]) or '/'
+                    if d not in search_dirs:
+                        search_dirs.append(d)
+        except Exception:
+            pass
+
+        self._status.setText(f"🔎 {proc} のログを検索中... ({len(search_dirs)}フォルダ)")
         QApplication.processEvents()
 
-        # search_dir 配下を listdir して、プロセス名トークン (group02_ctlsvr1
-        # → ctlsvr 等) でローテーション含む候補リストを得る
+        # 各候補ディレクトリ直下を listdir → プロセス名トークンでマッチ
+        # (group02_ctlsvr1 → ctlsvr / ローテーション messvr.log.20260504 も対象)
         found_path = None
+        searched_dir = ''                  # 実際にヒット判定したDIR
         stat_map: dict = {}
-        try:
-            entries = panel.conn.listdir(search_dir)
-            filenames = [
-                e.filename for e in entries
-                if not stat_mod.S_ISDIR(e.st_mode)
-            ]
-            # stat 情報も保持 (サイズ・mtime 表示用)
-            for e in entries:
-                if not stat_mod.S_ISDIR(e.st_mode):
-                    stat_map[e.filename] = e
-            matches = self._find_log_by_proc(filenames, proc)
-        except Exception:
-            matches = []
+        matches: list[str] = []
+        log_files_in_dir: list[str] = []   # 診断表示用
+        for cand in search_dirs:
+            try:
+                entries = panel.conn.listdir(cand)
+            except Exception:
+                continue
+            filenames = [e.filename for e in entries
+                         if not stat_mod.S_ISDIR(e.st_mode)]
+            cand_stat = {e.filename: e for e in entries
+                         if not stat_mod.S_ISDIR(e.st_mode)}
+            cand_logs = [f for f in filenames if '.log' in f.lower()]
+            cand_matches = self._find_log_by_proc(filenames, proc)
+            if cand_matches:
+                matches = cand_matches
+                searched_dir = cand
+                stat_map = cand_stat
+                log_files_in_dir = cand_logs
+                break
+            # 診断用に最初の候補の状況を保持
+            if not searched_dir:
+                searched_dir = cand
+                log_files_in_dir = cand_logs
+
+        # アラート時刻 (ローテーションログの絞り込みに使う)
+        alert_dt = _parse_alert_dt(info.get('timestamp', ''))
 
         if len(matches) == 1:
-            # 候補1件 → そのまま開く
-            found_path = f"{search_dir}/{matches[0]}"
+            found_path = f"{searched_dir}/{matches[0]}"
         elif len(matches) >= 2:
-            # 候補複数 → 選択ダイアログ
-            dlg = LogSelectionDialog(search_dir, matches, stat_map, self)
-            if dlg.exec() == QDialog.DialogCode.Accepted:
-                selected = dlg.selected_paths()
-                if selected:
-                    # 複数選択時は全部開く処理を別ルートで
-                    if len(selected) >= 2:
-                        self._open_multiple_for_alert(panel, selected, info)
-                        return
-                    found_path = selected[0]
+            # 時刻でアラートを含むログが一意に推定できれば、そのまま開く
+            # (5/1〜の大量ローテーションをいちいち選ばせない)
+            best = _pick_log_for_alert(matches, alert_dt) if alert_dt else None
+            if best:
+                found_path = f"{searched_dir}/{best}"
+                self._status.setText(
+                    f"🕒 アラート時刻 {alert_dt:%Y/%m/%d %H:%M:%S} を含む "
+                    f"{best} を自動選択"
+                )
+            else:
+                # 時刻不明 → 従来どおり選択ダイアログ (★で推定ログをマーク)
+                dlg = LogSelectionDialog(searched_dir, matches, stat_map, self,
+                                         alert_dt=alert_dt)
+                if dlg.exec() == QDialog.DialogCode.Accepted:
+                    selected = dlg.selected_paths()
+                    if selected:
+                        if len(selected) >= 2:
+                            self._open_multiple_for_alert(panel, selected, info)
+                            return
+                        found_path = selected[0]
 
         if not found_path:
-            # 何も見つからない → search_dir に移動してユーザー選択を促す
+            # 何も見つからない → 最初の候補DIRに移動してユーザー選択を促す
             try:
-                panel._load(search_dir)
+                panel._load(searched_dir or (search_dirs[0] if search_dirs else '/'))
             except Exception:
                 pass
+            # 診断: 実際に検索したDIRと、そこにあった .log ファイルを提示
+            if log_files_in_dir:
+                log_list = '\n'.join(f"  ・{f}" for f in log_files_in_dir[:15])
+                diag = (
+                    f"このフォルダには以下の .log があります:\n{log_list}\n\n"
+                    "プロセス名とログ名が対応していない可能性があります。"
+                )
+            else:
+                diag = (
+                    "このフォルダ直下には .log ファイルがありません。\n"
+                    "ログが別フォルダにある場合は、左ツリーでそのフォルダを\n"
+                    "開いてから再実行してください。"
+                )
             QMessageBox.information(
                 self, "ログ自動特定失敗",
-                f"プロセス「{proc}」に対応するログが\n  {search_dir}\n に見つかりません。\n\n"
-                "左ツリーで対象のフォルダを選んでから\n"
-                "もう一度「🚨 アラート解析」→「調査開始」を実行するか、\n"
-                "ツリーから手動でログを選んでください。"
+                f"検索したフォルダ ({len(search_dirs)}件):\n  " +
+                '\n  '.join(search_dirs) + "\n\n"
+                f"抽出プロセス名: 「{proc}」\n"
+                f"探したキーワード: {', '.join(self._process_name_tokens(proc))}\n\n"
+                f"{diag}\n\n"
+                "対処: 左ツリーで対象フォルダ/ログを選択 → 再度「調査開始」、\n"
+                "またはツリーから手動でログを開いてください。"
             )
             self._status.setText(
                 f"⚠ {proc} のログを自動特定できず → ツリーで対象フォルダを選択してください"
@@ -3958,9 +4143,19 @@ class MainWindow(QMainWindow):
         if name not in profiles:
             QMessageBox.warning(self, "警告", f"プロファイル「{name}」が見つかりません。")
             return
-        profiles[name]['log_dir'] = path.strip()
+        dir_value = path.strip()
+        profiles[name]['log_dir'] = dir_value
+        # 接続時の初期DIR解決は last_dir を優先する。📌 で明示保存した時は
+        # その意図を尊重し last_dir も同じ値に揃える (自動記憶に上書きされて
+        # 効かない問題を防ぐ)。
+        profiles[name]['last_dir'] = dir_value
         _save_profiles(profiles)
-        self._status.setText(f"📌 保存: [{name}] ログDIR = {path}")
+        # パネル側の path_input も保存値に合わせておく (以降の last_dir 追従の基準)
+        try:
+            panel.path_input.setText(dir_value)
+        except Exception:
+            pass
+        self._status.setText(f"📌 初期DIRに保存しました: [{name}] = {dir_value}")
 
     # ---------------------------------------------------------------- グリッド
 
