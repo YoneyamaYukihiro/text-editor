@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import sys
 import os
@@ -4182,6 +4182,53 @@ class MainWindow(QMainWindow):
         idx = self.tabs.addTab(tab, filename)
         self.tabs.setCurrentIndex(idx)
 
+    def apply_open_request(self, req: dict):
+        """起動引数 / 別プロセスからの IPC 要求を共通処理する。
+        - files: 開くファイル (既に開いていればそのタブをアクティブ化)
+        - profile: DB実行の初期プロファイル
+        - search: 起動後に検索バーで自動検索
+        - sql_extract: SQL抽出ダイアログを自動で開く
+        """
+        files = req.get('files') or []
+        profile = req.get('profile') or ''
+        search = req.get('search') or ''
+        sql_extract = bool(req.get('sql_extract'))
+
+        if profile:
+            self._origin_profile = profile
+
+        opened_any = False
+        for f in files:
+            if not os.path.isfile(f):
+                continue
+            # 既に開いていれば再ロードせずそのタブをアクティブ化
+            target = os.path.normcase(os.path.normpath(os.path.abspath(f)))
+            found = False
+            for idx in range(self.tabs.count()):
+                t = self.tabs.widget(idx)
+                if isinstance(t, EditorTab) and t.file_path:
+                    cur = os.path.normcase(os.path.normpath(os.path.abspath(t.file_path)))
+                    if cur == target:
+                        self.tabs.setCurrentIndex(idx)
+                        found = True
+                        break
+            if not found:
+                self._load_file(f)
+            opened_any = True
+
+        if search:
+            tab = self.current_tab()
+            if tab and hasattr(tab, 'search_bar'):
+                tab.search_bar.show_bar(initial_text=search)
+
+        if sql_extract and opened_any:
+            QTimer.singleShot(0, self._show_sql_extract)
+
+        # ウィンドウを前面に出す (最小化されていても復帰)
+        self.showNormal()
+        self.raise_()
+        self.activateWindow()
+
     def _refresh_bookmarks(self):
         refs = []
         for i in range(self.tabs.count()):
@@ -6549,7 +6596,65 @@ class SqlExtractDialog(QDialog):
 # エントリーポイント
 # ---------------------------------------------------------------------------
 
+def _parse_cli_args(argv: list[str]) -> dict:
+    """コマンドライン引数を共通フォーマット (dict) にパースする。
+      file1 file2 ...   : 開くファイル
+      --search KEYWORD  : 起動後に検索バーで自動検索
+      --profile NAME    : DB実行ダイアログで初期選択する接続プロファイル
+      --sql-extract     : 起動直後に SQL抽出ダイアログを自動で開く
+    """
+    files: list[str] = []
+    search_term = ''
+    profile_name = ''
+    auto_sql_extract = False
+    i = 0
+    while i < len(argv):
+        a = argv[i]
+        if a == '--search' and i + 1 < len(argv):
+            search_term = argv[i + 1]; i += 2
+        elif a.startswith('--search='):
+            search_term = a[len('--search='):]; i += 1
+        elif a == '--profile' and i + 1 < len(argv):
+            profile_name = argv[i + 1]; i += 2
+        elif a.startswith('--profile='):
+            profile_name = a[len('--profile='):]; i += 1
+        elif a == '--sql-extract':
+            auto_sql_extract = True; i += 1
+        elif os.path.isfile(a):
+            # 絶対パスに正規化して別プロセスに渡しても解決できるように
+            files.append(os.path.abspath(a)); i += 1
+        else:
+            i += 1
+    return {
+        'files': files, 'search': search_term,
+        'profile': profile_name, 'sql_extract': auto_sql_extract,
+    }
+
+
 if __name__ == '__main__':
+    import getpass
+    from PyQt6.QtNetwork import QLocalServer, QLocalSocket
+
+    req = _parse_cli_args(sys.argv[1:])
+
+    # ── 単一インスタンス制御 ───────────────────────────────────────────
+    # 既に Sora Editor が起動していれば、引数を渡してそちらにタブで開かせ、
+    # 自分はすぐ終了する。これで何回起動しても1ウィンドウにタブが増える。
+    _SINGLETON_KEY = f"SoraEditor_{getpass.getuser()}"
+    _probe = QLocalSocket()
+    _probe.connectToServer(_SINGLETON_KEY)
+    if _probe.waitForConnected(300):
+        # 既存インスタンスあり → リクエストを送信して終了
+        try:
+            _probe.write(json.dumps(req).encode('utf-8'))
+            _probe.flush()
+            _probe.waitForBytesWritten(2000)
+        finally:
+            _probe.disconnectFromServer()
+        sys.exit(0)
+    _probe.abort()
+
+    # ── ここからプライマリ (最初の) インスタンス ────────────────────────
     # 起動時の一時ファイルクリーンアップ (FTP ダウンロード分)
     import tempfile as _tempfile
     try:
@@ -6568,47 +6673,27 @@ if __name__ == '__main__':
     window = MainWindow()
     window.show()
 
-    # コマンドライン引数:
-    #   file1 file2 ...          : 開くファイル
-    #   --search KEYWORD         : 開いた直後に検索バーで自動検索
-    #   --search=KEYWORD         : 同上
-    #   --profile NAME           : DB実行ダイアログで初期選択する接続プロファイル名
-    #   --profile=NAME           : 同上
-    args = sys.argv[1:]
-    files: list[str] = []
-    search_term: str | None = None
-    profile_name: str | None = None
-    i = 0
-    while i < len(args):
-        a = args[i]
-        if a == '--search' and i + 1 < len(args):
-            search_term = args[i + 1]
-            i += 2
-        elif a.startswith('--search='):
-            search_term = a[len('--search='):]
-            i += 1
-        elif a == '--profile' and i + 1 < len(args):
-            profile_name = args[i + 1]
-            i += 2
-        elif a.startswith('--profile='):
-            profile_name = a[len('--profile='):]
-            i += 1
-        elif os.path.isfile(a):
-            files.append(a)
-            i += 1
-        else:
-            i += 1
+    # ローカルサーバーを立てて後続プロセスからの open 要求を受け付ける
+    _server = QLocalServer()
+    QLocalServer.removeServer(_SINGLETON_KEY)   # 残骸があれば除去
+    _server.listen(_SINGLETON_KEY)
 
-    if profile_name:
-        window._origin_profile = profile_name
+    def _on_new_connection():
+        sock = _server.nextPendingConnection()
+        if sock is None:
+            return
+        if sock.waitForReadyRead(2000):
+            try:
+                data = bytes(sock.readAll()).decode('utf-8')
+                remote_req = json.loads(data)
+                window.apply_open_request(remote_req)
+            except Exception:
+                pass
+        sock.disconnectFromServer()
 
-    for f in files:
-        window._load_file(f)
+    _server.newConnection.connect(_on_new_connection)
 
-    # 検索キーワード指定があれば即時検索 (現在のタブに対して)
-    if search_term:
-        tab = window.current_tab()
-        if tab and hasattr(tab, 'search_bar'):
-            tab.search_bar.show_bar(initial_text=search_term)
+    # 自分自身の起動引数を適用
+    window.apply_open_request(req)
 
     sys.exit(app.exec())

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.2"
+__version__ = "1.1.3"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1016,6 +1016,7 @@ class MiniLogViewer(QWidget):
     tail_changed     = pyqtSignal(bool)
     close_requested  = pyqtSignal(object)
     editor_requested = pyqtSignal(object, str)   # conn, path
+    sql_selection_requested = pyqtSignal(object, str)  # conn, 選択テキスト
 
     def __init__(self, conn: SSHConnection, path: str,
                  server_label: str, color_idx: int, parent=None):
@@ -1117,6 +1118,9 @@ class MiniLogViewer(QWidget):
         self.text.setReadOnly(True)
         mode = LogHighlighter.detect_mode_for_file(self.filepath)
         self.highlighter = LogHighlighter(self.text.document(), mode=mode)
+        # 右クリックで「選択範囲をSoraでSQL抽出」を出すためカスタムメニュー
+        self.text.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.text.customContextMenuRequested.connect(self._on_text_context_menu)
         root.addWidget(self.text, 1)
 
         # ── ステータス（超コンパクト） ────────────────────────────────
@@ -1179,6 +1183,33 @@ class MiniLogViewer(QWidget):
             self.highlighter.rehighlight()
         except Exception:
             pass
+
+    def _on_text_context_menu(self, pos):
+        """ログ本文の右クリックメニュー (コピー + 選択範囲SQL抽出)。"""
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self.text)
+        has_sel = self.text.textCursor().hasSelection()
+
+        a_copy = menu.addAction("コピー")
+        a_copy.setEnabled(has_sel)
+        a_copy.triggered.connect(self.text.copy)
+
+        a_all = menu.addAction("すべて選択")
+        a_all.triggered.connect(self.text.selectAll)
+
+        menu.addSeparator()
+
+        a_sql = menu.addAction("選択範囲をSoraでSQL抽出・実行...")
+        a_sql.setEnabled(has_sel)
+        if not has_sel:
+            a_sql.setToolTip("先にSQLを含むログ範囲を選択してください")
+        a_sql.triggered.connect(
+            lambda: self.sql_selection_requested.emit(
+                self.conn, self.text.textCursor().selection().toPlainText()
+            )
+        )
+
+        menu.exec(self.text.mapToGlobal(pos))
 
     # ── データ操作 ─────────────────────────────────────────────────────
 
@@ -2204,6 +2235,8 @@ class LogPopup(QDialog):
         # 📝 ボタン: 親 MainWindow の _open_in_text_editor へ
         if parent is not None and hasattr(parent, '_open_in_text_editor'):
             self.viewer.editor_requested.connect(parent._open_in_text_editor)
+        if parent is not None and hasattr(parent, '_open_selection_in_sora'):
+            self.viewer.sql_selection_requested.connect(parent._open_selection_in_sora)
         lay.addWidget(self.viewer)
 
     def closeEvent(self, event):
@@ -3424,11 +3457,21 @@ class MainWindow(QMainWindow):
         # DB実行ダイアログの初期プロファイルとして使う接続プロファイル名
         profile_name = getattr(conn, '_profile_name', '') or ''
 
-        # text_editor を起動: EXE 版とスクリプト版を自動判別
+        if self._launch_sora(local_path, search=search, profile_name=profile_name):
+            suffix = f" (検索: {search})" if search else ""
+            self._status.setText(f"📝 Sora Editor で開きました: {local_name}{suffix}")
+
+    def _launch_sora(self, local_path: str, *, search: str = '',
+                     profile_name: str = '', sql_extract: bool = False) -> bool:
+        """Sora Editor を起動 (EXE版/スクリプト版を自動判別)。
+        - search: 起動後に検索バーへ自動入力
+        - profile_name: DB実行ダイアログの初期プロファイル
+        - sql_extract: 起動直後に SQL抽出ダイアログを自動で開く
+        成功時 True。
+        """
+        import subprocess
         try:
             if getattr(sys, 'frozen', False):
-                # PyInstaller でビルドされた EXE として動作中
-                # → 同じフォルダにある "Sora Editor.exe" を呼ぶ
                 exe_dir = os.path.dirname(sys.executable)
                 editor_exe = os.path.join(exe_dir, "Sora Editor.exe")
                 if not os.path.isfile(editor_exe):
@@ -3436,33 +3479,55 @@ class MainWindow(QMainWindow):
                         self, "テキストエディタが見つかりません",
                         f"Sora Editor.exe が見つかりません:\n{exe_dir}\n\n"
                         "EXE版を使う場合は両アプリを同じフォルダに置いてください。\n"
-                        f"ダウンロードファイル:\n{local_path}",
+                        f"ファイル:\n{local_path}",
                     )
-                    return
+                    return False
                 cmd = [editor_exe, local_path]
-                if search:
-                    cmd += ['--search', search]
-                if profile_name:
-                    cmd += ['--profile', profile_name]
-                subprocess.Popen(cmd, cwd=exe_dir)
+                cwd = exe_dir
             else:
-                # 通常スクリプト実行 → python text_editor.py
                 editor_script = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), 'text_editor.py'
                 )
                 cmd = [sys.executable, editor_script, local_path]
-                if search:
-                    cmd += ['--search', search]
-                if profile_name:
-                    cmd += ['--profile', profile_name]
-                subprocess.Popen(cmd, cwd=os.path.dirname(editor_script))
-            suffix = f" (検索: {search})" if search else ""
-            self._status.setText(f"📝 Sora Editor で開きました: {local_name}{suffix}")
+                cwd = os.path.dirname(editor_script)
+            if search:
+                cmd += ['--search', search]
+            if profile_name:
+                cmd += ['--profile', profile_name]
+            if sql_extract:
+                cmd += ['--sql-extract']
+            subprocess.Popen(cmd, cwd=cwd)
+            return True
         except Exception as e:
             QMessageBox.critical(
                 self, "起動エラー",
-                f"テキストエディタの起動に失敗しました:\n{e}"
+                f"Sora Editor の起動に失敗しました:\n{e}"
             )
+            return False
+
+    def _open_selection_in_sora(self, conn, selected_text: str):
+        """ログセルで選択したテキストを一時ファイルに保存 → Sora Editor を
+        SQL抽出モードで起動する。"""
+        if not selected_text.strip():
+            QMessageBox.information(
+                self, "選択なし",
+                "ログセル内でSQLを含む範囲を選択してから実行してください。"
+            )
+            return
+        import tempfile
+        import time as _time
+        tmp_dir = os.path.join(tempfile.gettempdir(), 'ssh_log_viewer', '_selection')
+        os.makedirs(tmp_dir, exist_ok=True)
+        tmp_path = os.path.join(tmp_dir, f"selection_{int(_time.time() * 1000)}.log")
+        try:
+            with open(tmp_path, 'w', encoding='utf-8') as f:
+                f.write(selected_text)
+        except Exception as e:
+            QMessageBox.critical(self, "保存エラー", str(e))
+            return
+        profile_name = getattr(conn, '_profile_name', '') or ''
+        if self._launch_sora(tmp_path, profile_name=profile_name, sql_extract=True):
+            self._status.setText("📝 選択範囲を Sora Editor で SQL抽出 で開きました")
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -3915,6 +3980,7 @@ class MainWindow(QMainWindow):
                 break
         viewer = MiniLogViewer(conn, path, label, color_idx)
         viewer.editor_requested.connect(self._open_in_text_editor)
+        viewer.sql_selection_requested.connect(self._open_selection_in_sora)
         if not self.grid.assign(viewer):
             QMessageBox.information(
                 self, "グリッド満杯",
