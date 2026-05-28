@@ -2723,6 +2723,24 @@ class SettingsDialog(QDialog):
         theme_row.addWidget(self.theme_combo, 1)
         lay.addLayout(theme_row)
 
+        # 設定移行 (PC移行用) — めったに使わないのでここに集約
+        lay.addWidget(self._section_label("設定移行 (PC移行・バックアップ)"))
+        migrate_help = QLabel(
+            "FTPプロファイル / UI設定 / 検索履歴 を JSON 1ファイルに出力・読込できます。\n"
+            "別 PC に環境を移したい時にお使いください。"
+        )
+        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
+        migrate_help.setWordWrap(True)
+        lay.addWidget(migrate_help)
+        migrate_row = QHBoxLayout()
+        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
+        self.export_btn.setToolTip("FTPプロファイル / UI設定 / 検索履歴 を JSON に書き出す")
+        self.import_btn = QPushButton("📥 インポート (JSON読込)")
+        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
+        migrate_row.addWidget(self.export_btn)
+        migrate_row.addWidget(self.import_btn)
+        lay.addLayout(migrate_row)
+
         lay.addStretch()
 
         btns = QHBoxLayout()
@@ -3005,9 +3023,7 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "全て保存(&L)", QKeySequence("Ctrl+Alt+S"), self.save_all)
         self._add_action(fm, "全て保存して終了(&X)", QKeySequence("Ctrl+Alt+Q"), self.save_all_and_exit)
         fm.addSeparator()
-        # 設定系 (Windows系アプリの一般的配置: ファイル末尾 or 編集末尾)
-        self._add_action(fm, "📤 設定をエクスポート...", QKeySequence(), self._export_settings)
-        self._add_action(fm, "📥 設定をインポート...", QKeySequence(), self._import_settings)
+        # 設定 (Export/Import は設定ダイアログ内に統合)
         self._add_action(fm, "⚙ 設定(&P)...", QKeySequence("Ctrl+,"), self._open_settings)
         fm.addSeparator()
         self._add_action(fm, "終了(&Q)", QKeySequence("Ctrl+Q"), self.close)
@@ -3064,6 +3080,9 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
+        # 設定移行ボタンを MainWindow のメソッドに接続
+        dlg.export_btn.clicked.connect(self._export_settings)
+        dlg.import_btn.clicked.connect(self._import_settings)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
 
@@ -3794,9 +3813,20 @@ class MainWindow(QMainWindow):
         if not content.strip():
             QMessageBox.information(self, "情報", "ファイルが空です。")
             return
+        # モードレス表示 — メイン画面の編集や別タブの操作と並行して使える
         dlg = SqlExtractDialog(content, tab.filename, parent=self)
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dlg.open_sql_requested.connect(self._open_sql_content)
-        dlg.exec()
+        # ガベージコレクション対策で参照を保持 (閉じたら自動で除外)
+        if not hasattr(self, '_open_dialogs'):
+            self._open_dialogs: list = []
+        self._open_dialogs.append(dlg)
+        dlg.destroyed.connect(
+            lambda _=None, d=dlg: self._open_dialogs.remove(d)
+            if d in self._open_dialogs else None
+        )
+        dlg.show()
 
     def _open_sql_content(self, content: str, filename: str):
         tab = EditorTab(content, filename)
@@ -4231,28 +4261,17 @@ _DB_PROFILES_PATH = os.path.join(os.path.expanduser('~'), '.ssh_log_viewer_profi
 # ヒアドキュメントの区切り EOF をシングルクォートで囲む (<<'EOF') ことで
 # bash の変数展開を無効化する。Oracle の "M_CONDITION$RECIPE" のような
 # テーブル名に含まれる $ がシェルに食われるのを防ぐ。
+#
+# Oracle はあえて CSV 出力一択。結果表示側に「横グリッド / 縦転置 / 1件詳細 /
+# テキスト」の4モードがあるため、sqlplus 出力形式を分ける必要は無い。
+# (旧 v1.1 では通常表示/CSV/縦表示の3プリセットを用意していた)
 _DB_CMD_PRESETS = {
-    "Oracle (sqlplus, 通常表示)": (
-        "sqlplus -S USER/PASS@SID <<'EOF'\n"
-        "set sqlblanklines on define off\n"
-        "set linesize 200 pagesize 50 trimspool on\n"
-        "{SQL};\n"
-        "exit\nEOF"
-    ),
-    "Oracle (sqlplus, CSV出力)": (
+    "Oracle (sqlplus)": (
         "sqlplus -S USER/PASS@SID <<'EOF'\n"
         "set sqlblanklines on define off\n"
         "set markup csv on quote on\n"
         "set feedback off pagesize 0 trimspool on\n"
         "{SQL};\n"
-        "exit\nEOF"
-    ),
-    "Oracle (sqlplus, 縦表示)": (
-        "sqlplus -S USER/PASS@SID <<'EOF'\n"
-        "set sqlblanklines on define off\n"
-        "set linesize 32767 pagesize 0 feedback off heading off\n"
-        "column dummy noprint\n"
-        "select '----- record -----' dummy, t.* from ({SQL}) t;\n"
         "exit\nEOF"
     ),
     "MySQL/MariaDB":  'mysql -u USER -pPASS -h localhost DBNAME -e "{SQL}"',
@@ -6011,12 +6030,23 @@ class SqlExtractDialog(QDialog):
             self.sql_list.setCurrentRow(index)
 
     def _open_db_execute(self):
-        """現在プレビューしているSQLをDB実行ダイアログに渡す。"""
+        """現在プレビューしているSQLをDB実行ダイアログに渡す (モードレス)。"""
         sql = self.preview.toPlainText().strip()
         if not sql:
             QMessageBox.information(self, "SQL未選択",
                 "実行するSQLが選択されていません。\n左のリストから選んで「再整形」を押してください。")
             return
+        # 既にDB実行ダイアログが開いていれば、SQLだけ差し替えて前面に出す
+        if getattr(self, '_db_dialog', None) is not None:
+            try:
+                if self._db_dialog.isVisible():
+                    self._db_dialog.sql_input.setPlainText(sql)
+                    self._db_dialog.raise_()
+                    self._db_dialog.activateWindow()
+                    return
+            except Exception:
+                self._db_dialog = None
+
         # 親 (MainWindow) から起動元プロファイル名を取得
         default_profile = ''
         parent = self.parent()
@@ -6029,7 +6059,12 @@ class SqlExtractDialog(QDialog):
             parent=self,
             navigator=self,
         )
-        dlg.exec()
+        dlg.setWindowModality(Qt.WindowModality.NonModal)
+        dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
+        # 参照を保持 (閉じたら自動でクリア)
+        self._db_dialog = dlg
+        dlg.destroyed.connect(lambda _=None: setattr(self, '_db_dialog', None))
+        dlg.show()
 
 
 # ---------------------------------------------------------------------------

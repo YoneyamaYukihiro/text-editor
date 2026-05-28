@@ -2023,8 +2023,9 @@ class ProfileManagerDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 def parse_alert_email(text: str) -> dict:
-    """製造系アラートメールから ノード/プロセス/時刻/ロット 等を抽出。
-    [key = value] / [key   = value] / 「key: value」 等を許容。"""
+    """製造系アラートメールから ノード/プロセス/時刻/ロット/装置/工程/エラーコード 等を抽出。
+    `key = [value]` / `key: value` / `key   = value` のような書式を許容する。
+    """
     fields: dict = {}
 
     def grab(pattern: str, key: str):
@@ -2033,11 +2034,25 @@ def parse_alert_email(text: str) -> dict:
             fields[key] = m.group(1).strip()
 
     # よくあるラベル → 統一キー
+    # ※ `\s*[=:]` を必須にすることで本文中の `ロット[XXX]` 等を誤検出しない
     grab(r'(?:ノード|node|host|hostname)\s*[=:]\s*\[?\s*([^\s\]\n]+)',          'host')
     grab(r'(?:プロセス|process|service|app)\s*[=:]\s*\[?\s*([^\s\]\n]+)',        'process')
     grab(r'(?:ロット|lot|lot[_\s-]?id)\s*[=:]\s*\[?\s*([^\s\]\n]+)',             'lot')
-    grab(r'(?:大工程|工程|process[_\s-]?step|step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_major')
-    grab(r'(?:小工程|sub[_\s-]?step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_minor')
+    # 装置 (Equipment/EQ ID — 1ASETF5IKT02 / 1DRAGONCAS06 等)
+    grab(r'(?:装置|equipment|eq[_\s-]?id|machine|tool)\s*[=:]\s*\[?\s*([^\s\]\n]+)', 'equipment')
+    # キャリア (Carrier — M00020 等。ロット不明のアラートで重要)
+    grab(r'(?:キャリア|carrier|carrier[_\s-]?id|cassette)\s*[=:]\s*\[?\s*([^\s\]\n]+)', 'carrier')
+    # 大工程 / 小工程: 「小工程」内の「工程」が大工程パターンに誤マッチしないよう
+    # 個別キーワードに絞る (汎用 `工程` のフォールバックは別途末尾で試行)
+    grab(r'(?:大工程|process[_\s-]?step|major[_\s-]?step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_major')
+    grab(r'(?:小工程|sub[_\s-]?step|minor[_\s-]?step)\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', 'step_minor')
+    # 大工程が取れなかった時のみ、汎用の「工程」「step」を試す (誤検出回避)
+    if 'step_major' not in fields:
+        m = re.search(
+            r'(?<![大小])工程\s*[=:]\s*\[?\s*([^\]\n]+?)\s*\]?\s*(?:\n|$)', text
+        )
+        if m:
+            fields['step_major'] = m.group(1).strip()
 
     # 時刻: 2026/05/26 08:32:57 / 2026-05-26T08:32:57 等
     m_ts = re.search(
@@ -2050,6 +2065,23 @@ def parse_alert_email(text: str) -> dict:
     m_level = re.search(r'\b(ERROR|CRITICAL|FATAL|WARN(?:ING)?|INFO)\b', text)
     if m_level:
         fields['level'] = m_level.group(1).upper()
+
+    # MES エラーコード (例: MES00059) — 本文先頭付近に出現することが多い
+    m_code = re.search(r'\b(MES\d{3,6}|E\d{4,6}|ERR-?\d{3,6})\b', text)
+    if m_code:
+        fields['error_code'] = m_code.group(1)
+
+    # サマリ (本文の最初の文/行) — 検索キーワードのフォールバック用
+    # 「ERROR」「WARNING」等のレベル行を除いた最初の意味ある行を拾う
+    for line in text.splitlines():
+        s = line.strip()
+        if not s:
+            continue
+        # レベルだけの行はスキップ
+        if re.fullmatch(r'(ERROR|CRITICAL|FATAL|WARN(?:ING)?|INFO)', s, re.IGNORECASE):
+            continue
+        fields['summary'] = s[:200]
+        break
 
     return fields
 
@@ -2230,9 +2262,13 @@ class AlertAnalysisDialog(QDialog):
         self._result_labels: dict[str, QLabel] = {}
         for r, (key, label) in enumerate([
             ('timestamp', '時刻:'), ('level', 'レベル:'),
+            ('error_code', 'エラーコード:'),
             ('host', 'ノード:'), ('process', 'プロセス:'),
-            ('lot', 'ロット:'), ('step_major', '大工程:'),
+            ('equipment', '装置:'),
+            ('lot', 'ロット:'), ('carrier', 'キャリア:'),
+            ('step_major', '大工程:'),
             ('step_minor', '小工程:'),
+            ('summary', '概要:'),
         ]):
             grid.addWidget(QLabel(label), r, 0)
             v = QLabel("—")
@@ -2525,6 +2561,24 @@ class SettingsDialog(QDialog):
         self.cb_panel_hints = QCheckBox("説明ラベル (📁 表示中のフォルダ・⚡クイック…等) を表示")
         self.cb_panel_hints.setChecked(bool(SETTINGS.get('show_panel_hints', True)))
         lay.addWidget(self.cb_panel_hints)
+
+        # 設定移行 (PC移行用) — めったに使わないのでここに集約
+        lay.addWidget(self._section_label("設定移行 (PC移行・バックアップ)"))
+        migrate_help = QLabel(
+            "プロファイル / ワークスペース / 設定を JSON 1ファイルに出力・読込できます。\n"
+            "別 PC に環境を移したい時にお使いください。"
+        )
+        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
+        migrate_help.setWordWrap(True)
+        lay.addWidget(migrate_help)
+        migrate_row = QHBoxLayout()
+        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
+        self.export_btn.setToolTip("接続プロファイル / ワークスペース / UI設定を JSON に書き出す")
+        self.import_btn = QPushButton("📥 インポート (JSON読込)")
+        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
+        migrate_row.addWidget(self.export_btn)
+        migrate_row.addWidget(self.import_btn)
+        lay.addLayout(migrate_row)
 
         lay.addStretch()
 
@@ -2835,10 +2889,12 @@ class TerminalDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 _GRID_PRESETS = {
-    "1×1": (1, 1), "1×2": (1, 2), "1×3": (1, 3), "1×4": (1, 4),
-    "2×1": (2, 1), "2×2": (2, 2), "2×4": (2, 4),
-    "3×1": (3, 1), "3×2": (3, 2), "3×3": (3, 3), "3×4": (3, 4),
-    "4×3": (4, 3), "4×4": (4, 4),
+    "1×1": (1, 1), "1×2": (1, 2), "1×3": (1, 3), "1×4": (1, 4), "1×5": (1, 5), "1×6": (1, 6),
+    "2×1": (2, 1), "2×2": (2, 2), "2×3": (2, 3), "2×4": (2, 4), "2×5": (2, 5), "2×6": (2, 6),
+    "3×1": (3, 1), "3×2": (3, 2), "3×3": (3, 3), "3×4": (3, 4), "3×5": (3, 5), "3×6": (3, 6),
+    "4×3": (4, 3), "4×4": (4, 4), "4×5": (4, 5), "4×6": (4, 6),
+    "5×1": (5, 1), "5×2": (5, 2), "5×3": (5, 3),
+    "6×1": (6, 1), "6×2": (6, 2), "6×3": (6, 3),
 }
 
 
@@ -2856,15 +2912,53 @@ class MainWindow(QMainWindow):
     # ------------------------------------------------------------------ UI
 
     def _setup_ui(self):
-        # ── ツールバー ────────────────────────────────────────────────
+        # ── ツールバー (アイコン+ラベル統一スタイル) ──────────────────
         tb = QToolBar("ツールバー")
         tb.setMovable(False)
-        tb.setIconSize(QSize(16, 16))
+        tb.setIconSize(QSize(18, 18))
+        # 全てのセレクタを `QToolBar` 子要素として記述することで、
+        # グローバル QApplication スタイル (QToolBar QPushButton 等) と
+        # 同等以上の特異性を確保 (後勝ち)。
+        tb.setStyleSheet(
+            "QToolBar { background:#2a2a2a; border:none; spacing:3px; padding:4px 6px; }"
+            "QToolBar::separator { background:#444; width:1px; margin:4px 6px; }"
+            "QToolBar QLabel { color:#888; padding:0 4px; font-size:11px; }"
+            "QToolBar QPushButton, QToolBar QToolButton {"
+            "  background:#333; color:#d0d0d0; border:1px solid #444;"
+            "  padding:5px 10px; border-radius:4px; font-size:12px;"
+            "}"
+            "QToolBar QPushButton:hover, QToolBar QToolButton:hover {"
+            "  background:#3a3a3a; border:1px solid #666; color:#fff;"
+            "}"
+            "QToolBar QPushButton:pressed, QToolBar QToolButton:pressed {"
+            "  background:#2a4a8a; border:1px solid #4a8eff;"
+            "}"
+            "QToolBar QPushButton::menu-indicator,"
+            "QToolBar QToolButton::menu-indicator { width:0px; image:none; }"
+            "QToolBar QPushButton[primary='true'] {"
+            "  background:#3a6e3a; color:#e0f0e0; border:1px solid #4a8e4a;"
+            "}"
+            "QToolBar QPushButton[primary='true']:hover {"
+            "  background:#4a8e4a; border:1px solid #5aa05a;"
+            "}"
+            "QToolBar QPushButton[danger='true'] {"
+            "  background:#5a3a3a; color:#f0d0d0; border:1px solid #7a5a5a;"
+            "}"
+            "QToolBar QPushButton[danger='true']:hover {"
+            "  background:#7a3a3a; border:1px solid #a55;"
+            "}"
+            "QToolBar QComboBox, QToolBar QLineEdit {"
+            "  background:#1e1e1e; color:#e0e0e0; border:1px solid #555;"
+            "  padding:3px 6px; border-radius:3px; font-size:12px;"
+            "}"
+            "QToolBar QComboBox:focus, QToolBar QLineEdit:focus {"
+            "  border:1px solid #4a8eff;"
+            "}"
+        )
         self.addToolBar(tb)
 
-        grid_lbl = QLabel(" グリッド: ")
-        grid_lbl.setToolTip("ログ表示エリアの分割数 (行×列)")
-        tb.addWidget(grid_lbl)
+        # ── グリッド ──────────────────────────────────────────────────
+        tb.addWidget(QLabel("📐 グリッド"))
         self.grid_combo = QComboBox()
         self.grid_combo.addItems(_GRID_PRESETS.keys())
         self.grid_combo.setCurrentText("2×2")
@@ -2875,77 +2969,69 @@ class MainWindow(QMainWindow):
 
         tb.addSeparator()
 
-        # 全Tail / 全停止 — アイコンのみで省スペース
-        btn_all_tail = QPushButton("▶")
+        # ── Tail 制御 ─────────────────────────────────────────────────
+        btn_all_tail = QPushButton("▶ 全Tail開始")
+        btn_all_tail.setProperty("primary", True)
         btn_all_tail.setToolTip("全セルで Tail -F を開始 (新しい行が自動追従)")
-        btn_all_tail.setFixedWidth(28)
         btn_all_tail.clicked.connect(lambda: self.grid.start_all_tail())
         tb.addWidget(btn_all_tail)
 
-        btn_stop_all = QPushButton("■")
+        btn_stop_all = QPushButton("■ 全停止")
+        btn_stop_all.setProperty("danger", True)
         btn_stop_all.setToolTip("全セルの Tail -F を停止")
-        btn_stop_all.setFixedWidth(28)
         btn_stop_all.clicked.connect(lambda: self.grid.stop_all_tail())
         tb.addWidget(btn_stop_all)
 
         tb.addSeparator()
 
-        # 共通フィルタ (ラベルは🔎アイコンで省スペース)
-        gf_lbl = QLabel(" 🔎 ")
-        gf_lbl.setToolTip("開いている全ログセルにまとめてフィルタを適用")
-        tb.addWidget(gf_lbl)
+        # ── 共通フィルタ ──────────────────────────────────────────────
+        tb.addWidget(QLabel("🔎 共通フィルタ"))
         self.global_filter = QLineEdit()
-        self.global_filter.setPlaceholderText("全セルに適用...")
-        self.global_filter.setFixedWidth(140)
+        self.global_filter.setPlaceholderText("全セルに適用するキーワード/正規表現")
+        self.global_filter.setMinimumWidth(180)
         self.global_filter.setToolTip(
-            "検索文字列または正規表現 — 「適用」で全セルに反映"
+            "検索文字列または正規表現 — 「適用」ボタンで全セルに反映"
         )
         tb.addWidget(self.global_filter)
 
         self.global_level = QComboBox()
         self.global_level.addItems(["ALL", "ERROR+", "WARN+", "INFO+"])
-        self.global_level.setFixedWidth(70)
+        self.global_level.setFixedWidth(80)
         self.global_level.setToolTip(
             "ログレベルでフィルタ:\n"
-            "  ALL = 全行\n"
-            "  ERROR+ = ERROR/CRITICAL/FATAL のみ\n"
+            "  ALL    = 全行\n"
+            "  ERROR+ = ERROR/CRITICAL/FATAL\n"
             "  WARN+  = WARN以上\n"
             "  INFO+  = INFO以上"
         )
         tb.addWidget(self.global_level)
 
         apply_btn = QPushButton("適用")
-        apply_btn.setFixedWidth(40)
         apply_btn.setToolTip("共通フィルタとレベルを全セルに反映")
         apply_btn.clicked.connect(self._apply_global_filter)
         tb.addWidget(apply_btn)
 
         tb.addSeparator()
 
-        add_server_btn = QPushButton("＋ 接続")
-        add_server_btn.setToolTip(
-            "新しいサーバーに SSH または Telnet で接続 (最大6台)"
-        )
+        # ── 接続 ──────────────────────────────────────────────────────
+        add_server_btn = QPushButton("＋ サーバー接続")
+        add_server_btn.setProperty("primary", True)
+        add_server_btn.setToolTip("新しいサーバーに SSH または Telnet で接続 (最大6台)")
         add_server_btn.clicked.connect(self._add_server)
         tb.addWidget(add_server_btn)
 
         tb.addSeparator()
 
-        # ── ワークスペース (1ボタンでコンボ + メニュー) ─────────────────
-        ws_lbl = QLabel(" WS: ")
-        ws_lbl.setToolTip(
-            "ワークスペース: サーバー接続+開いたログ構成のセット"
-        )
-        tb.addWidget(ws_lbl)
+        # ── ワークスペース ────────────────────────────────────────────
+        tb.addWidget(QLabel("💼 ワークスペース"))
         self.ws_combo = QComboBox()
-        self.ws_combo.setFixedWidth(130)
-        self.ws_combo.setToolTip("保存済みワークスペースを選択")
+        self.ws_combo.setMinimumWidth(150)
+        self.ws_combo.setToolTip("保存済みワークスペース (サーバー接続+ログ構成のセット)")
         tb.addWidget(self.ws_combo)
         self._refresh_workspace_combo()
 
         from PyQt6.QtWidgets import QMenu
-        ws_act_btn = QPushButton("▶")
-        ws_act_btn.setFixedWidth(28)
+        ws_act_btn = QPushButton("操作 ▾")
         ws_act_btn.setToolTip("ワークスペース操作 (読込/保存/管理)")
         ws_menu = QMenu(ws_act_btn)
         act_load = ws_menu.addAction("📂 読込 (選択中を開く)")
@@ -2958,29 +3044,24 @@ class MainWindow(QMainWindow):
         ws_act_btn.setMenu(ws_menu)
         tb.addWidget(ws_act_btn)
 
-        tb.addSeparator()
+        # 右寄せ用スペーサー
+        spacer = QWidget()
+        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        tb.addWidget(spacer)
 
-        alert_btn = QPushButton("🚨")
-        alert_btn.setFixedWidth(34)
-        alert_btn.setToolTip("アラート解析: 運用アラートメールを貼り付けて、該当サーバー/ログを自動で開く")
+        # ── 解析・運用ツール (右寄せ) ─────────────────────────────────
+        alert_btn = QPushButton("🚨 アラート解析")
+        alert_btn.setToolTip(
+            "運用アラートメールを貼り付けて、該当サーバー/ログを自動で開く"
+        )
         alert_btn.clicked.connect(self._open_alert_analysis)
         tb.addWidget(alert_btn)
 
-        # 設定移行 (Export / Import) — アイコンのみ
-        migrate_btn = QPushButton("📦")
-        migrate_btn.setFixedWidth(34)
-        migrate_btn.setToolTip("設定移行: プロファイル/ワークスペース/設定の Export / Import")
-        migrate_menu = QMenu(migrate_btn)
-        act_exp = migrate_menu.addAction("📤 エクスポート (JSONに保存)...")
-        act_imp = migrate_menu.addAction("📥 インポート (JSONから読込)...")
-        act_exp.triggered.connect(self._export_settings)
-        act_imp.triggered.connect(self._import_settings)
-        migrate_btn.setMenu(migrate_menu)
-        tb.addWidget(migrate_btn)
+        tb.addSeparator()
 
-        settings_btn = QPushButton("⚙")
-        settings_btn.setFixedWidth(34)
-        settings_btn.setToolTip("設定: フォントサイズ・テーマ")
+        # 設定 (📦 移行は設定ダイアログ内に統合した)
+        settings_btn = QPushButton("⚙ 設定")
+        settings_btn.setToolTip("設定: フォントサイズ・テーマ・設定移行 (Export/Import)")
         settings_btn.clicked.connect(self._open_settings)
         tb.addWidget(settings_btn)
 
@@ -3385,6 +3466,9 @@ class MainWindow(QMainWindow):
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
+        # 設定移行ボタンを MainWindow のメソッドに接続
+        dlg.export_btn.clicked.connect(self._export_settings)
+        dlg.import_btn.clicked.connect(self._import_settings)
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
 
