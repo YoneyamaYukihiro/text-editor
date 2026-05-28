@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.3"
+__version__ = "1.1.4"
 
 import sys
 import os
@@ -2269,7 +2269,7 @@ class BookmarkPanel(QWidget):
         self.list_widget.itemDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.list_widget)
 
-        hint = QLabel("ダブルクリックでジャンプ  /  F2：マーク切替  /  F3：次へ  /  Shift+F3：前へ")
+        hint = QLabel("ダブルクリックでジャンプ  /  F2：登録/解除  /  F3：次へ  /  Shift+F3：前へ")
         hint.setStyleSheet("color: #606060; font-size: 10px;")
         layout.addWidget(hint)
         self.setLayout(layout)
@@ -2291,10 +2291,15 @@ class BookmarkPanel(QWidget):
             editor = tab.editor
             for lineno in sorted(editor._bookmarks):
                 block = editor.document().findBlockByNumber(lineno - 1)
-                preview = block.text().strip()[:60] if block.isValid() else ''
+                full_text = block.text().strip() if block.isValid() else ''
+                # プレビューは長め (200文字) + 超過時は省略記号
+                preview = full_text[:200]
+                if len(full_text) > 200:
+                    preview += ' …'
                 item = QListWidgetItem(f"  行 {lineno:>5}   {preview}")
                 item.setData(Qt.ItemDataRole.UserRole, (tab, lineno))
-                item.setToolTip(f"{label}  行 {lineno}")
+                # ホバーで全文を確認できるようツールチップに完全な行を入れる
+                item.setToolTip(f"{label}  行 {lineno}\n{full_text}")
                 # エラー行は赤っぽく
                 if re.search(r'\b(?:ERROR|CRITICAL|FATAL)\b', preview, re.IGNORECASE):
                     item.setForeground(QColor("#FF7070"))
@@ -2315,6 +2320,21 @@ class BookmarkPanel(QWidget):
                     item.setData(Qt.ItemDataRole.UserRole + 1, label)
 
                 self.list_widget.addItem(item)
+
+        # ブックマークが1つも無い場合は使い方ヒントを表示
+        if self.list_widget.count() == 0:
+            for msg in [
+                "ブックマークはまだありません。",
+                "",
+                "📌 登録/解除: エディタで行にカーソルを置いて F2",
+                "▶ 次へ: F3  /  ◀ 前へ: Shift+F3",
+                "↩ ジャンプ: 一覧をダブルクリック",
+                "🔖 ガター (左端) の青い◆が登録行の目印",
+            ]:
+                hint_item = QListWidgetItem(msg)
+                hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
+                hint_item.setForeground(QColor("#808080"))
+                self.list_widget.addItem(hint_item)
 
     def _on_double_click(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -3325,7 +3345,7 @@ class MainWindow(QMainWindow):
 
         # ブックマークメニュー
         bm = mb.addMenu("ブックマーク(&B)")
-        self._add_action(bm, "マーク切替(&F2)", QKeySequence("F2"), self._toggle_bookmark)
+        self._add_action(bm, "ブックマーク登録/解除(&F2)", QKeySequence("F2"), self._toggle_bookmark)
         self._add_action(bm, "次のブックマーク(&F3)", QKeySequence("F3"), self._next_bookmark)
         self._add_action(bm, "前のブックマーク(Shift+F3)", QKeySequence("Shift+F3"), self._prev_bookmark)
         bm.addSeparator()
@@ -4576,7 +4596,82 @@ def _check_sqlparse() -> bool:
     return _SQLPARSE_AVAILABLE
 
 
-def _try_format_sql(sql: str, indent: int, keyword_case: str) -> str:
+def _split_top_level_commas(s: str) -> list[str]:
+    """カッコ () とクォート '' "" を考慮してトップレベルのカンマで分割する。
+    例: TO_DATE('a','b'), 'x,y'  → ["TO_DATE('a','b')", "'x,y'"]
+    """
+    parts: list[str] = []
+    depth = 0
+    in_squote = False
+    in_dquote = False
+    buf = []
+    i = 0
+    n = len(s)
+    while i < n:
+        c = s[i]
+        if in_squote:
+            buf.append(c)
+            if c == "'":
+                # '' は文字列内のエスケープ
+                if i + 1 < n and s[i + 1] == "'":
+                    buf.append(s[i + 1]); i += 2; continue
+                in_squote = False
+            i += 1; continue
+        if in_dquote:
+            buf.append(c)
+            if c == '"':
+                in_dquote = False
+            i += 1; continue
+        if c == "'":
+            in_squote = True; buf.append(c); i += 1; continue
+        if c == '"':
+            in_dquote = True; buf.append(c); i += 1; continue
+        if c in '([':
+            depth += 1; buf.append(c); i += 1; continue
+        if c in ')]':
+            depth -= 1; buf.append(c); i += 1; continue
+        if c == ',' and depth == 0:
+            parts.append(''.join(buf).strip()); buf = []; i += 1; continue
+        buf.append(c); i += 1
+    if buf:
+        parts.append(''.join(buf).strip())
+    return parts
+
+
+def _format_insert_pairs(sql: str) -> str | None:
+    """INSERT INTO table (col,...) VALUES (val,...) を
+    「列名 = 値」の対応表 (読み取り用) に整形する。
+    解析できない (列数≠値数 / 複数行VALUES等) 場合は None を返す。
+    """
+    # INSERT INTO <table> ( <cols> ) VALUES ( <vals> )
+    m = re.match(
+        r'\s*INSERT\s+INTO\s+([^\s(]+)\s*\((.*?)\)\s*VALUES\s*\((.*)\)\s*;?\s*$',
+        sql, re.IGNORECASE | re.DOTALL,
+    )
+    if not m:
+        return None
+    table = m.group(1).strip()
+    cols = _split_top_level_commas(m.group(2))
+    vals = _split_top_level_commas(m.group(3))
+    if not cols or len(cols) != len(vals):
+        return None   # 対応が取れない場合は通常整形に任せる
+    width = max(len(c) for c in cols)
+    lines = [f"-- INSERT INTO {table}  (列 = 値) — {len(cols)} 列"]
+    for c, v in zip(cols, vals):
+        lines.append(f"{c.ljust(width)} = {v}")
+    return '\n'.join(lines)
+
+
+def _try_format_sql(sql: str, indent: int, keyword_case: str,
+                    insert_pairs: bool = True) -> str:
+    # INSERT は「列 = 値」の対応表で表示すると、どの列に何が入るか一目で分かる
+    # (DB実行は参照系のみ許可なので INSERT は確認用 = 実行可否は問わない)
+    # insert_pairs=False の時は通常のSQL整形 (コピーして実行したい場合)
+    if insert_pairs and re.match(r'\s*INSERT\s+INTO\b', sql, re.IGNORECASE):
+        paired = _format_insert_pairs(sql)
+        if paired:
+            return paired
+
     if not _check_sqlparse():
         return sql   # 未インストール時は素のSQLを返す
     try:
@@ -6223,6 +6318,16 @@ class SqlExtractDialog(QDialog):
         self.subst_check.setChecked(True)
         row2.addWidget(self.subst_check)
 
+        row2.addSpacing(12)
+        self.insert_pairs_check = QCheckBox("INSERTを列=値で表示")
+        self.insert_pairs_check.setToolTip(
+            "ON: INSERT文を「列名 = 値」の対応表で表示 (確認しやすい)\n"
+            "OFF: 通常のSQL文として表示 (コピーして実行したい時はこちら)"
+        )
+        self.insert_pairs_check.setChecked(True)
+        self.insert_pairs_check.toggled.connect(self._reformat)
+        row2.addWidget(self.insert_pairs_check)
+
         row2.addStretch()
         main.addLayout(row2, 0)
 
@@ -6468,7 +6573,7 @@ class SqlExtractDialog(QDialog):
         if self.subst_check.isChecked() and params:
             sql = _substitute_params(sql, params)
 
-        formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText())
+        formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText(), self.insert_pairs_check.isChecked())
         self.preview.setPlainText(formatted)
         self.lineno_label.setText(f"ログ行: {entry['lineno']}")
 
@@ -6509,7 +6614,7 @@ class SqlExtractDialog(QDialog):
             sql = entry['sql']
             if self.subst_check.isChecked() and entry['params']:
                 sql = _substitute_params(sql, entry['params'])
-            formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText())
+            formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText(), self.insert_pairs_check.isChecked())
             parts.append(f"-- ===== Query {i + 1}  (log line {entry['lineno']}) =====\n{formatted}")
         suffix = "_filtered" if (
             self._filtered_indices and len(self._filtered_indices) != len(self._extracted)
@@ -6546,7 +6651,7 @@ class SqlExtractDialog(QDialog):
         sql = entry['sql']
         if self.subst_check.isChecked() and entry['params']:
             sql = _substitute_params(sql, entry['params'])
-        formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText())
+        formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText(), self.insert_pairs_check.isChecked())
         return (formatted, entry['lineno'])
 
     def navigate_to(self, index: int):
