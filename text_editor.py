@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.1"
+__version__ = "1.1.2"
 
 import sys
 import os
@@ -242,6 +242,7 @@ class LineNumberArea(QWidget):
 
 class CodeEditor(QPlainTextEdit):
     bookmark_toggled = pyqtSignal(int, bool)   # lineno, is_bookmarked
+    sql_extract_requested = pyqtSignal()       # 選択範囲からSQL抽出 (右クリック)
 
     _GUTTER_W   = 7    # 変更バー幅(px) — 4 → 7 に拡大
     _BOOKMARK_W = 12   # ブックマーク列幅(px)
@@ -387,6 +388,60 @@ class CodeEditor(QPlainTextEdit):
         self.line_number_area.setGeometry(
             cr.left(), cr.top(), self.line_number_area_width(), cr.height()
         )
+
+    def contextMenuEvent(self, event):
+        # Qt 標準メニューは英語ラベルなので、編集メニューと表記を揃えるため
+        # 日本語のカスタムコンテキストメニューを自前で構築する。
+        from PyQt6.QtWidgets import QMenu
+        from PyQt6.QtGui import QGuiApplication
+
+        menu = QMenu(self)
+        doc = self.document()
+        has_sel = self.textCursor().hasSelection()
+        editable = not self.isReadOnly()
+        clip = QGuiApplication.clipboard()
+        clip_has_text = bool(clip and clip.text())
+
+        a_undo = menu.addAction("元に戻す")
+        a_undo.setEnabled(editable and doc.isUndoAvailable())
+        a_undo.triggered.connect(self.undo)
+
+        a_redo = menu.addAction("やり直し")
+        a_redo.setEnabled(editable and doc.isRedoAvailable())
+        a_redo.triggered.connect(self.redo)
+
+        menu.addSeparator()
+
+        a_cut = menu.addAction("切り取り")
+        a_cut.setEnabled(editable and has_sel)
+        a_cut.triggered.connect(self.cut)
+
+        a_copy = menu.addAction("コピー")
+        a_copy.setEnabled(has_sel)
+        a_copy.triggered.connect(self.copy)
+
+        a_paste = menu.addAction("貼り付け")
+        a_paste.setEnabled(editable and clip_has_text)
+        a_paste.triggered.connect(self.paste)
+
+        a_del = menu.addAction("削除")
+        a_del.setEnabled(editable and has_sel)
+        a_del.triggered.connect(lambda: self.textCursor().removeSelectedText())
+
+        menu.addSeparator()
+
+        a_all = menu.addAction("すべて選択")
+        a_all.triggered.connect(self.selectAll)
+
+        menu.addSeparator()
+
+        a_sql = menu.addAction("選択範囲からSQL抽出...")
+        a_sql.setEnabled(has_sel)
+        if not has_sel:
+            a_sql.setToolTip("先にSQLを含むログ範囲を選択してください")
+        a_sql.triggered.connect(self.sql_extract_requested.emit)
+
+        menu.exec(event.globalPos())
 
     def paintEvent(self, event):
         # 通常の描画 (テキスト + 検索ハイライト等) を全て済ませてから
@@ -1370,6 +1425,125 @@ def save_profiles(profiles: dict):
 
 
 # ---------------------------------------------------------------------------
+# FTPプロファイル管理ダイアログ (並べ替え/名前変更/削除)
+# ---------------------------------------------------------------------------
+
+class FTPProfileManagerDialog(QDialog):
+    """FTP接続プロファイルの並べ替え/名前変更/削除を行うダイアログ。
+    LogViewer のサーバープロファイル管理と同じ操作感。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("FTPプロファイル管理")
+        self.setMinimumSize(420, 360)
+        self._profiles = load_profiles()
+        self._build_ui()
+        self._populate()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        hint = QLabel("ドラッグで並べ替え / ダブルクリックで名前変更")
+        hint.setStyleSheet("color:#888;font-size:10px;")
+        lay.addWidget(hint)
+
+        self.list = QListWidget()
+        self.list.setDragDropMode(QListWidget.DragDropMode.InternalMove)
+        self.list.setDefaultDropAction(Qt.DropAction.MoveAction)
+        self.list.setSelectionMode(QListWidget.SelectionMode.SingleSelection)
+        self.list.itemDoubleClicked.connect(self._on_rename)
+        lay.addWidget(self.list, 1)
+
+        ops = QHBoxLayout()
+        rename_btn = QPushButton("✏ 名前変更")
+        rename_btn.clicked.connect(self._on_rename_selected)
+        delete_btn = QPushButton("🗑 削除")
+        delete_btn.clicked.connect(self._on_delete)
+        ops.addWidget(rename_btn)
+        ops.addWidget(delete_btn)
+        ops.addStretch()
+        lay.addLayout(ops)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
+                          border:1px solid {t['border']}; font-size:12px; }}
+            QListWidget::item {{ padding:4px 6px; }}
+            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:none; padding:4px 12px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:default {{ background:{t['selection']}; color:{t['text']}; }}
+        """)
+
+    def _populate(self):
+        self.list.clear()
+        for name, info in self._profiles.items():
+            host = info.get('host', '')
+            user = info.get('user', '')
+            port = info.get('port', 21)
+            item = QListWidgetItem(name)
+            item.setToolTip(f"{user}@{host}:{port}")
+            self.list.addItem(item)
+
+    def _on_rename(self, item):
+        old = item.text()
+        new, ok = QInputDialog.getText(self, "名前変更", "新しい名前:", text=old)
+        if not ok or not new.strip() or new == old:
+            return
+        new = new.strip()
+        if new in self._profiles:
+            QMessageBox.warning(self, "重複", f"「{new}」は既に存在します。")
+            return
+        new_map = {}
+        for k, v in self._profiles.items():
+            new_map[new if k == old else k] = v
+        self._profiles = new_map
+        item.setText(new)
+
+    def _on_rename_selected(self):
+        item = self.list.currentItem()
+        if item:
+            self._on_rename(item)
+
+    def _on_delete(self):
+        item = self.list.currentItem()
+        if not item:
+            return
+        name = item.text()
+        ans = QMessageBox.question(
+            self, "削除確認", f"FTPプロファイル「{name}」を削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+        )
+        if ans != QMessageBox.StandardButton.Yes:
+            return
+        self._profiles.pop(name, None)
+        self.list.takeItem(self.list.row(item))
+
+    def accept(self):
+        # 表示順を保存 (並べ替え結果を反映)
+        names_in_order = [self.list.item(i).text() for i in range(self.list.count())]
+        reordered = {n: self._profiles[n] for n in names_in_order if n in self._profiles}
+        save_profiles(reordered)
+        super().accept()
+
+
+# ---------------------------------------------------------------------------
 # FTP接続ダイアログ（プロファイル保存・読み込み対応）
 # ---------------------------------------------------------------------------
 
@@ -1394,9 +1568,10 @@ class FTPConnectDialog(QDialog):
             self.profile_combo.addItem(name)
         profile_row.addWidget(self.profile_combo, 1)
         self.save_btn = QPushButton("保存")
-        self.delete_btn = QPushButton("削除")
+        self.manage_btn = QPushButton("管理")
+        self.manage_btn.setToolTip("プロファイルの並べ替え / 名前変更 / 削除")
         profile_row.addWidget(self.save_btn)
-        profile_row.addWidget(self.delete_btn)
+        profile_row.addWidget(self.manage_btn)
         layout.addLayout(profile_row)
 
         layout.addSpacing(6)
@@ -1436,17 +1611,31 @@ class FTPConnectDialog(QDialog):
         # シグナル
         self.profile_combo.currentIndexChanged.connect(self._on_profile_selected)
         self.save_btn.clicked.connect(self._save_profile)
-        self.delete_btn.clicked.connect(self._delete_profile)
+        self.manage_btn.clicked.connect(self._manage_profiles)
         ok.clicked.connect(self.accept)
         cancel.clicked.connect(self.reject)
 
-        self._update_delete_btn()
+    def _manage_profiles(self):
+        """管理ダイアログを開き、結果 (並べ替え/改名/削除) をコンボに反映。"""
+        dlg = FTPProfileManagerDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            # 最新のプロファイルを読み直してコンボを再構築
+            self._profiles = load_profiles()
+            cur = self.profile_combo.currentText()
+            self.profile_combo.blockSignals(True)
+            self.profile_combo.clear()
+            self.profile_combo.addItem("-- 新規 --")
+            for n in self._profiles:
+                self.profile_combo.addItem(n)
+            # 元の選択を維持 (消えていたら新規)
+            idx = self.profile_combo.findText(cur)
+            self.profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
+            self.profile_combo.blockSignals(False)
 
     # --- プロファイル操作 ---
 
     def _on_profile_selected(self, idx):
         if idx == 0:
-            self._update_delete_btn()
             return
         name = self.profile_combo.currentText()
         p = self._profiles.get(name, {})
@@ -1454,7 +1643,6 @@ class FTPConnectDialog(QDialog):
         self.port.setText(str(p.get('port', 21)))
         self.user.setText(p.get('user', 'anonymous'))
         self.password.setText(p.get('password', ''))
-        self._update_delete_btn()
 
     def _save_profile(self):
         current = self.profile_combo.currentText()
@@ -1482,28 +1670,6 @@ class FTPConnectDialog(QDialog):
         idx = self.profile_combo.findText(name)
         self.profile_combo.setCurrentIndex(idx if idx >= 0 else 0)
         self.profile_combo.blockSignals(False)
-        self._update_delete_btn()
-
-    def _delete_profile(self):
-        name = self.profile_combo.currentText()
-        if name == '-- 新規 --':
-            return
-        ans = QMessageBox.question(
-            self, "削除確認", f"「{name}」を削除しますか？",
-            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-        )
-        if ans != QMessageBox.StandardButton.Yes:
-            return
-        self._profiles.pop(name, None)
-        save_profiles(self._profiles)
-        self.profile_combo.blockSignals(True)
-        self.profile_combo.removeItem(self.profile_combo.currentIndex())
-        self.profile_combo.setCurrentIndex(0)
-        self.profile_combo.blockSignals(False)
-        self._update_delete_btn()
-
-    def _update_delete_btn(self):
-        self.delete_btn.setEnabled(self.profile_combo.currentIndex() > 0)
 
     def info(self):
         # 「-- 新規 --」を選んでいなければ、選択中のプロファイル名も返す
@@ -1588,8 +1754,15 @@ class FTPPanel(QWidget):
         self.current_path = '/'
         # 接続中の保存済みプロファイル名 (空文字 = 一時接続/--新規--)
         self._active_profile_name: str = ''
+        # 再接続用に最後の接続情報を保持
+        self._last_conn_info: dict = {}
         # ローカルパスを渡して「未保存編集あり」かを返すコールバック (MainWindow が注入)
         self._is_modified_cb = lambda _local_path: False
+
+        # キープアライブタイマー: 60秒毎に NOOP を送ってアイドルタイムアウトを防ぐ
+        self._keepalive_timer = QTimer(self)
+        self._keepalive_timer.setInterval(60_000)
+        self._keepalive_timer.timeout.connect(self._send_keepalive)
 
     def set_modification_checker(self, fn):
         """MainWindow から呼ぶ: 引数local_path → bool (未保存編集あり) を返す関数 + UI を構築"""
@@ -1660,8 +1833,12 @@ class FTPPanel(QWidget):
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
 
-            # 接続中プロファイル名を保持 (ディレクトリ変更時の永続化に使う)
+            # 接続中プロファイル名 + 再接続用に接続情報を保持
             self._active_profile_name = info.get('profile_name', '')
+            self._last_conn_info = dict(info)
+
+            # キープアライブ開始 (アイドルタイムアウト切断防止)
+            self._keepalive_timer.start()
 
             # プロファイルに last_dir があれば自動 cd を試みる
             initial_dir = '/'
@@ -1682,6 +1859,7 @@ class FTPPanel(QWidget):
     def _disconnect(self):
         # 切断前に最新ディレクトリを永続化しておく
         self._persist_last_dir()
+        self._keepalive_timer.stop()
         if self.ftp:
             try:
                 self.ftp.quit()
@@ -1689,12 +1867,65 @@ class FTPPanel(QWidget):
                 pass
             self.ftp = None
         self._active_profile_name = ''
+        self._last_conn_info = {}
         self.status_label.setText("未接続")
         self.status_label.setStyleSheet("color: #808080; padding: 2px;")
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
         self.file_list.clear()
         self.open_btn.setEnabled(False)
+
+    def _send_keepalive(self):
+        """定期的に NOOP を送ってアイドル切断を防ぐ。失敗時は自動再接続を試みる。"""
+        if self.ftp is None:
+            return
+        try:
+            # NOOP は何もしないコマンド (タイマーをリセットする副作用のみ)
+            self.ftp.voidcmd('NOOP')
+        except Exception:
+            # 接続が死んでいた → 自動再接続を試みる
+            self._reconnect_silent()
+
+    def _reconnect_silent(self) -> bool:
+        """保存済み接続情報で静かに再接続。成功 = True / 失敗 = False。"""
+        info = dict(self._last_conn_info or {})
+        if not info:
+            return False
+        try:
+            try:
+                if self.ftp:
+                    self.ftp.close()
+            except Exception:
+                pass
+            self.ftp = ftplib.FTP()
+            self.ftp.connect(info['host'], info['port'], timeout=10)
+            self.ftp.login(info['user'], info['password'])
+            # 接続前にいた DIR を復元
+            if self.current_path and self.current_path != '/':
+                try:
+                    self.ftp.cwd(self.current_path)
+                except Exception:
+                    pass
+            return True
+        except Exception:
+            # 再接続失敗 → タイマー停止して切断状態に
+            self._keepalive_timer.stop()
+            self.ftp = None
+            self.status_label.setText("接続が切れました (再接続失敗)")
+            self.status_label.setStyleSheet("color: #FF8080; padding: 2px;")
+            self.connect_btn.setEnabled(True)
+            self.disconnect_btn.setEnabled(False)
+            return False
+
+    def _ensure_alive(self) -> bool:
+        """通信前に接続の生存確認。死んでいたら自動再接続。"""
+        if self.ftp is None:
+            return False
+        try:
+            self.ftp.voidcmd('NOOP')
+            return True
+        except Exception:
+            return self._reconnect_silent()
 
     def _persist_last_dir(self):
         """現在のディレクトリを接続中プロファイルに保存 (次回接続時の初期DIRに使う)。"""
@@ -1715,6 +1946,11 @@ class FTPPanel(QWidget):
 
     def _list(self, path):
         if not self.ftp:
+            return
+        # 通信前に接続生存を確認、死んでいたら自動再接続
+        if not self._ensure_alive():
+            QMessageBox.warning(self, "接続切断",
+                "FTP 接続が切れました。再接続に失敗したので再度接続してください。")
             return
         try:
             self.ftp.cwd(path)
@@ -1827,6 +2063,11 @@ class FTPPanel(QWidget):
 
     def _download(self, name):
         if not self.ftp:
+            return
+        # 通信前に接続生存を確認、死んでいたら自動再接続
+        if not self._ensure_alive():
+            QMessageBox.warning(self, "接続切断",
+                "FTP 接続が切れました。再接続に失敗したので再度接続してください。")
             return
 
         # 1. サイズ事前取得 (SIZE コマンド非対応サーバーは 0 扱い)
@@ -2948,14 +3189,39 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Quick Access")
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
+        # 上下に余白 + 下端に明確な境界線を引いてタブ領域と視覚的に分離
         tb.setStyleSheet(
-            "QToolBar { background:#2a2a2a; border:none; spacing:2px; padding:2px; }"
+            "QToolBar { background:#2a2a2a; border:none; border-bottom:2px solid #1a1a1a;"
+            "           spacing:2px; padding:5px 4px; }"
             "QToolButton { background:transparent; color:#c0c0c0; border:1px solid transparent;"
-            "              padding:4px 8px; border-radius:3px; font-size:13px; }"
+            "              padding:5px 9px; border-radius:3px; font-size:13px; }"
             "QToolButton:hover { background:#3a3a3a; border:1px solid #555; color:#fff; }"
             "QToolButton:checked { background:#2a4a8a; border:1px solid #4a8eff; color:#fff; }"
-            "QToolBar::separator { background:#444; width:1px; margin:4px 4px; }"
+            "QToolBar::separator { background:#444; width:1px; margin:4px 6px; }"
         )
+
+        # ファイル操作 (よく使う 新規/開く/保存/名前を付けて保存)
+        act_new = QAction("🆕 新規", self)
+        act_new.setToolTip("新規ファイル (Ctrl+N)")
+        act_new.triggered.connect(self.new_file)
+        tb.addAction(act_new)
+
+        act_open = QAction("📂 開く", self)
+        act_open.setToolTip("ファイルを開く (Ctrl+O)")
+        act_open.triggered.connect(self.open_file)
+        tb.addAction(act_open)
+
+        act_save = QAction("💾 保存", self)
+        act_save.setToolTip("上書き保存 (Ctrl+S)")
+        act_save.triggered.connect(self.save_file)
+        tb.addAction(act_save)
+
+        act_save_as = QAction("📝 名前を付けて保存", self)
+        act_save_as.setToolTip("名前を付けて保存 (Ctrl+Shift+S)")
+        act_save_as.triggered.connect(self.save_file_as)
+        tb.addAction(act_save_as)
+
+        tb.addSeparator()
 
         # FTP パネル トグル (チェック式)
         self._ftp_toolbar_action = QAction("📁 FTP", self)
@@ -3030,16 +3296,21 @@ class MainWindow(QMainWindow):
 
         # 編集メニュー
         em = mb.addMenu("編集(&E)")
-        self._add_action(em, "元に戻す(&U)", QKeySequence.StandardKey.Undo,
+        # 元に戻す/やり直し/切り取り/コピー/貼り付けは QPlainTextEdit が
+        # ネイティブで Ctrl+Z/Y/X/C/V を処理する。メニューアクションに同じ
+        # ショートカットを設定すると「ambiguous shortcut」となり、やり直し等が
+        # 発火しなくなるため、ここではショートカットを設定せず (ラベルにヒント表示のみ)
+        # クリック動作だけを提供する。キーボードはエディタ内蔵処理に任せる。
+        self._add_action(em, "元に戻す (Ctrl+Z)", None,
                          lambda: self.current_editor() and self.current_editor().undo())
-        self._add_action(em, "やり直し(&R)", QKeySequence.StandardKey.Redo,
+        self._add_action(em, "やり直し (Ctrl+Y)", None,
                          lambda: self.current_editor() and self.current_editor().redo())
         em.addSeparator()
-        self._add_action(em, "切り取り(&X)", QKeySequence.StandardKey.Cut,
+        self._add_action(em, "切り取り (Ctrl+X)", None,
                          lambda: self.current_editor() and self.current_editor().cut())
-        self._add_action(em, "コピー(&C)", QKeySequence.StandardKey.Copy,
+        self._add_action(em, "コピー (Ctrl+C)", None,
                          lambda: self.current_editor() and self.current_editor().copy())
-        self._add_action(em, "貼り付け(&V)", QKeySequence.StandardKey.Paste,
+        self._add_action(em, "貼り付け (Ctrl+V)", None,
                          lambda: self.current_editor() and self.current_editor().paste())
         em.addSeparator()
         self._add_action(em, "検索(&F)...", QKeySequence("Ctrl+F"), self._show_search)
@@ -3077,6 +3348,10 @@ class MainWindow(QMainWindow):
         # ツールメニュー (作業系の機能のみを残す)
         tm = mb.addMenu("ツール(&T)")
         self._add_action(tm, "ログからSQL抽出・整形(&S)...", QKeySequence("Ctrl+Shift+Q"), self._show_sql_extract)
+        self._add_action(
+            tm, "選択範囲からSQL抽出 (Ctrl+Shift+X)", QKeySequence("Ctrl+Shift+X"),
+            self._show_sql_extract_selection,
+        )
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -3207,10 +3482,12 @@ class MainWindow(QMainWindow):
 
     def _add_action(self, menu, label, shortcut, slot):
         act = QAction(label, self)
-        if isinstance(shortcut, QKeySequence.StandardKey):
-            act.setShortcut(QKeySequence(shortcut))
-        else:
-            act.setShortcut(shortcut)
+        # shortcut=None ならショートカット未設定 (ネイティブ処理に任せる/競合回避)
+        if shortcut is not None:
+            if isinstance(shortcut, QKeySequence.StandardKey):
+                act.setShortcut(QKeySequence(shortcut))
+            else:
+                act.setShortcut(shortcut)
         act.triggered.connect(slot)
         menu.addAction(act)
 
@@ -3226,10 +3503,13 @@ class MainWindow(QMainWindow):
                      border: 1px solid {t['border']}; }}
             QMenu::item {{ padding: 3px 20px 3px 12px; }}
             QMenu::item:selected {{ background: {t['selection']}; }}
-            QTabWidget::pane {{ border: none; background: {t['editor_bg']}; }}
+            QTabWidget::pane {{ border: none; background: {t['editor_bg']};
+                                margin-top: 2px; }}
+            QTabBar {{ background: {t['toolbar_bg']}; }}
             QTabBar::tab {{
                 background: {t['control_bg']}; color: {t['text']};
-                padding: 3px 10px; border: none; min-width: 60px;
+                padding: 6px 14px; border: none; min-width: 70px;
+                margin-right: 2px; margin-top: 3px;
                 font-size: {ui_fs}px;
             }}
             QTabBar::tab:selected {{
@@ -3433,6 +3713,8 @@ class MainWindow(QMainWindow):
         tab.content_changed.connect(self._on_content_changed)
         tab.editor.cursorPositionChanged.connect(self._update_cursor)
         tab.editor.bookmark_toggled.connect(lambda *_: self._refresh_bookmarks())
+        # 右クリック「選択範囲からSQL抽出」
+        tab.editor.sql_extract_requested.connect(self._show_sql_extract_selection)
 
     def save_file(self):
         tab = self.current_tab()
@@ -3443,15 +3725,54 @@ class MainWindow(QMainWindow):
         else:
             self.save_file_as()
 
+    # 名前を付けて保存の拡張子フィルタ (代表的なもの)
+    _SAVE_FILTERS = (
+        "テキストファイル (*.txt);;"
+        "ログファイル (*.log);;"
+        "SQLファイル (*.sql);;"
+        "Pythonファイル (*.py);;"
+        "JavaScript (*.js);;"
+        "JSON (*.json);;"
+        "CSV (*.csv);;"
+        "Markdown (*.md);;"
+        "XML (*.xml);;"
+        "HTML (*.html *.htm);;"
+        "YAML (*.yaml *.yml);;"
+        "シェルスクリプト (*.sh);;"
+        "設定ファイル (*.ini *.conf *.cfg);;"
+        "すべてのファイル (*)"
+    )
+
+    # 拡張子 → フィルタ名 (現在ファイルの種別を初期選択するため)
+    _EXT_TO_FILTER = {
+        '.txt': "テキストファイル (*.txt)",
+        '.log': "ログファイル (*.log)",
+        '.sql': "SQLファイル (*.sql)",
+        '.py':  "Pythonファイル (*.py)",
+        '.js':  "JavaScript (*.js)",
+        '.json': "JSON (*.json)",
+        '.csv': "CSV (*.csv)",
+        '.md':  "Markdown (*.md)",
+        '.xml': "XML (*.xml)",
+        '.html': "HTML (*.html *.htm)", '.htm': "HTML (*.html *.htm)",
+        '.yaml': "YAML (*.yaml *.yml)", '.yml': "YAML (*.yaml *.yml)",
+        '.sh':  "シェルスクリプト (*.sh)",
+        '.ini': "設定ファイル (*.ini *.conf *.cfg)",
+        '.conf': "設定ファイル (*.ini *.conf *.cfg)",
+        '.cfg': "設定ファイル (*.ini *.conf *.cfg)",
+    }
+
     def save_file_as(self):
         tab = self.current_tab()
         if not tab:
             return
+        # 現在ファイルの拡張子に合うフィルタを初期選択
+        ext = os.path.splitext(tab.filename)[1].lower()
+        initial_filter = self._EXT_TO_FILTER.get(ext, "テキストファイル (*.txt)")
         path, _ = QFileDialog.getSaveFileName(
             self, "名前を付けて保存", tab.filename,
-            "すべてのファイル (*);;"
-            "Pythonファイル (*.py);;"
-            "テキストファイル (*.txt)",
+            self._SAVE_FILTERS,
+            initial_filter,
         )
         if path:
             self._write_file(tab, path)
@@ -3804,17 +4125,40 @@ class MainWindow(QMainWindow):
         self._refresh_bookmarks()
         self._sync_toolbar_states()
 
-    def _show_sql_extract(self):
+    def _show_sql_extract(self, *, selection_only: bool = False):
+        """SQL抽出ダイアログを開く。
+        selection_only=True の時は、エディタの選択範囲だけを対象に抽出する
+        (ログを参照中に「この辺の SQL だけ抜き出したい」ユースケース)。
+        """
         tab = self.current_tab()
         if not tab:
             QMessageBox.information(self, "情報", "ファイルを開いてください。")
             return
-        content = tab.editor.toPlainText()
-        if not content.strip():
-            QMessageBox.information(self, "情報", "ファイルが空です。")
-            return
+
+        title = tab.filename
+        if selection_only:
+            cur = tab.editor.textCursor()
+            sel_text = cur.selection().toPlainText()
+            if not sel_text.strip():
+                QMessageBox.information(
+                    self, "選択範囲なし",
+                    "エディタでログ範囲を選択してから実行してください。\n"
+                    "(複数行を選択して右クリック → 「選択範囲からSQL抽出」)"
+                )
+                return
+            content = sel_text
+            # 選択範囲の開始行をタイトルに表示してコンテキスト分かりやすく
+            start_line = tab.editor.document().findBlock(cur.selectionStart()).blockNumber() + 1
+            end_line = tab.editor.document().findBlock(cur.selectionEnd()).blockNumber() + 1
+            title = f"{tab.filename} (選択 行{start_line}-{end_line})"
+        else:
+            content = tab.editor.toPlainText()
+            if not content.strip():
+                QMessageBox.information(self, "情報", "ファイルが空です。")
+                return
+
         # モードレス表示 — メイン画面の編集や別タブの操作と並行して使える
-        dlg = SqlExtractDialog(content, tab.filename, parent=self)
+        dlg = SqlExtractDialog(content, title, parent=self)
         dlg.setWindowModality(Qt.WindowModality.NonModal)
         dlg.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         dlg.open_sql_requested.connect(self._open_sql_content)
@@ -3827,6 +4171,10 @@ class MainWindow(QMainWindow):
             if d in self._open_dialogs else None
         )
         dlg.show()
+
+    def _show_sql_extract_selection(self):
+        """エディタの選択範囲からSQLを抽出 → ダイアログ表示。"""
+        self._show_sql_extract(selection_only=True)
 
     def _open_sql_content(self, content: str, filename: str):
         tab = EditorTab(content, filename)
@@ -4034,8 +4382,14 @@ class MainWindow(QMainWindow):
             return
         idx = self.tabs.indexOf(tab)
         title = tab.filename
+        bar = self.tabs.tabBar()
         if tab.is_modified:
+            # 未保存マーク ● + タブ文字色をオレンジにして目立たせる
             title = f"● {title}"
+            bar.setTabTextColor(idx, QColor("#FFB454"))
+        else:
+            # 保存済み → デフォルト色に戻す (QColor() = 無効色 = テーマ既定)
+            bar.setTabTextColor(idx, QColor())
         self.tabs.setTabText(idx, title)
 
     def _on_tab_changed(self, _):
@@ -4070,6 +4424,7 @@ class MainWindow(QMainWindow):
             self.pos_label.setText(f"行: {c.blockNumber()+1}  列: {c.columnNumber()+1}")
 
     def closeEvent(self, event):
+        # 未保存タブの確認
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab) and tab.is_modified:
@@ -4082,6 +4437,32 @@ class MainWindow(QMainWindow):
                     event.ignore()
                     return
                 break
+
+        # FTP 接続が残っていれば QUIT 送信 + キープアライブタイマー停止 +
+        # last_dir 永続化 をまとめて処理 (_disconnect が全部やってくれる)
+        try:
+            if getattr(self, 'ftp_panel', None) is not None and self.ftp_panel.ftp is not None:
+                self.ftp_panel._disconnect()
+        except Exception:
+            pass
+
+        # 開いているモードレスダイアログ (SQL抽出 / DB実行) も明示的に閉じる
+        # (WA_DeleteOnClose 設定済みなので close() で安全に破棄される)
+        try:
+            for dlg in list(getattr(self, '_open_dialogs', [])):
+                try:
+                    dlg.close()
+                except Exception:
+                    pass
+            db_dlg = getattr(self, '_db_dialog', None)
+            if db_dlg is not None:
+                try:
+                    db_dlg.close()
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
         event.accept()
 
 
@@ -5717,6 +6098,8 @@ class SqlExtractDialog(QDialog):
         )
         self._log_content = log_content
         self._extracted: list[dict] = []
+        # フィルタ後のインデックスリスト (sql_list の row → self._extracted の idx)
+        self._filtered_indices: list[int] = []
         self._build_ui()
         self._extract()
         # sqlparse 未インストール時は警告
@@ -5805,6 +6188,31 @@ class SqlExtractDialog(QDialog):
         ll.setContentsMargins(0, 0, 2, 0)
         ll.setSpacing(2)
         ll.addWidget(QLabel("抽出されたSQL:"))
+
+        # 絞り込みフィルタ (キーワード + 種別)
+        filter_row = QHBoxLayout()
+        filter_row.setSpacing(4)
+        filter_row.addWidget(QLabel("🔍"))
+        self.list_filter_input = QLineEdit()
+        self.list_filter_input.setPlaceholderText("SQLをキーワード絞り込み (例: M_WP_COLLECT_TYPE)")
+        self.list_filter_input.textChanged.connect(self._on_list_filter_changed)
+        filter_row.addWidget(self.list_filter_input, 1)
+        self.list_kind_combo = QComboBox()
+        self.list_kind_combo.addItem("全種別", "")
+        self.list_kind_combo.addItem("SELECT", "SELECT")
+        self.list_kind_combo.addItem("INSERT", "INSERT")
+        self.list_kind_combo.addItem("UPDATE", "UPDATE")
+        self.list_kind_combo.addItem("DELETE", "DELETE")
+        self.list_kind_combo.setToolTip("SQL種別で絞り込み")
+        self.list_kind_combo.currentIndexChanged.connect(self._on_list_filter_changed)
+        filter_row.addWidget(self.list_kind_combo)
+        ll.addLayout(filter_row)
+
+        # 絞り込み件数表示 (リストヘッダー右に薄く)
+        self.filter_count_label = QLabel("")
+        self.filter_count_label.setStyleSheet("color:#9ED969; font-size:10px; padding:1px 4px;")
+        ll.addWidget(self.filter_count_label)
+
         self.sql_list = QListWidget()
         self.sql_list.setAlternatingRowColors(True)
         self.sql_list.setUniformItemSizes(True)
@@ -5910,45 +6318,101 @@ class SqlExtractDialog(QDialog):
         self.count_label.setText(f"{len(self._extracted)} 件")
         self._update_list()
 
+    def _sql_kind(self, sql: str) -> str:
+        """SQL の先頭キーワードを 'SELECT'/'INSERT'/'UPDATE'/'DELETE'/'' で返す。"""
+        m = re.match(r'\s*(SELECT|WITH|INSERT|MERGE|UPDATE|DELETE)\b',
+                     sql, re.IGNORECASE)
+        if not m:
+            return ''
+        kw = m.group(1).upper()
+        if kw == 'WITH':
+            return 'SELECT'
+        if kw == 'MERGE':
+            return 'INSERT'
+        return kw
+
+    def _on_list_filter_changed(self, *_):
+        """検索キーワード or 種別変更時の絞り込み再描画。"""
+        self._update_list()
+
     def _update_list(self):
+        self.sql_list.blockSignals(True)
         self.sql_list.clear()
-        # 視認性の高い明るい配色 (ダーク背景に対するコントラスト重視)
+
+        # フィルタ条件取得
+        keyword = ''
+        kind_filter = ''
+        if hasattr(self, 'list_filter_input'):
+            keyword = self.list_filter_input.text().strip().lower()
+        if hasattr(self, 'list_kind_combo'):
+            kind_filter = self.list_kind_combo.currentData() or ''
+
+        # 絞り込み: self._extracted → self._filtered_indices
+        self._filtered_indices = []
         for i, entry in enumerate(self._extracted):
+            sql_text = entry['sql']
+            if kind_filter and self._sql_kind(sql_text) != kind_filter:
+                continue
+            if keyword and keyword not in sql_text.lower():
+                continue
+            self._filtered_indices.append(i)
+
+        # 絞り込み件数表示
+        if hasattr(self, 'filter_count_label'):
+            total = len(self._extracted)
+            shown = len(self._filtered_indices)
+            if shown == total:
+                self.filter_count_label.setText(f"{total} 件")
+            else:
+                self.filter_count_label.setText(f"{shown} / {total} 件 (絞り込み中)")
+
+        # リスト描画 (視認性の高い明るい配色)
+        for i in self._filtered_indices:
+            entry = self._extracted[i]
             preview = entry['sql'][:70].replace('\n', ' ')
             if len(entry['sql']) > 70:
                 preview += '…'
             has_params = bool(entry['params'])
             marker = ' [?]' if '?' in entry['sql'] and has_params else ''
-            # 種別ラベル (先頭にバッジ風に表示)
             sql_kind = ''
-            color = QColor("#e0e0e0")  # デフォルトはほぼ白
+            color = QColor("#e0e0e0")
             if re.match(r'\s*(SELECT|WITH)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'SEL'
-                color = QColor("#9ED969")          # 明るい緑
+                color = QColor("#9ED969")
             elif re.match(r'\s*(INSERT|MERGE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'INS'
-                color = QColor("#82AAFF")          # 明るい青
+                color = QColor("#82AAFF")
             elif re.match(r'\s*(UPDATE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'UPD'
-                color = QColor("#FFB454")          # 明るいオレンジ
+                color = QColor("#FFB454")
             elif re.match(r'\s*(DELETE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'DEL'
-                color = QColor("#FF6E6E")          # 明るい赤
+                color = QColor("#FF6E6E")
             kind_label = f"[{sql_kind}]" if sql_kind else "[?  ]"
+            # 元の連番 i+1 を保持して表示 (絞り込み後も元の番号が分かる)
             item = QListWidgetItem(f" {i+1:>3}. {kind_label}{marker}  {preview}")
             item.setToolTip(f"ログ行 {entry['lineno']}\n{entry['sql'][:300]}")
             item.setForeground(color)
-            # 太字でさらに強調
             f = item.font()
             f.setPointSize(max(10, f.pointSize()))
             item.setFont(f)
             self.sql_list.addItem(item)
-        if self._extracted:
+        self.sql_list.blockSignals(False)
+        if self._filtered_indices:
             self.sql_list.setCurrentRow(0)
+        else:
+            # マッチ無し → プレビューと情報をクリア
+            self.preview.clear()
+            self.lineno_label.setText("")
+            self.param_label.setText("")
 
     def _on_row_changed(self, row):
-        if 0 <= row < len(self._extracted):
-            self._show_entry(self._extracted[row])
+        # row は sql_list の表示インデックス。実 entry は filtered_indices 経由
+        if not (0 <= row < len(self._filtered_indices)):
+            return
+        real_idx = self._filtered_indices[row]
+        if 0 <= real_idx < len(self._extracted):
+            self._show_entry(self._extracted[real_idx])
 
     def _show_entry(self, entry: dict):
         sql = entry['sql']
@@ -5969,8 +6433,8 @@ class SqlExtractDialog(QDialog):
 
     def _reformat(self):
         row = self.sql_list.currentRow()
-        if 0 <= row < len(self._extracted):
-            self._show_entry(self._extracted[row])
+        if 0 <= row < len(self._filtered_indices):
+            self._show_entry(self._extracted[self._filtered_indices[row]])
 
     # ─── タブ操作 ─────────────────────────────────────────────────────
 
@@ -5979,20 +6443,31 @@ class SqlExtractDialog(QDialog):
         if not text:
             return
         row = self.sql_list.currentRow()
-        fname = f"query_{row+1}.sql"
+        # 元の連番 (絞り込み前のインデックス + 1) でファイル名を作る
+        if 0 <= row < len(self._filtered_indices):
+            real_idx = self._filtered_indices[row]
+            fname = f"query_{real_idx + 1}.sql"
+        else:
+            fname = f"query_{row + 1}.sql"
         self.open_sql_requested.emit(text, fname)
 
     def _open_all(self):
-        if not self._extracted:
+        # 絞り込み中なら絞り込み結果のみ、絞り込み無しなら全件
+        targets = self._filtered_indices if self._filtered_indices else range(len(self._extracted))
+        if not targets:
             return
         parts = []
-        for i, entry in enumerate(self._extracted, 1):
+        for i in targets:
+            entry = self._extracted[i]
             sql = entry['sql']
             if self.subst_check.isChecked() and entry['params']:
                 sql = _substitute_params(sql, entry['params'])
             formatted = _try_format_sql(sql, self.indent_spin.value(), self.kw_combo.currentText())
-            parts.append(f"-- ===== Query {i}  (log line {entry['lineno']}) =====\n{formatted}")
-        self.open_sql_requested.emit('\n\n'.join(parts), "all_queries.sql")
+            parts.append(f"-- ===== Query {i + 1}  (log line {entry['lineno']}) =====\n{formatted}")
+        suffix = "_filtered" if (
+            self._filtered_indices and len(self._filtered_indices) != len(self._extracted)
+        ) else ""
+        self.open_sql_requested.emit('\n\n'.join(parts), f"all_queries{suffix}.sql")
 
     def _copy(self):
         text = self.preview.toPlainText().strip()
@@ -6001,23 +6476,26 @@ class SqlExtractDialog(QDialog):
             self.param_label.setText("クリップボードにコピーしました")
 
     # ─── DB実行ダイアログ用ナビゲーション API ────────────────────────────
+    # index は「絞り込み後リスト上の位置」で扱う。これにより DB実行ダイアログの
+    # ◁▷ ボタンも絞り込み結果に対して順次移動する。
 
     def get_sql_count(self) -> int:
-        """抽出済み SQL の総数を返す。"""
-        return len(self._extracted)
+        """絞り込み後の SQL 件数を返す。"""
+        return len(self._filtered_indices)
 
     def get_current_index(self) -> int:
-        """現在選択中の SQL のインデックスを返す。未選択時は -1。"""
+        """現在選択中の SQL のリスト上インデックス。未選択時は -1。"""
         return self.sql_list.currentRow()
 
     def get_formatted_sql_at(self, index: int) -> tuple[str, int]:
-        """指定インデックスの整形済み SQL とログ行番号を返す。
+        """指定インデックス (絞り込み後) の整形済み SQL とログ行番号を返す。
         現在のオプション (kw_combo / indent_spin / subst_check) を適用する。
         範囲外の場合は ('', -1)。
         """
-        if not (0 <= index < len(self._extracted)):
+        if not (0 <= index < len(self._filtered_indices)):
             return ('', -1)
-        entry = self._extracted[index]
+        real_idx = self._filtered_indices[index]
+        entry = self._extracted[real_idx]
         sql = entry['sql']
         if self.subst_check.isChecked() and entry['params']:
             sql = _substitute_params(sql, entry['params'])
@@ -6025,8 +6503,8 @@ class SqlExtractDialog(QDialog):
         return (formatted, entry['lineno'])
 
     def navigate_to(self, index: int):
-        """SQL リストの選択を index に移動 (プレビューも追随する)。"""
-        if 0 <= index < len(self._extracted):
+        """絞り込み後リストの index に選択を移動 (プレビューも追随)。"""
+        if 0 <= index < len(self._filtered_indices):
             self.sql_list.setCurrentRow(index)
 
     def _open_db_execute(self):
