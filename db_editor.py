@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QPushButton, QPlainTextEdit, QTextEdit, QCheckBox, QMessageBox,
     QTabWidget, QStatusBar, QSplitter, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView,
+    QHeaderView, QDialog, QListWidget, QListWidgetItem,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor
@@ -99,6 +99,9 @@ except Exception:  # pragma: no cover
 # ---------------------------------------------------------------------------
 
 _AUDIT_LOG_PATH = os.path.join(os.path.expanduser('~'), '.db_editor_audit.log')
+# SQL 実行履歴 (呼び戻し用)。監査ログ (append-only の証跡) とは別物。
+_HISTORY_PATH = os.path.join(os.path.expanduser('~'), '.db_editor_history.json')
+_HISTORY_MAX = 200
 
 # 編集系コマンドテンプレート。{SQL} を実 SQL で置換する。
 # 既存 _DB_CMD_PRESETS (参照専用) と違い、トランザクションで包み、
@@ -318,6 +321,137 @@ def _append_audit(profile: str, sql: str, status: str, detail: str = ''):
         pass
 
 
+def _load_history() -> list[dict]:
+    """SQL 実行履歴を読み込む (新しいものが先頭)。"""
+    try:
+        with open(_HISTORY_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_history(hist: list[dict]):
+    try:
+        with open(_HISTORY_PATH, 'w', encoding='utf-8') as f:
+            json.dump(hist[:_HISTORY_MAX], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _append_history(profile: str, sql: str, kind: str, status: str):
+    """実行した SQL を履歴に追加する (新しいものが先頭、上限 _HISTORY_MAX 件)。
+    kind: 'sql' (SQL実行タブ) / 'grid' (グリッド編集の適用)
+    """
+    sql = (sql or '').strip()
+    if not sql:
+        return
+    hist = _load_history()
+    entry = {
+        'ts': datetime.datetime.now().strftime('%Y-%m-%d %H:%M:%S'),
+        'profile': profile, 'kind': kind, 'status': status, 'sql': sql,
+    }
+    # 直近と同一 SQL/プロファイルの連続実行はステータスのみ更新 (重複抑制)
+    if hist and hist[0].get('sql') == sql and hist[0].get('profile') == profile:
+        hist[0] = entry
+    else:
+        hist.insert(0, entry)
+    _save_history(hist)
+
+
+# ---------------------------------------------------------------------------
+# SQL 履歴ダイアログ
+# ---------------------------------------------------------------------------
+
+class HistoryDialog(QDialog):
+    """実行済み SQL の履歴一覧。選択して SQL タブのエディタに呼び戻せる。"""
+
+    sql_chosen = pyqtSignal(str)
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("SQL 実行履歴")
+        self.resize(820, 560)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint)
+        th = _theme()
+        self.setStyleSheet(
+            f"QDialog, QWidget {{ background:{th.get('bg', '#2b2b2b')};"
+            f" color:{th.get('text', '#dcdcdc')}; }}")
+        self._build_ui()
+        self._reload()
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.addWidget(QLabel(f"履歴ファイル: {_HISTORY_PATH} (上限 {_HISTORY_MAX} 件)"))
+
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.list = QListWidget()
+        self.list.currentRowChanged.connect(self._on_select)
+        self.list.itemDoubleClicked.connect(lambda _it: self._load_selected())
+        splitter.addWidget(self.list)
+        self.preview = QTextEdit()
+        self.preview.setReadOnly(True)
+        self.preview.setFont(QFont("Consolas", 10))
+        splitter.addWidget(self.preview)
+        splitter.setSizes([360, 180])
+        root.addWidget(splitter, 1)
+
+        btn_row = QHBoxLayout()
+        self.reload_btn = QPushButton("再読込")
+        self.reload_btn.clicked.connect(self._reload)
+        btn_row.addWidget(self.reload_btn)
+        self.clear_btn = QPushButton("履歴をクリア")
+        self.clear_btn.clicked.connect(self._clear)
+        btn_row.addWidget(self.clear_btn)
+        btn_row.addStretch()
+        self.load_btn = QPushButton("エディタに読み込む")
+        self.load_btn.clicked.connect(self._load_selected)
+        btn_row.addWidget(self.load_btn)
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    def _reload(self):
+        self._hist = _load_history()
+        self.list.clear()
+        for e in self._hist:
+            first_line = (e.get('sql', '').strip().splitlines() or [''])[0]
+            if len(first_line) > 80:
+                first_line = first_line[:80] + ' …'
+            kind = {'sql': 'SQL', 'grid': 'GRID'}.get(e.get('kind', ''), e.get('kind', ''))
+            label = (f"[{e.get('ts', '')}] {kind} · {e.get('profile', '')} · "
+                     f"{e.get('status', '')}\n    {first_line}")
+            self.list.addItem(QListWidgetItem(label))
+        self.preview.clear()
+        if self._hist:
+            self.list.setCurrentRow(0)
+
+    def _on_select(self, row: int):
+        if 0 <= row < len(self._hist):
+            self.preview.setPlainText(self._hist[row].get('sql', ''))
+
+    def _load_selected(self):
+        row = self.list.currentRow()
+        if 0 <= row < len(self._hist):
+            self.sql_chosen.emit(self._hist[row].get('sql', ''))
+            self.accept()
+
+    def _clear(self):
+        if not self._hist:
+            return
+        r = QMessageBox.question(
+            self, "履歴クリア", "SQL 実行履歴をすべて削除しますか？",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r == QMessageBox.StandardButton.Yes:
+            _save_history([])
+            self._reload()
+
+
 # ---------------------------------------------------------------------------
 # SSH 実行ワーカー (UI を固めないよう別スレッドで実行)
 # ---------------------------------------------------------------------------
@@ -520,6 +654,11 @@ class SqlEditTab(QWidget):
         self.preview_btn.setToolTip("UPDATE/DELETE の WHERE 条件で対象件数を COUNT します")
         self.preview_btn.clicked.connect(self._preview_impact)
         btn_row.addWidget(self.preview_btn)
+
+        self.history_btn = QPushButton("履歴")
+        self.history_btn.setToolTip("過去に実行した SQL の一覧を開き、選んでエディタに呼び戻します")
+        self.history_btn.clicked.connect(self._open_history)
+        btn_row.addWidget(self.history_btn)
 
         self.run_btn = QPushButton("▶ 実行 (Ctrl+Enter)")
         self.run_btn.setMinimumWidth(160)
@@ -736,6 +875,8 @@ class SqlEditTab(QWidget):
             _append_audit(getattr(self, '_pending_profile', ''),
                           self._pending_sql, status,
                           detail=(err.strip().splitlines()[0] if err.strip() else ''))
+            _append_history(getattr(self, '_pending_profile', ''),
+                            self._pending_sql, 'sql', status)
             self._status(
                 f"完了 (exit={exit_code})" if exit_code == 0
                 else f"エラー (exit={exit_code}) — ROLLBACK された可能性があります")
@@ -749,7 +890,18 @@ class SqlEditTab(QWidget):
         if self._mode == 'exec':
             _append_audit(getattr(self, '_pending_profile', ''),
                           self._pending_sql, "接続エラー", detail=msg)
+            _append_history(getattr(self, '_pending_profile', ''),
+                            self._pending_sql, 'sql', "接続エラー")
         self._status("エラー")
+
+    def _open_history(self):
+        dlg = HistoryDialog(self)
+        dlg.sql_chosen.connect(self._load_from_history)
+        dlg.exec()
+
+    def _load_from_history(self, sql: str):
+        self.sql_input.setPlainText(sql)
+        self._status("履歴から SQL を読み込みました")
 
     def _status(self, text: str):
         win = self.window()
@@ -1207,6 +1359,7 @@ class GridEditTab(QWidget):
             status = "成功" if exit_code == 0 else f"失敗(exit={exit_code})"
             _append_audit(self._pending_profile, self._pending_sql, status,
                           detail=(err.strip().splitlines()[0] if err.strip() else ''))
+            _append_history(self._pending_profile, self._pending_sql, 'grid', status)
             if exit_code == 0:
                 # 適用成功: 現在のセル値を新しい original として確定し dirty をクリア
                 self.table.blockSignals(True)
@@ -1229,6 +1382,7 @@ class GridEditTab(QWidget):
         self.result_view.setPlainText(f"接続/実行エラー:\n{msg}")
         if self._mode == 'apply':
             _append_audit(self._pending_profile, self._pending_sql, "接続エラー", detail=msg)
+            _append_history(self._pending_profile, self._pending_sql, 'grid', "接続エラー")
         self._status("エラー")
 
     def _status(self, text: str):
