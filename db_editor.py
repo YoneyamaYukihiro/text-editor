@@ -315,6 +315,19 @@ def _parse_csv_lines(text: str) -> list[list[str]]:
     return rows
 
 
+def _extract_counts(text: str) -> list[int]:
+    """COUNT(*) 出力テキストから件数 (単独行の整数) を抽出する。
+    各DBクライアントの装飾 (ヘッダー行 'COUNT(*)'、psql の '(1 row)' 等) は
+    整数単独行ではないので自然に除外される。
+    """
+    out = []
+    for line in (text or '').splitlines():
+        s = line.strip().strip(',').replace(',', '')
+        if re.fullmatch(r'\d+', s):
+            out.append(int(s))
+    return out
+
+
 def _sql_literal(text: str, empty_as_null: bool = True) -> str:
     """セル値を SQL リテラルに変換する。
     - None / (空欄 かつ empty_as_null) / 'NULL' トークン → NULL
@@ -981,6 +994,12 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.run_btn.setEnabled(True)
         self.preview_btn.setEnabled(True)
         parts = []
+        # 影響行プレビューは件数を先頭に明示する
+        if self._mode == 'count':
+            counts = _extract_counts(_clean_sqlplus_output(out))
+            if counts:
+                total = " / ".join(f"{n} 件" for n in counts)
+                parts.append(f"▶ 推定影響行数: {total}\n")
         if out.strip():
             parts.append(out.rstrip())
         if err.strip():
@@ -999,7 +1018,11 @@ class SqlEditTab(_EnvMixin, QWidget):
                 f"完了 (exit={exit_code})" if exit_code == 0
                 else f"エラー (exit={exit_code}) — ROLLBACK された可能性があります")
         else:
-            self._status(f"プレビュー完了 (exit={exit_code})")
+            counts = _extract_counts(_clean_sqlplus_output(out))
+            if counts:
+                self._status("影響行プレビュー: " + " / ".join(f"{n} 件" for n in counts))
+            else:
+                self._status(f"プレビュー完了 (exit={exit_code})")
 
     def _on_exec_failed(self, msg: str):
         self.run_btn.setEnabled(True)
@@ -1046,12 +1069,20 @@ class GridEditTab(_EnvMixin, QWidget):
         self._worker = None
         self._mode = None              # 'select' / 'apply'
         self._header: list[str] = []
-        self._original: list[list[str]] = []   # 取得直後の値スナップショット
-        self._dirty: set[tuple[int, int]] = set()
+        self._original: list[list[str]] = []   # 全表示行と整列した取得時スナップショット
+        self._row_kind: list[str] = []         # 行ごと: 'existing' / 'new'
+        self._deleted: set[int] = set()        # 削除マーク済みの既存行インデックス
+        self._dirty: set[tuple[int, int]] = set()  # 既存行の変更セル
         self._pending_sql = ''
         self._pending_profile = ''
         self._build_ui()
         self._refresh_profiles()
+
+    # 行状態に応じた背景色
+    _BG_CLEAR = QColor(0, 0, 0, 0)
+    _BG_EDIT = QColor("#5a3a1a")     # 変更セル (既存行)
+    _BG_NEW = QColor("#1f3a1f")      # 追加行
+    _BG_DELETE = QColor("#4a1f1f")   # 削除マーク行
 
     # ── UI 構築 ──────────────────────────────────────────────────────────
     def _build_ui(self):
@@ -1185,13 +1216,21 @@ class GridEditTab(_EnvMixin, QWidget):
 
         # 操作ボタン
         btn_row = QHBoxLayout()
-        self.dirty_lbl = QLabel("変更: 0 セル")
+        self.dirty_lbl = QLabel("変更なし")
         btn_row.addWidget(self.dirty_lbl)
         btn_row.addStretch()
+        self.add_row_btn = QPushButton("行を追加")
+        self.add_row_btn.setToolTip("空の行を追加します (INSERT 対象としてステージング)")
+        self.add_row_btn.clicked.connect(self._add_row)
+        btn_row.addWidget(self.add_row_btn)
+        self.del_row_btn = QPushButton("行を削除")
+        self.del_row_btn.setToolTip("選択中の行を削除マークします (既存行は DELETE、追加行は取消)")
+        self.del_row_btn.clicked.connect(self._delete_rows)
+        btn_row.addWidget(self.del_row_btn)
         self.revert_btn = QPushButton("変更を破棄")
         self.revert_btn.clicked.connect(self._revert)
         btn_row.addWidget(self.revert_btn)
-        self.preview_btn = QPushButton("変更をプレビュー (UPDATE生成)")
+        self.preview_btn = QPushButton("変更をプレビュー")
         self.preview_btn.clicked.connect(self._preview)
         btn_row.addWidget(self.preview_btn)
         self.apply_btn = QPushButton("▶ 変更を適用")
@@ -1297,13 +1336,15 @@ class GridEditTab(_EnvMixin, QWidget):
         self.table.blockSignals(True)
         self.table.clear()
         self._dirty.clear()
-        self._update_dirty_label()
+        self._deleted.clear()
+        self._row_kind = []
         if not rows:
             self.table.setRowCount(0)
             self.table.setColumnCount(0)
             self._header = []
             self._original = []
             self.table.blockSignals(False)
+            self._update_dirty_label()
             return
         ncols = max(len(r) for r in rows)
         header = (rows[0] + [''] * (ncols - len(rows[0])))
@@ -1312,6 +1353,7 @@ class GridEditTab(_EnvMixin, QWidget):
         self._original = [
             [(r[c] if c < len(r) else '') for c in range(ncols)] for r in body
         ]
+        self._row_kind = ['existing'] * len(body)
         self.table.setColumnCount(ncols)
         self.table.setHorizontalHeaderLabels(self._header)
         self.table.setRowCount(len(body))
@@ -1323,44 +1365,130 @@ class GridEditTab(_EnvMixin, QWidget):
             if self.table.columnWidth(c) > 360:
                 self.table.setColumnWidth(c, 360)
         self.table.blockSignals(False)
+        self._update_dirty_label()
+
+    # ── 行の追加 / 削除 ──────────────────────────────────────────────────
+    def _add_row(self):
+        if not self._header:
+            QMessageBox.information(self, "先にデータ取得",
+                "列構成を決めるため、先に SELECT でデータを取得してください。")
+            return
+        ncols = len(self._header)
+        r = self.table.rowCount()
+        self.table.blockSignals(True)
+        self.table.insertRow(r)
+        for c in range(ncols):
+            it = QTableWidgetItem('')
+            it.setBackground(self._BG_NEW)
+            self.table.setItem(r, c, it)
+        self.table.blockSignals(False)
+        self._original.append([''] * ncols)
+        self._row_kind.append('new')
+        self.table.scrollToBottom()
+        self.table.setCurrentCell(r, 0)
+        self._update_dirty_label()
+
+    def _delete_rows(self):
+        sel = sorted({i.row() for i in self.table.selectedIndexes()})
+        if not sel:
+            QMessageBox.information(self, "行未選択", "削除する行を選択してください。")
+            return
+        self.table.blockSignals(True)
+        # 追加行はインデックスがずれるので降順で物理削除する
+        for r in sorted(sel, reverse=True):
+            if r >= len(self._row_kind):
+                continue
+            if self._row_kind[r] == 'new':
+                self.table.removeRow(r)
+                del self._original[r]
+                del self._row_kind[r]
+                # 上にある削除マーク/変更セルのインデックスを詰める
+                self._deleted = {(d - 1 if d > r else d) for d in self._deleted}
+                self._dirty = {((dr - 1 if dr > r else dr), dc)
+                               for (dr, dc) in self._dirty}
+            else:
+                if r in self._deleted:
+                    self._deleted.discard(r)          # トグル: 削除マーク解除
+                    self._set_row_deleted(r, False)
+                else:
+                    self._deleted.add(r)
+                    self._set_row_deleted(r, True)
+        self.table.blockSignals(False)
+        self._update_dirty_label()
+
+    def _set_row_deleted(self, r: int, deleted: bool):
+        for c in range(self.table.columnCount()):
+            it = self.table.item(r, c)
+            if it is None:
+                continue
+            flags = it.flags()
+            if deleted:
+                it.setBackground(self._BG_DELETE)
+                it.setFlags(flags & ~Qt.ItemFlag.ItemIsEditable)
+            else:
+                it.setFlags(flags | Qt.ItemFlag.ItemIsEditable)
+                # 復帰時は変更セルなら編集色、そうでなければクリア
+                orig = self._original[r][c] if r < len(self._original) else ''
+                changed = (r, c) in self._dirty and it.text() != orig
+                it.setBackground(self._BG_EDIT if changed else self._BG_CLEAR)
 
     # ── セル編集の追跡 ───────────────────────────────────────────────────
     def _on_item_changed(self, item: QTableWidgetItem):
         r, c = item.row(), item.column()
-        if r >= len(self._original) or c >= len(self._original[r]):
+        if r >= len(self._row_kind):
+            return
+        if self._row_kind[r] == 'new' or r in self._deleted:
+            return  # 追加行は丸ごと INSERT、削除行は編集不可
+        if c >= len(self._original[r]):
             return
         orig = self._original[r][c]
         if item.text() != orig:
             self._dirty.add((r, c))
-            item.setBackground(QColor("#5a3a1a"))
+            item.setBackground(self._BG_EDIT)
         else:
             self._dirty.discard((r, c))
-            item.setBackground(QColor(0, 0, 0, 0))
+            item.setBackground(self._BG_CLEAR)
         self._update_dirty_label()
 
     def _update_dirty_label(self):
-        rows = {r for r, _ in self._dirty}
-        self.dirty_lbl.setText(f"変更: {len(self._dirty)} セル / {len(rows)} 行")
+        upd_rows = {r for r, _ in self._dirty}
+        n_ins = sum(1 for k in self._row_kind if k == 'new')
+        n_del = len(self._deleted)
+        if not (upd_rows or n_ins or n_del):
+            self.dirty_lbl.setText("変更なし")
+        else:
+            self.dirty_lbl.setText(
+                f"変更: 更新 {len(upd_rows)} 行 / 追加 {n_ins} 行 / 削除 {n_del} 行")
 
     def _revert(self):
-        if not self._dirty:
-            return
+        # 全ステージングを破棄して取得直後の状態に戻す
         self.table.blockSignals(True)
-        for (r, c) in list(self._dirty):
-            it = self.table.item(r, c)
-            if it is not None:
+        # 追加行を末尾から物理削除
+        for r in range(len(self._row_kind) - 1, -1, -1):
+            if self._row_kind[r] == 'new':
+                self.table.removeRow(r)
+                del self._original[r]
+                del self._row_kind[r]
+        # 既存行の変更セルを戻し、削除マークを解除
+        for r in range(self.table.rowCount()):
+            for c in range(self.table.columnCount()):
+                it = self.table.item(r, c)
+                if it is None:
+                    continue
                 it.setText(self._original[r][c])
-                it.setBackground(QColor(0, 0, 0, 0))
+                it.setFlags(it.flags() | Qt.ItemFlag.ItemIsEditable)
+                it.setBackground(self._BG_CLEAR)
         self._dirty.clear()
+        self._deleted.clear()
         self.table.blockSignals(False)
         self._update_dirty_label()
 
-    # ── UPDATE 生成 ──────────────────────────────────────────────────────
+    # ── 文生成 (DELETE / UPDATE / INSERT) ────────────────────────────────
     def _pk_indices(self) -> list[int] | None:
         pk_raw = [p.strip() for p in self.pk_input.text().split(',') if p.strip()]
         if not pk_raw:
             QMessageBox.warning(self, "主キー未指定",
-                "UPDATE の WHERE 条件に使う主キー列を指定してください。")
+                "UPDATE / DELETE の WHERE 条件に使う主キー列を指定してください。")
             return None
         lower = [h.lower() for h in self._header]
         idxs = []
@@ -1373,51 +1501,81 @@ class GridEditTab(_EnvMixin, QWidget):
             idxs.append(lower.index(pk.lower()))
         return idxs
 
-    def _generate_updates(self) -> list[str] | None:
-        if not self._dirty:
+    def _generate_statements(self) -> list[str] | None:
+        """ステージング状態から DELETE → UPDATE → INSERT の順で文を生成する。"""
+        upd_rows = {r for r, _ in self._dirty}
+        has_changes = bool(upd_rows or self._deleted
+                           or any(k == 'new' for k in self._row_kind))
+        if not has_changes:
             return []
         table = self.table_input.text().strip()
         if not table:
-            QMessageBox.warning(self, "テーブル未指定", "UPDATE 対象のテーブル名を入力してください。")
-            return None
-        pk_idx = self._pk_indices()
-        if pk_idx is None:
+            QMessageBox.warning(self, "テーブル未指定", "対象のテーブル名を入力してください。")
             return None
         empty_null = self.empty_null_chk.isChecked()
-        dirty_rows: dict[int, list[int]] = {}
+
+        # UPDATE / DELETE には主キーが必要 (INSERT のみなら不要)
+        pk_idx: list[int] = []
+        if upd_rows or self._deleted:
+            pk_idx = self._pk_indices()
+            if pk_idx is None:
+                return None
+
+        deletes, updates, inserts = [], [], []
+
+        # DELETE (既存・削除マーク行) — 取得時点の主キー値で特定
+        for r in sorted(self._deleted):
+            where = [f"{self._header[c]} = {_sql_literal(self._original[r][c], empty_null)}"
+                     for c in pk_idx]
+            deletes.append(f"DELETE FROM {table} WHERE {' AND '.join(where)};")
+
+        # UPDATE (既存・非削除・変更セルあり)
+        dirty_by_row: dict[int, list[int]] = {}
         for (r, c) in self._dirty:
-            dirty_rows.setdefault(r, []).append(c)
-        stmts = []
-        for r in sorted(dirty_rows):
-            set_cols = sorted(dirty_rows[r])
+            if r in self._deleted:
+                continue
+            dirty_by_row.setdefault(r, []).append(c)
+        for r in sorted(dirty_by_row):
             set_parts = []
-            for c in set_cols:
+            for c in sorted(dirty_by_row[r]):
                 it = self.table.item(r, c)
-                new_val = it.text() if it is not None else ''
-                set_parts.append(f"{self._header[c]} = {_sql_literal(new_val, empty_null)}")
-            # WHERE は取得直後の主キー値で行を特定 (主キー自体を編集していても元の行)
-            where_parts = []
-            for c in pk_idx:
-                ov = self._original[r][c]
-                where_parts.append(f"{self._header[c]} = {_sql_literal(ov, empty_null)}")
-            stmts.append(
+                set_parts.append(
+                    f"{self._header[c]} = {_sql_literal(it.text() if it else '', empty_null)}")
+            where = [f"{self._header[c]} = {_sql_literal(self._original[r][c], empty_null)}"
+                     for c in pk_idx]
+            updates.append(
                 f"UPDATE {table} SET {', '.join(set_parts)} "
-                f"WHERE {' AND '.join(where_parts)};")
-        return stmts
+                f"WHERE {' AND '.join(where)};")
+
+        # INSERT (追加行・非削除) — 全列空の行はスキップ
+        ncols = len(self._header)
+        for r in range(self.table.rowCount()):
+            if r >= len(self._row_kind) or self._row_kind[r] != 'new':
+                continue
+            vals = [(self.table.item(r, c).text() if self.table.item(r, c) else '')
+                    for c in range(ncols)]
+            if all(v == '' for v in vals):
+                continue
+            cols_sql = ', '.join(self._header)
+            vals_sql = ', '.join(_sql_literal(v, empty_null) for v in vals)
+            inserts.append(f"INSERT INTO {table} ({cols_sql}) VALUES ({vals_sql});")
+
+        return deletes + updates + inserts
 
     def _preview(self):
-        stmts = self._generate_updates()
+        stmts = self._generate_statements()
         if stmts is None:
             return
         if not stmts:
             self.result_view.setPlainText("変更がありません。")
             return
         self.result_view.setPlainText(
-            "-- 生成された UPDATE (適用前プレビュー) --\n" + "\n".join(stmts))
-        self._status(f"{len(stmts)} 件の UPDATE を生成")
+            "-- 生成された変更 (適用前プレビュー / DELETE→UPDATE→INSERT) --\n"
+            + "\n".join(stmts))
+        self._status(f"{len(stmts)} 件の文を生成")
 
     def _apply(self):
-        stmts = self._generate_updates()
+        stmts = self._generate_statements()
         if stmts is None:
             return
         if not stmts:
@@ -1436,10 +1594,9 @@ class GridEditTab(_EnvMixin, QWidget):
         body = self._build_cmd_body(self.edit_cmd.toPlainText(), sql)
         if body is None:
             return
-        rows = {r for r, _ in self._dirty}
         r = QMessageBox.question(
             self, "適用確認",
-            f"{len(rows)} 行 / {len(self._dirty)} セルの変更を適用します。\n\n"
+            f"{len(stmts)} 件の変更を適用します。\n\n"
             f"{sql}\n\n1 トランザクションで COMMIT され、失敗時は ROLLBACK されます。",
             QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
             QMessageBox.StandardButton.No)
@@ -1448,7 +1605,7 @@ class GridEditTab(_EnvMixin, QWidget):
             return
         prof_name = self.profile_combo.currentText()
         if not self._confirm_production(
-                prof_name, f"{len(rows)} 行の変更を適用しようとしています。"):
+                prof_name, f"{len(stmts)} 件の変更 (UPDATE/DELETE/INSERT) を適用しようとしています。"):
             self._status("本番確認が未完了のため中止しました")
             return
         self._mode = 'apply'
@@ -1493,17 +1650,13 @@ class GridEditTab(_EnvMixin, QWidget):
                           detail=(err.strip().splitlines()[0] if err.strip() else ''))
             _append_history(self._pending_profile, self._pending_sql, 'grid', status)
             if exit_code == 0:
-                # 適用成功: 現在のセル値を新しい original として確定し dirty をクリア
-                self.table.blockSignals(True)
-                for (r, c) in list(self._dirty):
-                    it = self.table.item(r, c)
-                    if it is not None:
-                        self._original[r][c] = it.text()
-                        it.setBackground(QColor(0, 0, 0, 0))
-                self._dirty.clear()
-                self.table.blockSignals(False)
-                self._update_dirty_label()
-                self._status("適用成功 (COMMIT 済)")
+                # 適用成功: INSERT/DELETE で行集合が変わるため、元の SELECT を
+                # 再実行して最新状態に同期する (取得 SQL があれば)
+                self._status("適用成功 (COMMIT 済) — 再取得します")
+                if self.sql_input.toPlainText().strip():
+                    self._fetch()
+                else:
+                    self._populate_grid('')
             else:
                 self._status(f"適用エラー (exit={exit_code}) — ROLLBACK の可能性")
 
