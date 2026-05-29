@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -15,7 +15,7 @@ from PyQt6.QtWidgets import (
     QSplitter, QPlainTextEdit, QLabel, QLineEdit, QPushButton, QComboBox,
     QTreeWidget, QTreeWidgetItem, QDialog, QGridLayout, QFileDialog,
     QMessageBox, QInputDialog, QCheckBox, QFrame, QToolBar, QSizePolicy,
-    QListWidget, QListWidgetItem,
+    QListWidget, QListWidgetItem, QTabWidget,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
@@ -1519,10 +1519,13 @@ class ServerPanel(QWidget):
         path_row = QHBoxLayout()
         path_row.setContentsMargins(2, 1, 2, 1)
         path_row.setSpacing(2)
+        _pt = _theme()
+        _pbtn = (f"background:{_pt['control_bg']};color:{_pt['text']};"
+                 f"border:1px solid {_pt['border']};border-radius:3px;font-weight:bold;")
         up_btn = QPushButton("⬆")
         up_btn.setFixedSize(20, 18)
         up_btn.setToolTip("親フォルダへ移動")
-        up_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-weight:bold;")
+        up_btn.setStyleSheet(_pbtn)
         up_btn.clicked.connect(self._go_parent)
         self.path_input = QLineEdit(self._initial_path)
         self.path_input.setToolTip("リモートサーバーのフォルダパスを入力して Enter または → で移動")
@@ -1530,19 +1533,19 @@ class ServerPanel(QWidget):
         go_btn = QPushButton("→")
         go_btn.setFixedSize(20, 18)
         go_btn.setToolTip("入力したフォルダに移動")
-        go_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-weight:bold;")
+        go_btn.setStyleSheet(_pbtn)
         go_btn.clicked.connect(lambda: self._load(self.path_input.text()))
         refresh_btn = QPushButton("↻")
         refresh_btn.setFixedSize(22, 18)
         refresh_btn.setToolTip(
             "現在のフォルダを再読み込み (ローテーションされた新ファイルを表示)"
         )
-        refresh_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-size:13px;font-weight:bold;")
+        refresh_btn.setStyleSheet(_pbtn + "font-size:13px;")
         refresh_btn.clicked.connect(lambda: self._load(self.path_input.text()))
         save_btn = QPushButton("📌")
         save_btn.setFixedSize(22, 18)
         save_btn.setToolTip("現在のフォルダを「次回接続時の初期DIR」としてプロファイルに保存")
-        save_btn.setStyleSheet("background:#333;color:#ddd;border:none;font-size:11px;")
+        save_btn.setStyleSheet(_pbtn + "font-size:11px;")
         save_btn.clicked.connect(
             lambda: self.save_dir_requested.emit(self, self.path_input.text())
         )
@@ -1655,7 +1658,7 @@ class ServerPanel(QWidget):
         self.tree.setStyleSheet(
             f"QTreeWidget{{background:{t['panel_bg']};color:{t['text']};border:none;font-size:{fs}px;}}"
             f"QTreeWidget::item{{padding:1px 0;}}"
-            f"QTreeWidget::item:selected{{background:{t['selection']};}}"
+            f"QTreeWidget::item:selected{{background:{t['selection']};color:{t['text']};}}"
             f"QTreeWidget::item:hover{{background:{t['control_bg']};}}"
         )
         # 表示/非表示の切り替え (画面の縦スペースを節約)
@@ -1736,11 +1739,12 @@ class ServerPanel(QWidget):
             return  # フォルダにはメニューを出さない
 
         menu = QMenu(self)
+        _mt = _theme()
         menu.setStyleSheet(
-            "QMenu{background:#2b2b2b;color:#e0e0e0;border:1px solid #555;}"
-            "QMenu::item{padding:6px 18px;}"
-            "QMenu::item:selected{background:#214283;}"
-            "QMenu::separator{height:1px;background:#444;margin:4px 8px;}"
+            f"QMenu{{background:{_mt['panel_bg']};color:{_mt['text']};border:1px solid {_mt['border']};}}"
+            f"QMenu::item{{padding:6px 18px;}}"
+            f"QMenu::item:selected{{background:{_mt['selection']};}}"
+            f"QMenu::separator{{height:1px;background:{_mt['border']};margin:4px 8px;}}"
         )
 
         act_log = menu.addAction("📊 ログビューアで開く (グリッドに追加)")
@@ -1843,17 +1847,18 @@ class SSHConnectDialog(QDialog):
         btns.addWidget(cancel)
         lay.addLayout(btns)
 
-        self.setStyleSheet("""
-            QDialog{background:#2b2b2b;}
-            QLabel{color:#a9b7c6;}
-            QLineEdit{background:#3a3a3a;color:#a9b7c6;border:1px solid #555;padding:1px 3px;}
-            QPushButton{background:#4a4a4a;color:#a9b7c6;border:none;padding:2px 8px;border-radius:2px;}
-            QPushButton:hover{background:#5a5a5a;}
-            QPushButton[primary='true']{background:#3a6e3a;color:#e0f0e0;border:1px solid #4a8e4a;font-weight:600;padding:3px 14px;}
-            QPushButton[primary='true']:hover{background:#4a8e4a;border:1px solid #5aa05a;}
-            QComboBox{background:#3a3a3a;color:#a9b7c6;border:1px solid #555;padding:1px 3px;}
-            QComboBox::drop-down{border:none;width:14px;}
-            QComboBox QAbstractItemView{background:#2b2b2b;color:#a9b7c6;selection-background-color:#214283;}
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog{{background:{t['bg']};}}
+            QLabel{{color:{t['text']};}}
+            QLineEdit{{background:{t['panel_bg']};color:{t['text']};border:1px solid {t['border']};padding:1px 3px;}}
+            QPushButton{{background:{t['control_bg']};color:{t['text']};border:none;padding:2px 8px;border-radius:2px;}}
+            QPushButton:hover{{background:{t['control_hover']};}}
+            QPushButton[primary='true']{{background:#3a6e3a;color:#e0f0e0;border:1px solid #4a8e4a;font-weight:600;padding:3px 14px;}}
+            QPushButton[primary='true']:hover{{background:#4a8e4a;border:1px solid #5aa05a;}}
+            QComboBox{{background:{t['control_bg']};color:{t['text']};border:1px solid {t['border']};padding:1px 3px;}}
+            QComboBox::drop-down{{border:none;width:14px;}}
+            QComboBox QAbstractItemView{{background:{t['panel_bg']};color:{t['text']};selection-background-color:{t['selection']};}}
         """)
 
     def _on_select(self, idx):
@@ -1993,7 +1998,7 @@ class ProfileManagerDialog(QDialog):
             QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
                           border:1px solid {t['border']}; font-size:12px; }}
             QListWidget::item {{ padding:4px 6px; }}
-            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QListWidget::item:selected {{ background:{t['selection']}; color:{t['text']}; }}
             QPushButton {{ background:{t['control_bg']}; color:{t['text']};
                           border:none; padding:4px 12px; border-radius:2px; }}
             QPushButton:hover {{ background:{t['control_hover']}; }}
@@ -2293,7 +2298,7 @@ class LogSelectionDialog(QDialog):
             QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
                           border:1px solid {t['border']}; font-family:Consolas; font-size:11px; }}
             QListWidget::item {{ padding:3px 6px; }}
-            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QListWidget::item:selected {{ background:{t['selection']}; color:{t['text']}; }}
             QPushButton {{ background:{t['control_bg']}; color:{t['text']};
                           border:none; padding:5px 14px; border-radius:2px; }}
             QPushButton:hover {{ background:{t['control_hover']}; }}
@@ -2459,7 +2464,7 @@ class AlertAnalysisDialog(QDialog):
             QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
                           border:1px solid {t['border']}; }}
             QListWidget::item {{ padding:3px 6px; }}
-            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QListWidget::item:selected {{ background:{t['selection']}; color:{t['text']}; }}
             QPushButton {{ background:{t['control_bg']}; color:{t['text']};
                           border:none; padding:5px 14px; border-radius:2px; }}
             QPushButton:hover {{ background:{t['control_hover']}; }}
@@ -2593,7 +2598,7 @@ class WorkspaceManagerDialog(QDialog):
             QListWidget {{ background:{t['panel_bg']}; color:{t['text']};
                           border:1px solid {t['border']}; font-size:12px; }}
             QListWidget::item {{ padding:4px 6px; }}
-            QListWidget::item:selected {{ background:{t['selection']}; }}
+            QListWidget::item:selected {{ background:{t['selection']}; color:{t['text']}; }}
             QPushButton {{ background:{t['control_bg']}; color:{t['text']};
                           border:none; padding:4px 12px; border-radius:2px; }}
             QPushButton:hover {{ background:{t['control_hover']}; }}
@@ -2665,79 +2670,18 @@ class SettingsDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
-        from PyQt6.QtWidgets import QSpinBox  # 既に import 済みだが明示
-
+        self.setMinimumWidth(420)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(4)
+        lay.setSpacing(6)
 
-        # フォントサイズグループ
-        lay.addWidget(self._section_label("フォントサイズ"))
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(2)
+        tabs = QTabWidget()
+        tabs.addTab(self._build_display_tab(), "表示")
+        tabs.addTab(self._build_migrate_tab(), "設定移行")
+        lay.addWidget(tabs)
 
-        self._spinners: dict[str, QSpinBox] = {}
-        rows = [
-            ("左サイドバー (DIRツリー):", 'tree_font_size',     7, 24),
-            ("ツールバー:",                'toolbar_font_size',  7, 24),
-            ("ログセル (本文):",           'log_font_size',      7, 24),
-            ("ターミナル:",                'terminal_font_size', 7, 24),
-        ]
-        for r, (label, key, lo, hi) in enumerate(rows):
-            grid.addWidget(QLabel(label), r, 0)
-            container, sp = self._make_spinner(key, lo, hi)
-            grid.addWidget(container, r, 1)
-            self._spinners[key] = sp
-        lay.addLayout(grid)
-
-        # テーマ
-        lay.addWidget(self._section_label("テーマ"))
-        theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel("プリセット:"))
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
-        cur_theme = SETTINGS.get('theme', 'Dark')
-        i = self.theme_combo.findText(cur_theme)
-        if i >= 0:
-            self.theme_combo.setCurrentIndex(i)
-        theme_row.addWidget(self.theme_combo, 1)
-        lay.addLayout(theme_row)
-
-        # 左パネル表示オプション
-        lay.addWidget(self._section_label("左パネル表示"))
-        self.cb_quick_jump = QCheckBox("クイックジャンプ (📋ログ / 🏠ホーム / 🗂/tmp) を表示")
-        self.cb_quick_jump.setChecked(bool(SETTINGS.get('show_quick_jump', True)))
-        lay.addWidget(self.cb_quick_jump)
-        self.cb_panel_hints = QCheckBox("説明ラベル (📁 表示中のフォルダ・⚡クイック…等) を表示")
-        self.cb_panel_hints.setChecked(bool(SETTINGS.get('show_panel_hints', True)))
-        lay.addWidget(self.cb_panel_hints)
-
-        # 設定移行 (PC移行用) — めったに使わないのでここに集約
-        lay.addWidget(self._section_label("設定移行 (PC移行・バックアップ)"))
-        migrate_help = QLabel(
-            "プロファイル / ワークスペース / 設定を JSON 1ファイルに出力・読込できます。\n"
-            "別 PC に環境を移したい時にお使いください。"
-        )
-        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
-        migrate_help.setWordWrap(True)
-        lay.addWidget(migrate_help)
-        migrate_row = QHBoxLayout()
-        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
-        self.export_btn.setToolTip("接続プロファイル / ワークスペース / UI設定を JSON に書き出す")
-        self.import_btn = QPushButton("📥 インポート (JSON読込)")
-        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
-        migrate_row.addWidget(self.export_btn)
-        migrate_row.addWidget(self.import_btn)
-        lay.addLayout(migrate_row)
-
-        lay.addStretch()
-
-        # ボタン
+        # ボタン (タブ外共通)
         btns = QHBoxLayout()
-        reset = QPushButton("デフォルトに戻す")
-        reset.clicked.connect(self._reset_defaults)
-        btns.addWidget(reset)
         btns.addStretch()
         ok = QPushButton("OK")
         ok.setDefault(True)
@@ -2753,6 +2697,13 @@ class SettingsDialog(QDialog):
             QDialog{{background:{t['bg']};}}
             QLabel{{color:{t['text']};}}
             QCheckBox{{color:{t['text']}; padding:2px;}}
+            QTabWidget::pane{{border:1px solid {t['border']};background:{t['panel_bg']};
+                             top:-1px;}}
+            QTabBar::tab{{background:{t['control_bg']};color:{t['text_dim']};
+                         padding:5px 14px;border:1px solid {t['border']};
+                         border-bottom:none;margin-right:2px;}}
+            QTabBar::tab:selected{{background:{t['panel_bg']};color:{t['text']};
+                                  border-bottom:1px solid {t['panel_bg']};}}
             QComboBox{{background:{t['control_bg']};color:{t['text']};
                       border:1px solid {t['border']};
                       padding:2px 4px;min-height:24px;}}
@@ -2763,6 +2714,87 @@ class SettingsDialog(QDialog):
             QPushButton:hover{{background:{t['control_hover']};}}
             QPushButton:default{{background:{t['selection']};color:{t['text']};}}
         """)
+
+    def _tab_page(self):
+        """タブページ用の (QWidget, QVBoxLayout) を作る共通ヘルパー。"""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(6)
+        return page, v
+
+    def _build_display_tab(self):
+        from PyQt6.QtWidgets import QSpinBox
+        page, v = self._tab_page()
+
+        v.addWidget(self._section_label("フォントサイズ"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        self._spinners: dict[str, QSpinBox] = {}
+        rows = [
+            ("左サイドバー (DIRツリー):", 'tree_font_size',     7, 24),
+            ("ツールバー:",                'toolbar_font_size',  7, 24),
+            ("ログセル (本文):",           'log_font_size',      7, 24),
+            ("ターミナル:",                'terminal_font_size', 7, 24),
+        ]
+        for r, (label, key, lo, hi) in enumerate(rows):
+            grid.addWidget(QLabel(label), r, 0)
+            container, sp = self._make_spinner(key, lo, hi)
+            grid.addWidget(container, r, 1)
+            self._spinners[key] = sp
+        v.addLayout(grid)
+
+        v.addWidget(self._section_label("テーマ"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("プリセット:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
+        cur_theme = SETTINGS.get('theme', 'Dark')
+        i = self.theme_combo.findText(cur_theme)
+        if i >= 0:
+            self.theme_combo.setCurrentIndex(i)
+        theme_row.addWidget(self.theme_combo, 1)
+        v.addLayout(theme_row)
+
+        v.addWidget(self._section_label("左パネル表示"))
+        self.cb_quick_jump = QCheckBox("クイックジャンプ (📋ログ / 🏠ホーム / 🗂/tmp) を表示")
+        self.cb_quick_jump.setChecked(bool(SETTINGS.get('show_quick_jump', True)))
+        v.addWidget(self.cb_quick_jump)
+        self.cb_panel_hints = QCheckBox("説明ラベル (📁 表示中のフォルダ・⚡クイック…等) を表示")
+        self.cb_panel_hints.setChecked(bool(SETTINGS.get('show_panel_hints', True)))
+        v.addWidget(self.cb_panel_hints)
+
+        v.addStretch()
+        # このタブ (フォント・テーマ・左パネル) のみをデフォルトに戻すボタン
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        reset = QPushButton("デフォルトに戻す")
+        reset.setToolTip("フォントサイズ・テーマ・左パネル表示を初期値に戻します")
+        reset.clicked.connect(self._reset_defaults)
+        reset_row.addWidget(reset)
+        v.addLayout(reset_row)
+        return page
+
+    def _build_migrate_tab(self):
+        page, v = self._tab_page()
+        migrate_help = QLabel(
+            "プロファイル / ワークスペース / 設定を JSON 1ファイルに出力・読込できます。\n"
+            "別 PC に環境を移したい時にお使いください。"
+        )
+        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
+        migrate_help.setWordWrap(True)
+        v.addWidget(migrate_help)
+        migrate_row = QHBoxLayout()
+        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
+        self.export_btn.setToolTip("接続プロファイル / ワークスペース / UI設定を JSON に書き出す")
+        self.import_btn = QPushButton("📥 インポート (JSON読込)")
+        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
+        migrate_row.addWidget(self.export_btn)
+        migrate_row.addWidget(self.import_btn)
+        v.addLayout(migrate_row)
+        v.addStretch()
+        return page
 
     @staticmethod
     def _section_label(text: str) -> QLabel:
@@ -3062,50 +3094,57 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------------------------ UI
 
+    def _apply_toolbar_style(self):
+        """ツールバーの自前スタイルをテーマから生成して適用 (テーマ変更で再適用)。"""
+        tb = getattr(self, '_toolbar', None)
+        if tb is None:
+            return
+        t = _theme()
+        tb.setStyleSheet(
+            f"QToolBar {{ background:{t['toolbar_bg']}; border:none; spacing:3px; padding:4px 6px; }}"
+            f"QToolBar::separator {{ background:{t['border']}; width:1px; margin:4px 6px; }}"
+            f"QToolBar QLabel {{ color:{t['text_dim']}; padding:0 4px; font-size:11px; }}"
+            f"QToolBar QPushButton, QToolBar QToolButton {{"
+            f"  background:{t['control_bg']}; color:{t['text']}; border:1px solid {t['border']};"
+            f"  padding:5px 10px; border-radius:4px; font-size:12px;"
+            f"}}"
+            f"QToolBar QPushButton:hover, QToolBar QToolButton:hover {{"
+            f"  background:{t['control_hover']}; border:1px solid {t['border']};"
+            f"}}"
+            f"QToolBar QPushButton:pressed, QToolBar QToolButton:pressed {{"
+            f"  background:{t['selection']}; border:1px solid {t['selection']};"
+            f"}}"
+            f"QToolBar QPushButton::menu-indicator,"
+            f"QToolBar QToolButton::menu-indicator {{ width:0px; image:none; }}"
+            f"QToolBar QPushButton[primary='true'] {{"
+            f"  background:#3a6e3a; color:#e0f0e0; border:1px solid #4a8e4a;"
+            f"}}"
+            f"QToolBar QPushButton[primary='true']:hover {{"
+            f"  background:#4a8e4a; border:1px solid #5aa05a;"
+            f"}}"
+            f"QToolBar QPushButton[danger='true'] {{"
+            f"  background:#c0392b; color:#ffffff; border:1px solid #e05545; font-weight:600;"
+            f"}}"
+            f"QToolBar QPushButton[danger='true']:hover {{"
+            f"  background:#e0432f; border:1px solid #ff6b5a;"
+            f"}}"
+            f"QToolBar QComboBox, QToolBar QLineEdit {{"
+            f"  background:{t['panel_bg']}; color:{t['text']}; border:1px solid {t['border']};"
+            f"  padding:3px 6px; border-radius:3px; font-size:12px;"
+            f"}}"
+            f"QToolBar QComboBox:focus, QToolBar QLineEdit:focus {{"
+            f"  border:1px solid {t['selection']};"
+            f"}}"
+        )
+
     def _setup_ui(self):
         # ── ツールバー (アイコン+ラベル統一スタイル) ──────────────────
         tb = QToolBar("ツールバー")
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
-        # 全てのセレクタを `QToolBar` 子要素として記述することで、
-        # グローバル QApplication スタイル (QToolBar QPushButton 等) と
-        # 同等以上の特異性を確保 (後勝ち)。
-        tb.setStyleSheet(
-            "QToolBar { background:#2a2a2a; border:none; spacing:3px; padding:4px 6px; }"
-            "QToolBar::separator { background:#444; width:1px; margin:4px 6px; }"
-            "QToolBar QLabel { color:#888; padding:0 4px; font-size:11px; }"
-            "QToolBar QPushButton, QToolBar QToolButton {"
-            "  background:#333; color:#d0d0d0; border:1px solid #444;"
-            "  padding:5px 10px; border-radius:4px; font-size:12px;"
-            "}"
-            "QToolBar QPushButton:hover, QToolBar QToolButton:hover {"
-            "  background:#3a3a3a; border:1px solid #666; color:#fff;"
-            "}"
-            "QToolBar QPushButton:pressed, QToolBar QToolButton:pressed {"
-            "  background:#2a4a8a; border:1px solid #4a8eff;"
-            "}"
-            "QToolBar QPushButton::menu-indicator,"
-            "QToolBar QToolButton::menu-indicator { width:0px; image:none; }"
-            "QToolBar QPushButton[primary='true'] {"
-            "  background:#3a6e3a; color:#e0f0e0; border:1px solid #4a8e4a;"
-            "}"
-            "QToolBar QPushButton[primary='true']:hover {"
-            "  background:#4a8e4a; border:1px solid #5aa05a;"
-            "}"
-            "QToolBar QPushButton[danger='true'] {"
-            "  background:#c0392b; color:#ffffff; border:1px solid #e05545; font-weight:600;"
-            "}"
-            "QToolBar QPushButton[danger='true']:hover {"
-            "  background:#e0432f; border:1px solid #ff6b5a;"
-            "}"
-            "QToolBar QComboBox, QToolBar QLineEdit {"
-            "  background:#1e1e1e; color:#e0e0e0; border:1px solid #555;"
-            "  padding:3px 6px; border-radius:3px; font-size:12px;"
-            "}"
-            "QToolBar QComboBox:focus, QToolBar QLineEdit:focus {"
-            "  border:1px solid #4a8eff;"
-            "}"
-        )
+        self._toolbar = tb
+        # ツールバー自前スタイル (テーマ変更時に _apply_theme から再適用される)
+        self._apply_toolbar_style()
         self.addToolBar(tb)
 
         # ── グリッド ──────────────────────────────────────────────────
@@ -3195,10 +3234,11 @@ class MainWindow(QMainWindow):
         ws_act_btn.setMenu(ws_menu)
         tb.addWidget(ws_act_btn)
 
-        # 右寄せ用スペーサー
-        spacer = QWidget()
-        spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
-        tb.addWidget(spacer)
+        # 右寄せ用スペーサー (背景をツールバー色に合わせて黒浮きを防ぐ / テーマ変更で更新)
+        self._tb_spacer = QWidget()
+        self._tb_spacer.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Preferred)
+        self._tb_spacer.setStyleSheet(f"background:{_theme()['toolbar_bg']};")
+        tb.addWidget(self._tb_spacer)
 
         # ── 解析・運用ツール (右寄せ) ─────────────────────────────────
         alert_btn = QPushButton("🚨 アラート調査")
@@ -4055,15 +4095,47 @@ class MainWindow(QMainWindow):
         )
 
     def _apply_all_settings(self):
-        """SETTINGS の変更を全 UI に反映する。"""
-        self._apply_theme()
+        """SETTINGS の変更を全 UI に反映する。
+        途中で1つ例外が出ても残りが必ず実行されるよう各処理を try で隔離する
+        (例外で止まるとツールバーだけ更新されグリッドが古いまま、になり得るため)。
+        """
+        try:
+            self._apply_theme()
+        except Exception:
+            pass
         for panel in self._panels:
-            panel.apply_settings()
+            try:
+                panel.apply_settings()
+            except Exception:
+                pass
         # 空セルとビューアの両方を更新
-        self.grid.apply_settings()
+        try:
+            self.grid.apply_settings()
+        except Exception:
+            pass
         for dlg in list(self._terminals):
             try:
                 dlg.apply_settings()
+            except Exception:
+                pass
+        # スタイルシートを再設定しても子ウィジェットが再描画されないことがあるため、
+        # 全ウィジェットを強制的に再ポリッシュしてライブ反映を確実にする。
+        try:
+            self._force_restyle()
+        except Exception:
+            pass
+
+    def _force_restyle(self):
+        """ウィジェットツリー全体のスタイルを再適用して即時再描画させる。"""
+        from PyQt6.QtWidgets import QWidget as _QW
+        widgets = self.findChildren(_QW)
+        widgets.append(self)
+        for w in widgets:
+            try:
+                st = w.style()
+                st.unpolish(w)
+                st.polish(w)
+                w.update()
             except Exception:
                 pass
 
@@ -4219,11 +4291,17 @@ class MainWindow(QMainWindow):
             QScrollBar::add-page:horizontal,
             QScrollBar::sub-page:horizontal {{ background:none; }}
         """)
+        # ツールバー自前スタイル (メインwindowのQToolBarルールを上書きしているため、
+        # ライブのテーマ変更ではここで明示的に再適用しないと更新されない)
+        self._apply_toolbar_style()
         # 「サーバー未接続」のラベル色も合わせる
         if hasattr(self, '_no_server_label') and self._no_server_label is not None:
             self._no_server_label.setStyleSheet(
                 f"color:{t['text_dim']}; padding:12px; font-size:11px;"
             )
+        # ツールバーの右寄せスペーサー (生成時固定色) もライブ更新
+        if hasattr(self, '_tb_spacer') and self._tb_spacer is not None:
+            self._tb_spacer.setStyleSheet(f"background:{t['toolbar_bg']};")
 
 
 # ---------------------------------------------------------------------------

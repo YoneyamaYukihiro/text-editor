@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.6"
+__version__ = "1.1.7"
 
 import sys
 import os
@@ -129,9 +129,11 @@ _THEME_PRESETS = {
 }
 
 _DEFAULT_SETTINGS = {
-    'editor_font_size': 11,
+    'editor_font_size': 15,   # px 指定 (旧 11pt ≈ 15px 相当)
     'ui_font_size':     10,
     'theme':            'Dark',
+    # ログ→ソースジャンプ用に登録するソースルートDIRの一覧 (再帰検索の起点)
+    'source_dirs':      [],
 }
 
 
@@ -152,8 +154,52 @@ def _save_settings(s: dict):
 SETTINGS: dict = _load_settings()
 
 
+# ---------------------------------------------------------------------------
+# ブックマークの永続化 ( {絶対パス: [行番号, ...]} を JSON 保存)
+# ---------------------------------------------------------------------------
+_BOOKMARKS_PATH = os.path.join(os.path.expanduser('~'), '.text_editor_bookmarks.json')
+
+
+def _load_bookmarks_store() -> dict:
+    try:
+        with open(_BOOKMARKS_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
+    except Exception:
+        return {}
+
+
+def _save_bookmarks_store(store: dict):
+    try:
+        with open(_BOOKMARKS_PATH, 'w', encoding='utf-8') as f:
+            json.dump(store, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def _theme() -> dict:
     return _THEME_PRESETS.get(SETTINGS.get('theme', 'Dark'), _THEME_PRESETS['Dark'])
+
+
+def _is_light_theme() -> bool:
+    """現在のテーマ背景が明るいか (輝度で判定)。"""
+    bg = _theme().get('bg', '#2b2b2b').lstrip('#')
+    try:
+        r, g, b = int(bg[0:2], 16), int(bg[2:4], 16), int(bg[4:6], 16)
+        return (0.299 * r + 0.587 * g + 0.114 * b) > 140
+    except Exception:
+        return False
+
+
+def _syntax_palette() -> dict:
+    """シンタックスハイライトのトークン配色をテーマ明暗に合わせて返す。
+    ダーク基調はそのまま、ライト基調では濃いめの高コントラスト色にする。
+    """
+    if _is_light_theme():
+        return {'keyword': '#0033B3', 'type': '#006A6A', 'function': '#795E26',
+                'number': '#0B6FC2', 'string': '#1A7F1A', 'comment': '#6A737D'}
+    return {'keyword': '#CC7832', 'type': '#4EC9B0', 'function': '#DCDCAA',
+            'number': '#6897BB', 'string': '#6A8759', 'comment': '#808080'}
 
 
 # ---------------------------------------------------------------------------
@@ -243,6 +289,7 @@ class LineNumberArea(QWidget):
 class CodeEditor(QPlainTextEdit):
     bookmark_toggled = pyqtSignal(int, bool)   # lineno, is_bookmarked
     sql_extract_requested = pyqtSignal()       # 選択範囲からSQL抽出 (右クリック)
+    source_open_requested = pyqtSignal()       # 選択範囲/現在行からソースを開く (右クリック)
 
     _GUTTER_W   = 7    # 変更バー幅(px) — 4 → 7 に拡大
     _BOOKMARK_W = 12   # ブックマーク列幅(px)
@@ -267,8 +314,9 @@ class CodeEditor(QPlainTextEdit):
         self._bookmarks: set[int] = set()
         self._search_selections: list = []
 
-        fs = SETTINGS.get('editor_font_size', 11)
-        font = QFont("Consolas", fs)
+        fs = SETTINGS.get('editor_font_size', 15)
+        font = QFont("Consolas")
+        font.setPixelSize(fs)   # px 指定 (設定ラベルの「px」と一致 / 段差を均一に)
         font.setFixedPitch(True)
         self.setFont(font)
         self.setTabStopDistance(4 * self.fontMetrics().horizontalAdvance(' '))
@@ -317,6 +365,16 @@ class CodeEditor(QPlainTextEdit):
         else:
             self._bookmarks.add(lineno)
             self.bookmark_toggled.emit(lineno, True)
+        self.line_number_area.update()
+
+    def add_bookmark(self, lineno: int):
+        """指定行にブックマークを追加 (既にあれば何もしない)。
+        ソースジャンプ等から自動でしおりを付けるのに使う。
+        """
+        if lineno < 1 or lineno in self._bookmarks:
+            return
+        self._bookmarks.add(lineno)
+        self.bookmark_toggled.emit(lineno, True)
         self.line_number_area.update()
 
     def goto_next_bookmark(self, forward: bool = True):
@@ -440,6 +498,12 @@ class CodeEditor(QPlainTextEdit):
         if not has_sel:
             a_sql.setToolTip("先にSQLを含むログ範囲を選択してください")
         a_sql.triggered.connect(self.sql_extract_requested.emit)
+
+        a_src = menu.addAction("ソースを開く (該当行へジャンプ)...")
+        a_src.setToolTip(
+            "選択範囲 (無ければ現在行) の Class#method():行 / スタックトレース等を解析し、\n"
+            "登録済みソース検索パスから該当ファイルを開いてその行へジャンプします")
+        a_src.triggered.connect(self.source_open_requested.emit)
 
         menu.exec(event.globalPos())
 
@@ -704,6 +768,98 @@ class SyntaxHighlighter(QSyntaxHighlighter):
             'block_comment': ('/*', '*/'),
             'kw_case_insensitive': True,
         },
+        'cpp': {
+            'keywords': [
+                'alignas', 'alignof', 'asm', 'auto', 'break', 'case', 'catch',
+                'class', 'concept', 'const', 'consteval', 'constexpr', 'constinit',
+                'const_cast', 'continue', 'decltype', 'default', 'delete', 'do',
+                'dynamic_cast', 'else', 'enum', 'explicit', 'export', 'extern',
+                'false', 'for', 'friend', 'goto', 'if', 'inline', 'mutable',
+                'namespace', 'new', 'noexcept', 'nullptr', 'operator', 'private',
+                'protected', 'public', 'register', 'reinterpret_cast', 'requires',
+                'return', 'sizeof', 'static', 'static_assert', 'static_cast',
+                'struct', 'switch', 'template', 'this', 'thread_local', 'throw',
+                'true', 'try', 'typedef', 'typeid', 'typename', 'union', 'using',
+                'virtual', 'volatile', 'while',
+            ],
+            'types': [
+                'bool', 'char', 'char8_t', 'char16_t', 'char32_t', 'double',
+                'float', 'int', 'long', 'short', 'signed', 'unsigned', 'void',
+                'wchar_t', 'size_t', 'ssize_t', 'int8_t', 'int16_t', 'int32_t',
+                'int64_t', 'uint8_t', 'uint16_t', 'uint32_t', 'uint64_t',
+                'string', 'wstring', 'vector', 'map', 'set', 'list', 'pair',
+            ],
+            'patterns': [
+                (r'^\s*#\s*\w+', '#9876AA'),   # プリプロセッサ (#include / #define 等)
+            ],
+            'strings': [r'"(?:[^"\\]|\\.)*"', r"'(?:[^'\\]|\\.)*'"],
+            'comment': r'//[^\n]*',
+            'block_comment': ('/*', '*/'),
+        },
+        'java': {
+            'keywords': [
+                'abstract', 'assert', 'break', 'case', 'catch', 'class', 'const',
+                'continue', 'default', 'do', 'else', 'enum', 'extends', 'final',
+                'finally', 'for', 'goto', 'if', 'implements', 'import',
+                'instanceof', 'interface', 'native', 'new', 'package', 'private',
+                'protected', 'public', 'return', 'static', 'strictfp', 'super',
+                'switch', 'synchronized', 'this', 'throw', 'throws', 'transient',
+                'try', 'volatile', 'while', 'true', 'false', 'null', 'var',
+                'record', 'sealed', 'yield', 'permits', 'non-sealed',
+            ],
+            'types': [
+                'boolean', 'byte', 'char', 'double', 'float', 'int', 'long',
+                'short', 'void', 'String', 'Integer', 'Long', 'Double', 'Float',
+                'Boolean', 'Byte', 'Short', 'Character', 'Object', 'List', 'Map',
+                'Set', 'Collection', 'Optional',
+            ],
+            'patterns': [
+                (r'@\w+', '#BBB529'),           # アノテーション (@Override 等)
+            ],
+            'strings': [r'"(?:[^"\\]|\\.)*"', r"'(?:[^'\\]|\\.)*'"],
+            'comment': r'//[^\n]*',
+            'block_comment': ('/*', '*/'),
+        },
+        'csharp': {
+            'keywords': [
+                'abstract', 'as', 'base', 'break', 'case', 'catch', 'checked',
+                'class', 'const', 'continue', 'default', 'delegate', 'do', 'else',
+                'enum', 'event', 'explicit', 'extern', 'false', 'finally', 'fixed',
+                'for', 'foreach', 'goto', 'if', 'implicit', 'in', 'interface',
+                'internal', 'is', 'lock', 'namespace', 'new', 'null', 'operator',
+                'out', 'override', 'params', 'private', 'protected', 'public',
+                'readonly', 'ref', 'return', 'sealed', 'sizeof', 'stackalloc',
+                'static', 'struct', 'switch', 'this', 'throw', 'true', 'try',
+                'typeof', 'unchecked', 'unsafe', 'using', 'virtual', 'volatile',
+                'while', 'var', 'async', 'await', 'yield', 'get', 'set', 'value',
+                'partial', 'where', 'nameof',
+            ],
+            'types': [
+                'bool', 'byte', 'sbyte', 'char', 'decimal', 'double', 'float',
+                'int', 'uint', 'long', 'ulong', 'short', 'ushort', 'object',
+                'string', 'void', 'dynamic', 'nint', 'nuint',
+                'String', 'Int32', 'Int64', 'Boolean', 'Object', 'List', 'Dictionary',
+            ],
+            'patterns': [
+                (r'^\s*#\s*\w+', '#9876AA'),   # #region / #if 等のディレクティブ
+                (r'\[[A-Za-z_]\w*(?:\([^)]*\))?\]', '#BBB529'),  # 属性 [Serializable] 等
+            ],
+            'strings': [r'@?"(?:[^"\\]|\\.)*"', r"'(?:[^'\\]|\\.)*'"],
+            'comment': r'//[^\n]*',
+            'block_comment': ('/*', '*/'),
+        },
+        'xml': {
+            # タグ・属性ベース (キーワードは持たない)
+            'patterns': [
+                (r'</?[A-Za-z_][\w:.\-]*', '#569CD6'),     # 開始/終了タグ名
+                (r'/?>', '#569CD6'),                        # 閉じ > / />
+                (r'[A-Za-z_][\w:.\-]*(?=\s*=)', '#9CDCFE'),  # 属性名
+                (r'&[A-Za-z#0-9]+;', '#D7BA7D'),            # エンティティ参照
+                (r'<[!?][\w\-]+', '#9876AA'),               # <?xml / <!DOCTYPE 等
+            ],
+            'strings': [r'"[^"]*"', r"'[^']*'"],
+            'block_comment': ('<!--', '-->'),
+        },
     }
 
     # ブロックコメント中を示すブロック状態値
@@ -757,7 +913,8 @@ class SyntaxHighlighter(QSyntaxHighlighter):
     def _build_rules(self):
         self._rules.clear()
         self._line_level_rules.clear()
-        self._comment_fmt = self._fmt('#808080', italic=True)
+        self._pal = _syntax_palette()   # テーマ明暗に応じたトークン配色
+        self._comment_fmt = self._fmt(self._pal['comment'], italic=True)
         self._block_comment_spec = None
 
         spec = self.LANG_RULES.get(self.language)
@@ -781,23 +938,28 @@ class SyntaxHighlighter(QSyntaxHighlighter):
         for pat_str, color in spec.get('inline', []):
             self._rules.append((QRegularExpression(pat_str), self._fmt(color)))
 
+        # --- 汎用パターン (プリプロセッサ / XMLタグ等) ---
+        # キーワード等より先に追加 → 後段の文字列・コメントで上書きされる
+        for pat_str, color in spec.get('patterns', []):
+            self._rules.append((QRegularExpression(pat_str), self._fmt(color)))
+
         # --- 通常言語ルール ---
         # 注: 後から append したルールが先のルールを上書きするため、
         #     優先度の低いもの (数値) から順に追加し、文字列・コメントを最後に置く。
         # キーワード（橙・太字）
-        kw_fmt = self._fmt('#CC7832', bold=True)
+        kw_fmt = self._fmt(self._pal['keyword'], bold=True)
         for kw in spec.get('keywords', []):
             pat = QRegularExpression(r'\b' + kw + r'\b', re_opts)
             self._rules.append((pat, kw_fmt))
 
         # データ型（水色）
-        type_fmt = self._fmt('#4EC9B0', bold=True)
+        type_fmt = self._fmt(self._pal['type'], bold=True)
         for t in spec.get('types', []):
             pat = QRegularExpression(r'\b' + t + r'\b', re_opts)
             self._rules.append((pat, type_fmt))
 
         # 組み込み関数（黄緑）
-        fn_fmt = self._fmt('#DCDCAA')
+        fn_fmt = self._fmt(self._pal['function'])
         for fn in spec.get('functions', []):
             pat = QRegularExpression(r'\b' + fn + r'\b', re_opts)
             self._rules.append((pat, fn_fmt))
@@ -805,10 +967,10 @@ class SyntaxHighlighter(QSyntaxHighlighter):
         # 数値（青）— ※先に追加して、後段の文字列ルールで上書きされるようにする
         # （文字列リテラル内 '#2b2b2b' の数字に青色が乗らないため）
         if 'line_levels' not in spec:
-            self._rules.append((QRegularExpression(r'\b\d+\.?\d*\b'), self._fmt('#6897BB')))
+            self._rules.append((QRegularExpression(r'\b\d+\.?\d*\b'), self._fmt(self._pal['number'])))
 
         # 文字列リテラル（緑）— 数値より後に追加 → 文字列が数値を上書き
-        str_fmt = self._fmt('#6A8759')
+        str_fmt = self._fmt(self._pal['string'])
         for pat in spec.get('strings', []):
             self._rules.append((QRegularExpression(pat), str_fmt))
 
@@ -846,16 +1008,17 @@ class SyntaxHighlighter(QSyntaxHighlighter):
 
     def _apply_sql_inline(self, text: str):
         """log 中の SQL 行に対し、SQL キーワード等を着色"""
-        kw_fmt = self._fmt('#CC7832', bold=True)
+        pal = getattr(self, '_pal', None) or _syntax_palette()
+        kw_fmt = self._fmt(pal['keyword'], bold=True)
         for m in self._SQL_KEYWORDS_RE.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), kw_fmt)
-        num_fmt = self._fmt('#6897BB')
+        num_fmt = self._fmt(pal['number'])
         for m in self._SQL_NUMBER_RE.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), num_fmt)
-        str_fmt = self._fmt('#6A8759')
+        str_fmt = self._fmt(pal['string'])
         for m in self._SQL_STRING_RE.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), str_fmt)
-        cm_fmt = self._fmt('#808080', italic=True)
+        cm_fmt = self._fmt(pal['comment'], italic=True)
         for m in self._SQL_COMMENT_RE.finditer(text):
             self.setFormat(m.start(), m.end() - m.start(), cm_fmt)
 
@@ -901,6 +1064,11 @@ class SyntaxHighlighter(QSyntaxHighlighter):
         self._build_rules()
         self.rehighlight()
 
+    def rebuild_theme(self):
+        """テーマ変更時に配色を作り直して再ハイライト。"""
+        self._build_rules()
+        self.rehighlight()
+
 
 # ---------------------------------------------------------------------------
 # インライン検索バー（エディタ下部に埋め込み）
@@ -935,21 +1103,6 @@ class InlineSearchBar(QWidget):
         layout.setContentsMargins(6, 3, 6, 3)
         layout.setSpacing(4)
 
-        # トグル系ボタン (Aa / .*) 共通スタイル — Grepパネルと統一
-        toggle_style = (
-            "QPushButton { background:#3a3a3a; color:#a9b7c6; border:1px solid #555;"
-            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
-            "QPushButton:checked { background:#2a4a8a; color:#fff; border:1px solid #4a8eff; }"
-            "QPushButton:hover { background:#4a4a4a; }"
-            "QPushButton:checked:hover { background:#3a5a9a; }"
-        )
-        # ナビ・履歴・操作系ボタン共通スタイル
-        btn_style = (
-            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
-            "              padding:2px 4px; border-radius:3px; }"
-            "QPushButton:hover { background:#4a4a4a; color:#fff; }"
-        )
-
         # --- 検索行 (🔍 [input] [📜] [▲] [▼] [matches]  [Aa] [.*]  ✕) ---
         layout.addWidget(QLabel("🔍"))
         self.search_input = QComboBox()
@@ -964,21 +1117,18 @@ class InlineSearchBar(QWidget):
         )
         layout.addWidget(self.search_input, 2)
 
-        search_hist_btn = QPushButton("📜")
-        search_hist_btn.setFixedWidth(26)
-        search_hist_btn.setToolTip("検索履歴を開く")
-        search_hist_btn.setStyleSheet(btn_style)
-        search_hist_btn.clicked.connect(self.search_input.showPopup)
-        layout.addWidget(search_hist_btn)
+        self.search_hist_btn = QPushButton("📜")
+        self.search_hist_btn.setFixedWidth(26)
+        self.search_hist_btn.setToolTip("検索履歴を開く")
+        self.search_hist_btn.clicked.connect(self.search_input.showPopup)
+        layout.addWidget(self.search_hist_btn)
 
         self.prev_btn = QPushButton("▲")
         self.prev_btn.setFixedWidth(26)
         self.prev_btn.setToolTip("前を検索 (Shift+Enter)")
-        self.prev_btn.setStyleSheet(btn_style)
         self.next_btn = QPushButton("▼")
         self.next_btn.setFixedWidth(26)
         self.next_btn.setToolTip("次を検索 (Enter)")
-        self.next_btn.setStyleSheet(btn_style)
         layout.addWidget(self.prev_btn)
         layout.addWidget(self.next_btn)
 
@@ -1008,22 +1158,15 @@ class InlineSearchBar(QWidget):
         self._replace_hist_btn = QPushButton("📜")
         self._replace_hist_btn.setFixedWidth(26)
         self._replace_hist_btn.setToolTip("置換履歴を開く")
-        self._replace_hist_btn.setStyleSheet(btn_style)
         self._replace_hist_btn.clicked.connect(self.replace_input.showPopup)
         layout.addWidget(self._replace_hist_btn)
 
         self.replace_btn = QPushButton("置換")
         self.replace_btn.setFixedWidth(48)
         self.replace_btn.setToolTip("現在のマッチを置換")
-        self.replace_btn.setStyleSheet(btn_style)
         self.replace_all_btn = QPushButton("全置換")
         self.replace_all_btn.setFixedWidth(56)
         self.replace_all_btn.setToolTip("全マッチを一括置換")
-        self.replace_all_btn.setStyleSheet(
-            "QPushButton { background:#3a6e3a; color:#e0f0e0; border:none;"
-            "              padding:3px 8px; border-radius:3px; font-weight:600; }"
-            "QPushButton:hover { background:#4a8e4a; }"
-        )
         layout.addWidget(self.replace_btn)
         layout.addWidget(self.replace_all_btn)
 
@@ -1042,40 +1185,24 @@ class InlineSearchBar(QWidget):
         self.case_check.setCheckable(True)
         self.case_check.setFixedWidth(34)
         self.case_check.setToolTip("大文字小文字を区別")
-        self.case_check.setStyleSheet(toggle_style)
         self.regex_check = QPushButton(".*")
         self.regex_check.setCheckable(True)
         self.regex_check.setFixedWidth(34)
         self.regex_check.setToolTip("正規表現として扱う")
-        self.regex_check.setStyleSheet(toggle_style)
         layout.addWidget(self.case_check)
         layout.addWidget(self.regex_check)
 
         layout.addStretch()
 
         # --- 閉じる ---
-        close_btn = QPushButton("✕")
-        close_btn.setFixedWidth(28)
-        close_btn.setToolTip("検索バーを閉じる (Esc)")
-        close_btn.setStyleSheet(
-            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
-            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
-            "QPushButton:hover { background:#7a3a3a; color:#fff; border:1px solid #a55; }"
-        )
-        layout.addWidget(close_btn)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedWidth(28)
+        self.close_btn.setToolTip("検索バーを閉じる (Esc)")
+        layout.addWidget(self.close_btn)
 
         self.setLayout(layout)
         # 全体スタイル (背景・コンボのみ)
-        self.setStyleSheet("""
-            QWidget   { background: #2d2d2d; }
-            QLabel    { color: #a9b7c6; }
-            QComboBox { background:#1e1e1e; color:#e0e0e0; border:1px solid #555;
-                        padding:2px 4px; border-radius:3px; }
-            QComboBox:focus { border:1px solid #4a8eff; }
-            QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6;
-                                          selection-background-color:#2a4a8a; }
-        """)
-        self.setMaximumHeight(36)
+        self._apply_style()
 
         # デバウンスタイマー: タイプ後 N ms 経過してから検索実行
         self._debounce_timer = QTimer(self)
@@ -1094,7 +1221,61 @@ class InlineSearchBar(QWidget):
         self.prev_btn.clicked.connect(self.find_prev)
         self.replace_btn.clicked.connect(self.replace_current)
         self.replace_all_btn.clicked.connect(self.replace_all)
-        close_btn.clicked.connect(self.close_bar)
+        self.close_btn.clicked.connect(self.close_bar)
+
+    def _apply_style(self):
+        """検索バーのスタイルをテーマ + UIフォントサイズ連動で適用。"""
+        fs = SETTINGS.get('ui_font_size', 10)
+        t = _theme()
+        self.setStyleSheet(f"""
+            QWidget   {{ background: {t['toolbar_bg']}; }}
+            QLabel    {{ color: {t['text']}; }}
+            QComboBox {{ background:{t['panel_bg']}; color:{t['text']};
+                        border:1px solid {t['border']};
+                        padding:2px 4px; border-radius:3px; font-size:{fs}px; }}
+            QComboBox:focus {{ border:1px solid {t['selection']}; }}
+            QComboBox QAbstractItemView {{ background:{t['panel_bg']}; color:{t['text']};
+                                          selection-background-color:{t['selection']}; }}
+        """)
+        # ボタン群をテーマ連動で再スタイル
+        btn_style = (
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; }}"
+            f"QPushButton:hover {{ background:{t['control_hover']}; }}"
+        )
+        toggle_style = (
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:{t['control_hover']}; }}"
+            f"QPushButton:checked {{ background:{t['selection']}; color:{t['text']};"
+            f"              border:1px solid {t['selection']}; }}"
+        )
+        close_style = (
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:#c0392b; color:#fff; border:1px solid #e05545; }}"
+        )
+        green_style = (
+            "QPushButton { background:#3a6e3a; color:#e0f0e0; border:none;"
+            "              padding:3px 8px; border-radius:3px; font-weight:600; }"
+            "QPushButton:hover { background:#4a8e4a; }"
+        )
+        for b in (self.search_hist_btn, self.prev_btn, self.next_btn,
+                  self._replace_hist_btn, self.replace_btn):
+            b.setStyleSheet(btn_style)
+        self.replace_all_btn.setStyleSheet(green_style)
+        self.case_check.setStyleSheet(toggle_style)
+        self.regex_check.setStyleSheet(toggle_style)
+        self.close_btn.setStyleSheet(close_style)
+        # フォントが大きい時に入力欄が潰れないよう高さ上限も連動
+        self.setMaximumHeight(max(36, fs + 22))
+
+    def apply_ui_settings(self):
+        """UIフォントサイズ等の設定変更を反映 (MainWindow から呼ばれる)。"""
+        self._apply_style()
 
     def _on_input_changed(self, text):
         """入力中はタイマー再起動。ドキュメントサイズに応じて遅延を調整。"""
@@ -1879,7 +2060,6 @@ class FTPPanel(QWidget):
         layout.setSpacing(2)
 
         self.status_label = QLabel("未接続")
-        self.status_label.setStyleSheet("color: #808080; padding: 2px;")
         layout.addWidget(self.status_label)
 
         btns = QHBoxLayout()
@@ -1891,8 +2071,8 @@ class FTPPanel(QWidget):
         layout.addLayout(btns)
 
         self.path_label = QLabel("/")
-        self.path_label.setStyleSheet("padding: 3px; background: #3a3a3a; color: #a9b7c6;")
         layout.addWidget(self.path_label)
+        self.apply_theme()
 
         self.file_list = QListWidget()
         # 複数選択を有効化 (Ctrl/Shift クリックで複数選択 → 一括ダウンロード可)
@@ -1918,6 +2098,17 @@ class FTPPanel(QWidget):
         self.file_list.itemDoubleClicked.connect(self._on_double_click)
         self.file_list.itemSelectionChanged.connect(self._on_selection)
         self.open_btn.clicked.connect(self._open_selected)
+
+    def apply_theme(self):
+        """パス欄・状態ラベルをテーマ連動で再スタイル。"""
+        t = _theme()
+        if hasattr(self, 'path_label'):
+            self.path_label.setStyleSheet(
+                f"padding:3px; background:{t['control_bg']}; color:{t['text']};"
+            )
+        # 未接続時のみ状態ラベルを既定色に (接続中は接続処理側で色を上書き)
+        if hasattr(self, 'status_label') and self.ftp is None:
+            self.status_label.setStyleSheet(f"color:{t['text_dim']}; padding:2px;")
 
     # --- FTP operations ---
 
@@ -2353,6 +2544,7 @@ class FTPPanel(QWidget):
 class BookmarkPanel(QWidget):
     jump_requested = pyqtSignal(object, int)  # EditorTab, lineno
     close_requested = pyqtSignal()
+    bookmarks_cleared = pyqtSignal()          # 全削除後に発火 (永続化更新用)
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2372,30 +2564,39 @@ class BookmarkPanel(QWidget):
         clear_btn = QPushButton("全削除")
         clear_btn.setMaximumWidth(60)
         clear_btn.clicked.connect(self._clear_all)
-        # 閉じるボタン (Grep パネルと同スタイル)
-        close_btn = QPushButton("✕")
-        close_btn.setFixedWidth(28)
-        close_btn.setToolTip("ブックマーク一覧を閉じる (Esc)")
-        close_btn.setStyleSheet(
-            "QPushButton { background:#3a3a3a; color:#c0c0c0; border:1px solid #555;"
-            "              padding:2px 4px; border-radius:3px; font-weight:600; }"
-            "QPushButton:hover { background:#7a3a3a; color:#fff; border:1px solid #a55; }"
-        )
-        close_btn.clicked.connect(self.close_requested.emit)
+        # 閉じるボタン (テーマ連動)
+        self.close_btn = QPushButton("✕")
+        self.close_btn.setFixedWidth(28)
+        self.close_btn.setToolTip("ブックマーク一覧を閉じる (Esc)")
+        self.close_btn.clicked.connect(self.close_requested.emit)
         header.addStretch()
         header.addWidget(refresh_btn)
         header.addWidget(clear_btn)
-        header.addWidget(close_btn)
+        header.addWidget(self.close_btn)
         layout.addLayout(header)
+        self.apply_theme()
 
         self.list_widget = QListWidget()
         self.list_widget.itemDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.list_widget)
 
         hint = QLabel("ダブルクリックでジャンプ  /  F2：登録/解除  /  F3：次へ  /  Shift+F3：前へ")
-        hint.setStyleSheet("color: #606060; font-size: 10px;")
+        hint.setStyleSheet("color: #a0a6ad; font-size: 11px;")
+        hint.setWordWrap(True)   # 右サイドバーは幅が狭いので折り返す
         layout.addWidget(hint)
         self.setLayout(layout)
+
+    def apply_theme(self):
+        """閉じる(×)ボタンをテーマ連動で再スタイル (ホバーは赤=閉じる/削除色)。"""
+        if not hasattr(self, 'close_btn'):
+            return
+        t = _theme()
+        self.close_btn.setStyleSheet(
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:#c0392b; color:#fff; border:1px solid #e05545; }}"
+        )
 
     def keyPressEvent(self, event):
         # Esc キーで閉じる
@@ -2412,7 +2613,16 @@ class BookmarkPanel(QWidget):
         self.list_widget.clear()
         for label, tab in self._tab_refs:
             editor = tab.editor
-            for lineno in sorted(editor._bookmarks):
+            linenos = sorted(editor._bookmarks)
+            if not linenos:
+                continue
+            # このタブ (ファイル) のヘッダーを1回だけ挿入
+            header_item = QListWidgetItem(f"📄 {label}")
+            header_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            header_item.setForeground(QColor("#6897BB"))
+            self.list_widget.addItem(header_item)
+
+            for lineno in linenos:
                 block = editor.document().findBlockByNumber(lineno - 1)
                 full_text = block.text().strip() if block.isValid() else ''
                 # プレビューは長め (200文字) + 超過時は省略記号
@@ -2430,34 +2640,14 @@ class BookmarkPanel(QWidget):
                     item.setForeground(QColor("#E8B26A"))
                 else:
                     item.setForeground(QColor("#4A9EFF"))
-
-                # ファイル名ヘッダーを初回だけ挿入
-                if not self.list_widget.count() or \
-                        self.list_widget.item(self.list_widget.count() - 1).data(
-                            Qt.ItemDataRole.UserRole + 1) != label:
-                    header_item = QListWidgetItem(f"📄 {label}")
-                    header_item.setFlags(Qt.ItemFlag.NoItemFlags)
-                    header_item.setForeground(QColor("#6897BB"))
-                    header_item.setData(Qt.ItemDataRole.UserRole + 1, label)
-                    self.list_widget.addItem(header_item)
-                    item.setData(Qt.ItemDataRole.UserRole + 1, label)
-
                 self.list_widget.addItem(item)
 
-        # ブックマークが1つも無い場合は使い方ヒントを表示
+        # ブックマークが1つも無い場合は最小限の表示のみ (操作説明は下部の凡例にある)
         if self.list_widget.count() == 0:
-            for msg in [
-                "ブックマークはまだありません。",
-                "",
-                "📌 登録/解除: エディタで行にカーソルを置いて F2",
-                "▶ 次へ: F3  /  ◀ 前へ: Shift+F3",
-                "↩ ジャンプ: 一覧をダブルクリック",
-                "🔖 ガター (左端) の青い◆が登録行の目印",
-            ]:
-                hint_item = QListWidgetItem(msg)
-                hint_item.setFlags(Qt.ItemFlag.NoItemFlags)
-                hint_item.setForeground(QColor("#808080"))
-                self.list_widget.addItem(hint_item)
+            empty_item = QListWidgetItem("ブックマークはまだありません。")
+            empty_item.setFlags(Qt.ItemFlag.NoItemFlags)
+            empty_item.setForeground(QColor("#808080"))
+            self.list_widget.addItem(empty_item)
 
     def _on_double_click(self, item):
         data = item.data(Qt.ItemDataRole.UserRole)
@@ -2469,6 +2659,7 @@ class BookmarkPanel(QWidget):
             tab.editor._bookmarks.clear()
             tab.editor.line_number_area.update()
         self._refresh()
+        self.bookmarks_cleared.emit()
 
 
 # ---------------------------------------------------------------------------
@@ -2778,6 +2969,28 @@ class GrepPanel(QWidget):
         self.pattern_input.returnPressed.connect(self.start_search)
         self.close_btn.clicked.connect(self.close_requested.emit)
 
+        self.apply_theme()
+
+    def apply_theme(self):
+        """ボタン類をテーマ連動で再スタイル (検索ボタンの緑は維持)。"""
+        t = _theme()
+        toggle_style = (
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:{t['control_hover']}; }}"
+            f"QPushButton:checked {{ background:{t['selection']}; color:{t['text']};"
+            f"              border:1px solid {t['selection']}; }}"
+        )
+        self.case_check.setStyleSheet(toggle_style)
+        self.regex_check.setStyleSheet(toggle_style)
+        self.close_btn.setStyleSheet(
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
+            f"              border:1px solid {t['border']};"
+            f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
+            f"QPushButton:hover {{ background:#c0392b; color:#fff; border:1px solid #e05545; }}"
+        )
+
     def keyPressEvent(self, event):
         # Esc キーで Grep パネルを閉じる
         if event.key() == Qt.Key.Key_Escape:
@@ -2937,10 +3150,22 @@ LANG_MAP = {
     '.pls': 'sql', '.plsql': 'sql', '.pck': 'sql',
     '.prc': 'sql', '.fnc': 'sql', '.tps': 'sql', '.tpb': 'sql',
     '.log': 'log', '.LOG': 'log',
+    # C / C++
+    '.c': 'cpp', '.cpp': 'cpp', '.cc': 'cpp', '.cxx': 'cpp',
+    '.h': 'cpp', '.hpp': 'cpp', '.hh': 'cpp', '.hxx': 'cpp', '.ino': 'cpp',
+    # Java
+    '.java': 'java',
+    # C#
+    '.cs': 'csharp',
+    # XML / HTML
+    '.xml': 'xml', '.html': 'xml', '.htm': 'xml', '.xhtml': 'xml',
+    '.xsl': 'xml', '.xslt': 'xml', '.xsd': 'xml', '.svg': 'xml',
+    '.csproj': 'xml', '.pom': 'xml',
 }
 
 # 表示用 (UI のコンボ等で使う)
-SUPPORTED_LANGUAGES = ['text', 'python', 'javascript', 'sql', 'log']
+SUPPORTED_LANGUAGES = ['text', 'python', 'javascript', 'sql', 'log',
+                       'cpp', 'java', 'csharp', 'xml']
 
 
 def detect_language(filename: str) -> str:
@@ -3024,14 +3249,21 @@ class EditorTab(QWidget):
 
     def apply_settings(self):
         """テーマ・フォントサイズ変更を反映"""
-        fs = SETTINGS.get('editor_font_size', 11)
-        font = QFont("Consolas", fs)
+        fs = SETTINGS.get('editor_font_size', 15)
+        font = QFont("Consolas")
+        font.setPixelSize(fs)   # px 指定 (設定ラベルの「px」と一致 / 段差を均一に)
         font.setFixedPitch(True)
         self.editor.setFont(font)
         self.editor.setTabStopDistance(
             4 * self.editor.fontMetrics().horizontalAdvance(' ')
         )
         self._apply_editor_style()
+        # テーマ変更に合わせてシンタックス配色も作り直す
+        if hasattr(self, 'highlighter') and hasattr(self.highlighter, 'rebuild_theme'):
+            self.highlighter.rebuild_theme()
+        # 検索バーにも UI フォントサイズを反映
+        if hasattr(self, 'search_bar'):
+            self.search_bar.apply_ui_settings()
         # 行番号エリアを再描画 (ガター色も theme 連動にしたい場合は CodeEditor を修正)
         self.editor.line_number_area.update()
 
@@ -3061,6 +3293,107 @@ class EditorTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# ソース参照の候補選択ダイアログ (ログ→ソースジャンプ)
+# ---------------------------------------------------------------------------
+
+class SourceRefPickerDialog(QDialog):
+    """複数のソース参照 / 候補ファイルから1つを選んで開くためのダイアログ。
+    entries: [{'ref': 参照dict, 'paths': [絶対パス, ...]}]
+    選択結果は chosen() で (path, ref) を返す (キャンセル時 None)。
+    """
+    def __init__(self, entries: list[dict], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("ソースを開く — 候補選択")
+        self.setMinimumWidth(560)
+        self._results: list = []   # 開く対象の (path, ref) リスト
+
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("開くソースファイルを選択してください (「全て開く」で全候補をタブで開く):"))
+
+        self.list = QListWidget()
+        for e in entries:
+            ref = e['ref']
+            line = int(ref.get('line') or 0)
+            loc = f":{line}" if line > 0 else f"  ({ref.get('method','')} を検索)"
+            paths = e.get('paths') or []
+            if not paths:
+                it = QListWidgetItem(f"{ref['raw']}    →  (見つかりません)")
+                it.setForeground(QColor("#c0392b"))
+                it.setFlags(it.flags() & ~Qt.ItemFlag.ItemIsSelectable
+                            & ~Qt.ItemFlag.ItemIsEnabled)
+                self.list.addItem(it)
+                continue
+            for p in paths:
+                it = QListWidgetItem(f"{ref['raw']}  →  {p}{loc}")
+                it.setData(Qt.ItemDataRole.UserRole, (p, ref))
+                it.setToolTip(p)
+                self.list.addItem(it)
+        # 最初の選択可能項目を選んでおく
+        for i in range(self.list.count()):
+            if self.list.item(i).flags() & Qt.ItemFlag.ItemIsSelectable:
+                self.list.setCurrentRow(i)
+                break
+        self.list.itemDoubleClicked.connect(lambda _it: self._accept_current())
+        lay.addWidget(self.list)
+
+        btns = QHBoxLayout()
+        green = (
+            "QPushButton{background:#3a6e3a;color:#e0f0e0;border:1px solid #4a8e4a;"
+            "font-weight:600;padding:3px 14px;border-radius:2px;}"
+            "QPushButton:hover{background:#4a8e4a;border:1px solid #5aa05a;}"
+        )
+        ok = QPushButton("開く")
+        ok.setDefault(True)
+        ok.setStyleSheet(green)
+        self.open_all_btn = QPushButton("全て開く")
+        self.open_all_btn.setToolTip("見つかった候補をすべてタブで開きます")
+        cancel = QPushButton("キャンセル")
+        ok.clicked.connect(self._accept_current)
+        self.open_all_btn.clicked.connect(self._accept_all)
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(self.open_all_btn)
+        btns.addStretch(1)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+    def _all_targets(self) -> list:
+        """選択可能な全項目の (path, ref) を返す。"""
+        out = []
+        for i in range(self.list.count()):
+            it = self.list.item(i)
+            data = it.data(Qt.ItemDataRole.UserRole)
+            if data:
+                out.append(data)
+        return out
+
+    def _accept_current(self):
+        it = self.list.currentItem()
+        if it is None:
+            return
+        data = it.data(Qt.ItemDataRole.UserRole)
+        if not data:
+            return
+        self._results = [data]
+        self.accept()
+
+    def _accept_all(self):
+        targets = self._all_targets()
+        if not targets:
+            return
+        self._results = targets
+        self.accept()
+
+    def results(self) -> list:
+        """開く対象の (path, ref) リスト (キャンセル時は空)。"""
+        return self._results
+
+    def chosen(self):
+        """後方互換: 先頭の (path, ref) を返す (無ければ None)。"""
+        return self._results[0] if self._results else None
+
+
+# ---------------------------------------------------------------------------
 # 設定ダイアログ
 # ---------------------------------------------------------------------------
 
@@ -3074,63 +3407,18 @@ class SettingsDialog(QDialog):
         self._build_ui()
 
     def _build_ui(self):
+        self.setMinimumWidth(420)
         lay = QVBoxLayout(self)
         lay.setContentsMargins(8, 8, 8, 8)
-        lay.setSpacing(4)
+        lay.setSpacing(6)
 
-        lay.addWidget(self._section_label("フォントサイズ"))
-        grid = QGridLayout()
-        grid.setHorizontalSpacing(8)
-        grid.setVerticalSpacing(2)
-
-        self._spinners: dict[str, QSpinBox] = {}
-        rows = [
-            ("エディタ本文:", 'editor_font_size', 8, 28),
-            ("UI (パネル等):", 'ui_font_size',    8, 20),
-        ]
-        for r, (label, key, lo, hi) in enumerate(rows):
-            grid.addWidget(QLabel(label), r, 0)
-            container, sp = self._make_spinner(key, lo, hi)
-            grid.addWidget(container, r, 1)
-            self._spinners[key] = sp
-        lay.addLayout(grid)
-
-        lay.addWidget(self._section_label("テーマ"))
-        theme_row = QHBoxLayout()
-        theme_row.addWidget(QLabel("プリセット:"))
-        self.theme_combo = QComboBox()
-        self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
-        cur_theme = SETTINGS.get('theme', 'Dark')
-        i = self.theme_combo.findText(cur_theme)
-        if i >= 0:
-            self.theme_combo.setCurrentIndex(i)
-        theme_row.addWidget(self.theme_combo, 1)
-        lay.addLayout(theme_row)
-
-        # 設定移行 (PC移行用) — めったに使わないのでここに集約
-        lay.addWidget(self._section_label("設定移行 (PC移行・バックアップ)"))
-        migrate_help = QLabel(
-            "FTPプロファイル / UI設定 / 検索履歴 を JSON 1ファイルに出力・読込できます。\n"
-            "別 PC に環境を移したい時にお使いください。"
-        )
-        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
-        migrate_help.setWordWrap(True)
-        lay.addWidget(migrate_help)
-        migrate_row = QHBoxLayout()
-        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
-        self.export_btn.setToolTip("FTPプロファイル / UI設定 / 検索履歴 を JSON に書き出す")
-        self.import_btn = QPushButton("📥 インポート (JSON読込)")
-        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
-        migrate_row.addWidget(self.export_btn)
-        migrate_row.addWidget(self.import_btn)
-        lay.addLayout(migrate_row)
-
-        lay.addStretch()
+        tabs = QTabWidget()
+        tabs.addTab(self._build_display_tab(), "表示")
+        tabs.addTab(self._build_source_tab(), "ソース検索パス")
+        tabs.addTab(self._build_migrate_tab(), "設定移行")
+        lay.addWidget(tabs)
 
         btns = QHBoxLayout()
-        reset = QPushButton("デフォルトに戻す")
-        reset.clicked.connect(self._reset_defaults)
-        btns.addWidget(reset)
         btns.addStretch()
         ok = QPushButton("OK")
         ok.setDefault(True)
@@ -3145,15 +3433,116 @@ class SettingsDialog(QDialog):
         self.setStyleSheet(f"""
             QDialog{{background:{t['bg']};}}
             QLabel{{color:{t['text']};}}
+            QTabWidget::pane{{border:1px solid {t['border']};background:{t['panel_bg']};
+                             top:-1px;}}
+            QTabBar::tab{{background:{t['control_bg']};color:{t['text_dim']};
+                         padding:5px 14px;border:1px solid {t['border']};
+                         border-bottom:none;margin-right:2px;}}
+            QTabBar::tab:selected{{background:{t['panel_bg']};color:{t['text']};
+                                  border-bottom:1px solid {t['panel_bg']};}}
             QComboBox{{background:{t['control_bg']};color:{t['text']};
                       border:1px solid {t['border']};padding:2px 4px;min-height:24px;}}
             QComboBox QAbstractItemView{{background:{t['panel_bg']};color:{t['text']};
                                         selection-background-color:{t['selection']};}}
+            QListWidget{{background:{t['panel_bg']};color:{t['text']};
+                        border:1px solid {t['border']};}}
             QPushButton{{background:{t['control_bg']};color:{t['text']};border:none;
                         padding:4px 12px;border-radius:2px;}}
             QPushButton:hover{{background:{t['control_hover']};}}
             QPushButton:default{{background:{t['selection']};color:{t['text']};}}
         """)
+
+    def _tab_page(self) -> tuple:
+        """タブページ用の (QWidget, QVBoxLayout) を作る共通ヘルパー。"""
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(6)
+        return page, v
+
+    def _build_display_tab(self) -> QWidget:
+        page, v = self._tab_page()
+        v.addWidget(self._section_label("フォントサイズ"))
+        grid = QGridLayout()
+        grid.setHorizontalSpacing(8)
+        grid.setVerticalSpacing(2)
+        self._spinners: dict[str, QSpinBox] = {}
+        rows = [
+            ("エディタ本文:", 'editor_font_size', 8, 28),
+            ("UI (パネル等):", 'ui_font_size',    8, 20),
+        ]
+        for r, (label, key, lo, hi) in enumerate(rows):
+            grid.addWidget(QLabel(label), r, 0)
+            container, sp = self._make_spinner(key, lo, hi)
+            grid.addWidget(container, r, 1)
+            self._spinners[key] = sp
+        v.addLayout(grid)
+
+        v.addWidget(self._section_label("テーマ"))
+        theme_row = QHBoxLayout()
+        theme_row.addWidget(QLabel("プリセット:"))
+        self.theme_combo = QComboBox()
+        self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
+        cur_theme = SETTINGS.get('theme', 'Dark')
+        i = self.theme_combo.findText(cur_theme)
+        if i >= 0:
+            self.theme_combo.setCurrentIndex(i)
+        theme_row.addWidget(self.theme_combo, 1)
+        v.addLayout(theme_row)
+        v.addStretch()
+        # このタブ (フォント・テーマ) のみをデフォルトに戻すボタン
+        reset_row = QHBoxLayout()
+        reset_row.addStretch()
+        reset = QPushButton("デフォルトに戻す")
+        reset.setToolTip("フォントサイズとテーマを初期値に戻します (ソース検索パス等には影響しません)")
+        reset.clicked.connect(self._reset_defaults)
+        reset_row.addWidget(reset)
+        v.addLayout(reset_row)
+        return page
+
+    def _build_source_tab(self) -> QWidget:
+        page, v = self._tab_page()
+        src_help = QLabel(
+            "ここに登録したフォルダを再帰検索し、ログの Class#method():行 や\n"
+            "スタックトレースから該当ソースを開きます (右クリック → ソースを開く)。"
+        )
+        src_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
+        src_help.setWordWrap(True)
+        v.addWidget(src_help)
+        self.source_list = QListWidget()
+        for d in (SETTINGS.get('source_dirs') or []):
+            self.source_list.addItem(d)
+        v.addWidget(self.source_list, 1)
+        src_btns = QHBoxLayout()
+        self.add_src_btn = QPushButton("＋ 追加")
+        self.del_src_btn = QPushButton("－ 削除")
+        self.add_src_btn.clicked.connect(self._add_source_dir)
+        self.del_src_btn.clicked.connect(self._remove_source_dir)
+        src_btns.addWidget(self.add_src_btn)
+        src_btns.addWidget(self.del_src_btn)
+        src_btns.addStretch()
+        v.addLayout(src_btns)
+        return page
+
+    def _build_migrate_tab(self) -> QWidget:
+        page, v = self._tab_page()
+        migrate_help = QLabel(
+            "FTPプロファイル / UI設定 / 検索履歴 を JSON 1ファイルに出力・読込できます。\n"
+            "別 PC に環境を移したい時にお使いください。"
+        )
+        migrate_help.setStyleSheet("color:#888; font-size:10px; padding:2px 4px;")
+        migrate_help.setWordWrap(True)
+        v.addWidget(migrate_help)
+        migrate_row = QHBoxLayout()
+        self.export_btn = QPushButton("📤 エクスポート (JSON保存)")
+        self.export_btn.setToolTip("FTPプロファイル / UI設定 / 検索履歴 を JSON に書き出す")
+        self.import_btn = QPushButton("📥 インポート (JSON読込)")
+        self.import_btn.setToolTip("別 PC からエクスポートした JSON を取り込む (マージ/置換選択)")
+        migrate_row.addWidget(self.export_btn)
+        migrate_row.addWidget(self.import_btn)
+        v.addLayout(migrate_row)
+        v.addStretch()
+        return page
 
     @staticmethod
     def _section_label(text: str) -> QLabel:
@@ -3218,10 +3607,28 @@ class SettingsDialog(QDialog):
         if i >= 0:
             self.theme_combo.setCurrentIndex(i)
 
+    def _add_source_dir(self):
+        d = QFileDialog.getExistingDirectory(self, "ソース検索パスを追加")
+        if not d:
+            return
+        # 重複は追加しない
+        existing = {self.source_list.item(i).text()
+                    for i in range(self.source_list.count())}
+        if d not in existing:
+            self.source_list.addItem(d)
+
+    def _remove_source_dir(self):
+        for it in self.source_list.selectedItems():
+            self.source_list.takeItem(self.source_list.row(it))
+
     def accept(self):
         for k, sp in self._spinners.items():
             SETTINGS[k] = sp.value()
         SETTINGS['theme'] = self.theme_combo.currentText()
+        SETTINGS['source_dirs'] = [
+            self.source_list.item(i).text()
+            for i in range(self.source_list.count())
+        ]
         try:
             _save_settings(SETTINGS)
         except Exception as e:
@@ -3289,12 +3696,12 @@ class MainWindow(QMainWindow):
         self.bookmark_panel = BookmarkPanel()
         self.bookmark_panel.jump_requested.connect(self._jump_to_bookmark)
         self.bookmark_panel.close_requested.connect(self._hide_bookmark_panel)
+        self.bookmark_panel.bookmarks_cleared.connect(self._persist_all_bookmarks)
         self.bookmark_panel.hide()
 
-        # 下部エリアを横スプリッターで Grep | Bookmark に分割
+        # 下部エリア (Grep 専用) — ブックマークは右サイドバーへ移動
         self.bottom_splitter = QSplitter(Qt.Orientation.Horizontal)
         self.bottom_splitter.addWidget(self.grep_panel)
-        self.bottom_splitter.addWidget(self.bookmark_panel)
         self.bottom_splitter.hide()
 
         self.v_splitter.addWidget(self.tabs)
@@ -3302,9 +3709,15 @@ class MainWindow(QMainWindow):
         self.v_splitter.setStretchFactor(0, 3)
         self.v_splitter.setStretchFactor(1, 1)
 
+        # ブックマークパネルは右サイドバー (縦長でリスト表示に向く)
+        self.bookmark_panel.setMinimumWidth(240)
+
         self.splitter.addWidget(self.ftp_panel)
         self.splitter.addWidget(self.v_splitter)
-        self.splitter.setStretchFactor(1, 1)
+        self.splitter.addWidget(self.bookmark_panel)
+        self.splitter.setStretchFactor(0, 0)   # FTP: 固定気味
+        self.splitter.setStretchFactor(1, 1)   # 中央(エディタ): 伸縮
+        self.splitter.setStretchFactor(2, 0)   # ブックマーク: 固定気味
         self.setCentralWidget(self.splitter)
 
         # クイックアクセスツールバー (アイコンで主要機能を素早く起動)
@@ -3323,6 +3736,27 @@ class MainWindow(QMainWindow):
         sb.addPermanentWidget(self.lang_combo)
         self.setStatusBar(sb)
 
+    def _apply_toolbar_style(self):
+        """クイックアクセスツールバーのスタイルをテーマ連動で適用。"""
+        tb = getattr(self, '_toolbar', None)
+        if tb is None:
+            return
+        t = _theme()
+        fs = SETTINGS.get('ui_font_size', 10) + 3
+        tb.setStyleSheet(
+            f"QToolBar {{ background:{t['toolbar_bg']}; border:none;"
+            f"           border-bottom:2px solid {t['border']};"
+            f"           spacing:2px; padding:5px 4px; }}"
+            f"QToolButton {{ background:transparent; color:{t['text']};"
+            f"              border:1px solid transparent;"
+            f"              padding:5px 9px; border-radius:3px; font-size:{fs}px; }}"
+            f"QToolButton:hover {{ background:{t['control_hover']};"
+            f"              border:1px solid {t['border']}; }}"
+            f"QToolButton:checked {{ background:{t['selection']};"
+            f"              border:1px solid {t['selection']}; }}"
+            f"QToolBar::separator {{ background:{t['border']}; width:1px; margin:4px 6px; }}"
+        )
+
     def _setup_toolbar(self):
         """主要機能のアイコンを並べたクイックアクセスツールバー。
         メニューを開かなくても FTPパネル切替・設定・SQL抽出・検索 などを
@@ -3332,16 +3766,9 @@ class MainWindow(QMainWindow):
         tb = QToolBar("Quick Access")
         tb.setMovable(False)
         tb.setIconSize(QSize(18, 18))
-        # 上下に余白 + 下端に明確な境界線を引いてタブ領域と視覚的に分離
-        tb.setStyleSheet(
-            "QToolBar { background:#2a2a2a; border:none; border-bottom:2px solid #1a1a1a;"
-            "           spacing:2px; padding:5px 4px; }"
-            "QToolButton { background:transparent; color:#c0c0c0; border:1px solid transparent;"
-            "              padding:5px 9px; border-radius:3px; font-size:13px; }"
-            "QToolButton:hover { background:#3a3a3a; border:1px solid #555; color:#fff; }"
-            "QToolButton:checked { background:#2a4a8a; border:1px solid #4a8eff; color:#fff; }"
-            "QToolBar::separator { background:#444; width:1px; margin:4px 6px; }"
-        )
+        self._toolbar = tb
+        # 上下に余白 + 下端に明確な境界線を引いてタブ領域と視覚的に分離 (テーマ連動)
+        self._apply_toolbar_style()
 
         # ファイル操作 (よく使う 新規/開く/保存/名前を付けて保存)
         act_new = QAction("🆕 新規", self)
@@ -3673,6 +4100,7 @@ class MainWindow(QMainWindow):
             QLineEdit {{
                 background: {t['panel_bg']}; color: {t['text']};
                 border: 1px solid {t['border']}; padding: 1px 3px;
+                font-size: {ui_fs}px;
             }}
             QCheckBox {{ color: {t['text']}; spacing: 4px; }}
             QLabel {{ color: {t['text']}; }}
@@ -3701,6 +4129,7 @@ class MainWindow(QMainWindow):
             QComboBox {{
                 background: {t['control_bg']}; color: {t['text']};
                 border: 1px solid {t['border']}; padding: 1px 3px;
+                font-size: {ui_fs}px;
             }}
             QComboBox::drop-down {{ border: none; width: 16px; }}
             QComboBox QAbstractItemView {{
@@ -3750,6 +4179,14 @@ class MainWindow(QMainWindow):
             QScrollBar::add-page:horizontal,
             QScrollBar::sub-page:horizontal {{ background: none; }}
         """)
+        # ツールバー・各パネルもテーマ連動で再スタイル
+        self._apply_toolbar_style()
+        if hasattr(self, 'bookmark_panel'):
+            self.bookmark_panel.apply_theme()
+        if hasattr(self, 'grep_panel') and hasattr(self.grep_panel, 'apply_theme'):
+            self.grep_panel.apply_theme()
+        if hasattr(self, 'ftp_panel') and hasattr(self.ftp_panel, 'apply_theme'):
+            self.ftp_panel.apply_theme()
 
     # --- タブ操作 ---
 
@@ -3788,6 +4225,7 @@ class MainWindow(QMainWindow):
             idx = self.tabs.addTab(tab, filename)
             self.tabs.setCurrentIndex(idx)
             tab.editor.document().setModified(False)
+            self._restore_tab_bookmarks(tab)
             self._watch_path(path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
@@ -3838,6 +4276,7 @@ class MainWindow(QMainWindow):
         idx = self.tabs.addTab(tab, f"[FTP] {filename}")
         self.tabs.setCurrentIndex(idx)
         tab.editor.document().setModified(False)
+        self._restore_tab_bookmarks(tab)
         self._watch_path(local_path)
 
     def _is_local_file_modified(self, local_path: str) -> bool:
@@ -3855,9 +4294,62 @@ class MainWindow(QMainWindow):
     def _connect_tab(self, tab):
         tab.content_changed.connect(self._on_content_changed)
         tab.editor.cursorPositionChanged.connect(self._update_cursor)
-        tab.editor.bookmark_toggled.connect(lambda *_: self._refresh_bookmarks())
+        # ブックマーク変更 → 一覧更新 + ファイル単位で永続化
+        tab.editor.bookmark_toggled.connect(
+            lambda *_: self._on_bookmark_changed(tab))
         # 右クリック「選択範囲からSQL抽出」
         tab.editor.sql_extract_requested.connect(self._show_sql_extract_selection)
+        # 右クリック「ソースを開く (該当行へジャンプ)」
+        tab.editor.source_open_requested.connect(self._open_source_from_selection)
+
+    # ------------------------------------------------ ブックマーク永続化
+    @staticmethod
+    def _bm_key(path: str) -> str:
+        try:
+            return os.path.normcase(os.path.abspath(path))
+        except Exception:
+            return path
+
+    def _on_bookmark_changed(self, tab):
+        self._refresh_bookmarks()
+        self._persist_tab_bookmarks(tab)
+
+    def _persist_tab_bookmarks(self, tab):
+        """タブのブックマークをファイルパス単位で JSON 保存。
+        パスの無いタブ (新規/未保存) は保存対象外。"""
+        path = getattr(tab, 'file_path', None)
+        if not path:
+            return
+        store = _load_bookmarks_store()
+        key = self._bm_key(path)
+        bms = sorted(getattr(tab.editor, '_bookmarks', set()))
+        if bms:
+            store[key] = bms
+        else:
+            store.pop(key, None)   # 全解除されたら記録も消す
+        _save_bookmarks_store(store)
+
+    def _restore_tab_bookmarks(self, tab):
+        """保存済みブックマークをタブへ復元 (ファイルを開いた直後に呼ぶ)。"""
+        path = getattr(tab, 'file_path', None)
+        if not path:
+            return
+        bms = _load_bookmarks_store().get(self._bm_key(path)) or []
+        if not bms:
+            return
+        total = tab.editor.document().blockCount()
+        for ln in bms:
+            if isinstance(ln, int) and 1 <= ln <= total:
+                tab.editor._bookmarks.add(ln)
+        tab.editor.line_number_area.update()
+        self._refresh_bookmarks()
+
+    def _persist_all_bookmarks(self):
+        """全タブのブックマークを保存 (全削除後などに使用)。"""
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, EditorTab):
+                self._persist_tab_bookmarks(t)
 
     def save_file(self):
         tab = self.current_tab()
@@ -3930,6 +4422,8 @@ class MainWindow(QMainWindow):
             self.tabs.setTabText(idx, tab.filename)
             tab.editor.document().setModified(False)
             tab.reset_original()  # 保存後はガターをリセット
+            # 保存でパスが付いた/変わったタブのブックマークを永続化
+            self._persist_tab_bookmarks(tab)
             self.statusBar().showMessage(f"保存しました: {path}", 3000)
             # 自分が書いたファイルの fileChanged を 1 秒間無視
             self._self_write_paths.add(path)
@@ -4134,28 +4628,22 @@ class MainWindow(QMainWindow):
         if tab and tab.file_path:
             self.grep_panel.set_directory(os.path.dirname(tab.file_path))
         self.grep_panel.pattern_input.setFocus()
+        self._ensure_bottom_height()
         self._sync_toolbar_states()
 
     def _hide_grep_panel(self):
-        """Grep パネルを隠す (Bookmark パネルも非表示なら下部スプリッターごと隠す)。"""
+        """Grep パネル (下部) を隠す。"""
         try:
-            if self.grep_panel.isVisible():
-                self.grep_panel.hide()
-            if (not self.grep_panel.isVisible()
-                    and not self.bookmark_panel.isVisible()):
-                self.bottom_splitter.hide()
+            self.grep_panel.hide()
+            self.bottom_splitter.hide()
         except Exception:
             pass
         self._sync_toolbar_states()
 
     def _hide_bookmark_panel(self):
-        """ブックマークパネルを隠す (Grep パネルも非表示なら下部スプリッターごと隠す)。"""
+        """ブックマークパネル (右サイドバー) を隠す。"""
         try:
-            if self.bookmark_panel.isVisible():
-                self.bookmark_panel.hide()
-            if (not self.grep_panel.isVisible()
-                    and not self.bookmark_panel.isVisible()):
-                self.bottom_splitter.hide()
+            self.bookmark_panel.hide()
         except Exception:
             pass
         self._sync_toolbar_states()
@@ -4264,9 +4752,43 @@ class MainWindow(QMainWindow):
 
     def _show_bookmarks(self):
         self.bookmark_panel.show()
-        self.bottom_splitter.show()
         self._refresh_bookmarks()
+        self._ensure_bookmark_width()
         self._sync_toolbar_states()
+
+    def _ensure_bookmark_width(self, target: int = 320):
+        """右サイドバーのブックマークパネルに初期幅を確保する (狭すぎ/0 を防ぐ)。"""
+        def _apply():
+            total = self.splitter.width()
+            sizes = self.splitter.sizes()
+            if total <= 0 or len(sizes) < 3:
+                return
+            if sizes[2] >= target:
+                return
+            ftp_w = sizes[0]
+            give = min(target, max(total // 3, 240))
+            center = max(total - ftp_w - give, 320)
+            self.splitter.setSizes([ftp_w, center, give])
+        QTimer.singleShot(0, _apply)
+
+    def _ensure_bottom_height(self, min_bottom: int = 300):
+        """下部パネル (Grep/ブックマーク) 表示時に高さが足りなければ広げる。
+        行が見切れないよう、下部に最低でも min_bottom px 程度を確保する。
+        """
+        def _apply():
+            total = self.v_splitter.height()
+            if total <= 0:
+                return
+            sizes = self.v_splitter.sizes()
+            if len(sizes) < 2:
+                return
+            # 下部の目標高さ (画面が小さい時は半分まで)
+            target = min(min_bottom, max(total // 2, 200))
+            if sizes[1] < target:
+                top = max(total - target, 150)
+                self.v_splitter.setSizes([top, target])
+        # レイアウト確定後にサイズ取得・適用 (初回表示直後は height が未確定なため)
+        QTimer.singleShot(0, _apply)
 
     def _show_sql_extract(self, *, selection_only: bool = False):
         """SQL抽出ダイアログを開く。
@@ -4318,6 +4840,121 @@ class MainWindow(QMainWindow):
     def _show_sql_extract_selection(self):
         """エディタの選択範囲からSQLを抽出 → ダイアログ表示。"""
         self._show_sql_extract(selection_only=True)
+
+    def _open_source_from_selection(self):
+        """選択範囲 (無ければ現在行) のソース参照を解析し、登録ソース検索パスから開く。
+        Class#method():行 / スタックトレース / File.ext:行 を抽出し、
+        登録済みソース検索パスを再帰検索して該当ファイルの該当行へジャンプする。
+        """
+        tab = self.current_tab()
+        if not tab:
+            return
+        cursor = tab.editor.textCursor()
+        text = cursor.selectedText() if cursor.hasSelection() else ''
+        # QPlainTextEdit の selectedText は段落区切りが U+2028 になるので復元
+        text = text.replace(' ', '\n').replace(' ', '\n')
+        if not text.strip():
+            text = cursor.block().text()   # 選択が無ければ現在行
+
+        refs = _extract_source_refs(text)
+        if not refs:
+            QMessageBox.information(
+                self, "ソース参照なし",
+                "選択範囲 (または現在行) からソース参照を検出できませんでした。\n"
+                "例: WP50121Servlet#createValueList():995 / (Foo.java:123) / utils.py:42")
+            return
+
+        source_dirs = SETTINGS.get('source_dirs') or []
+        if not source_dirs:
+            ans = QMessageBox.question(
+                self, "ソース検索パス未登録",
+                "ソースの検索先 (ソース検索パス) が未登録です。\n"
+                "今すぐ設定で登録しますか？",
+                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            )
+            if ans == QMessageBox.StandardButton.Yes:
+                self._open_settings()
+            return
+
+        # 各参照について候補ファイルを解決 (ref 全体を保持してメソッド検索に使う)
+        entries = []
+        total_candidates = 0
+        for r in refs:
+            paths = _resolve_source_file(r, source_dirs)
+            total_candidates += len(paths)
+            entries.append({'ref': r, 'paths': paths})
+
+        if total_candidates == 0:
+            names = ', '.join(
+                (r['filename'] or (r['classname'] + '.*')) for r in refs)
+            QMessageBox.warning(
+                self, "ソースが見つかりません",
+                f"登録済みソース検索パスから該当ファイルが見つかりませんでした:\n{names}\n\n"
+                "設定でソース検索パスが正しいか確認してください。")
+            return
+
+        # 候補が1件だけなら直接開く。複数なら選択ダイアログ。
+        single = [(e['paths'][0], e['ref']) for e in entries if len(e['paths']) == 1]
+        if total_candidates == 1 and len(single) == 1:
+            path, ref = single[0]
+            self._open_source_target(path, ref)
+            return
+
+        dlg = SourceRefPickerDialog(entries, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            targets = dlg.results()
+            for path, ref in targets:
+                self._open_source_target(path, ref)
+            if len(targets) > 1:
+                self.statusBar().showMessage(
+                    f"ソースを {len(targets)} 件開きました", 4000)
+
+    def _open_source_target(self, path: str, ref: dict):
+        """解決済みパスを開き、行番号があればその行へ、無ければメソッド定義へジャンプ。
+        ジャンプ先の行には自動でブックマークを付ける (調査箇所を後から辿れるように)。
+        """
+        line = int(ref.get('line') or 0)
+        if line > 0:
+            self._open_file_at_line(path, line, '')
+            self._auto_bookmark(line)
+            self.statusBar().showMessage(f"ソースを開きました: {path}:{line}", 4000)
+            return
+        # 行番号が無い (C++ 等) → ファイルを開いてメソッド定義を検索しジャンプ
+        self._open_file_at_line(path, 1, '')
+        method = ref.get('method', '')
+        classname = ref.get('classname', '')
+        tab = self.current_tab()
+        if not tab or not method:
+            self.statusBar().showMessage(f"ソースを開きました: {path}", 4000)
+            return
+        doc = tab.editor.document()
+        pat_def = re.compile(r'\b' + re.escape(classname) + r'\s*::\s*'
+                             + re.escape(method) + r'\b') if classname else None
+        pat_call = re.compile(r'\b' + re.escape(method) + r'\s*\(')
+        best = None
+        for i in range(doc.blockCount()):
+            t = doc.findBlockByNumber(i).text()
+            if pat_def and pat_def.search(t):
+                best = i
+                break
+            if best is None and pat_call.search(t):
+                best = i
+        if best is not None:
+            self._jump_to_line(tab.editor, best + 1)
+            self._auto_bookmark(best + 1)
+            self.statusBar().showMessage(
+                f"ソースを開きました: {path} ({method} を検索)", 4000)
+        else:
+            self.statusBar().showMessage(
+                f"ソースを開きました: {path} (メソッド {method} は未検出)", 4000)
+
+    def _auto_bookmark(self, lineno: int):
+        """現在のタブのエディタの指定行に自動でブックマークを付ける。"""
+        tab = self.current_tab()
+        if tab and lineno > 0:
+            tab.editor.add_bookmark(lineno)
+            # シグナル経由に依存せず確実に永続化する
+            self._persist_tab_bookmarks(tab)
 
     def _open_sql_content(self, content: str, filename: str):
         tab = EditorTab(content, filename)
@@ -4560,11 +5197,30 @@ class MainWindow(QMainWindow):
             self.ftp_panel.hide()
         else:
             self.ftp_panel.show()
+            self._ensure_ftp_width()
         # ツールバーのチェック状態を実状態に同期
         if hasattr(self, '_ftp_toolbar_action'):
             self._ftp_toolbar_action.blockSignals(True)
             self._ftp_toolbar_action.setChecked(self.ftp_panel.isVisible())
             self._ftp_toolbar_action.blockSignals(False)
+
+    def _ensure_ftp_width(self, target: int = 260):
+        """左サイドバー(FTP)表示時に幅を確保する。
+        ブックマーク表示で splitter サイズが確定し FTP が 0 幅になっていても、
+        開いた時にきちんと表示されるようにする。
+        """
+        def _apply():
+            total = self.splitter.width()
+            sizes = self.splitter.sizes()      # [ftp, center, bookmark]
+            if total <= 0 or len(sizes) < 3:
+                return
+            if sizes[0] >= self.ftp_panel.minimumWidth():
+                return   # 既に十分な幅がある
+            bm = sizes[2]                       # ブックマーク幅 (非表示なら 0)
+            give = min(target, self.ftp_panel.maximumWidth())
+            center = max(total - give - bm, 320)
+            self.splitter.setSizes([give, center, bm])
+        QTimer.singleShot(0, _apply)
 
     def _on_content_changed(self):
         tab = self.current_tab()
@@ -4614,6 +5270,12 @@ class MainWindow(QMainWindow):
             self.pos_label.setText(f"行: {c.blockNumber()+1}  列: {c.columnNumber()+1}")
 
     def closeEvent(self, event):
+        # 終了前に全タブのブックマークを念のため永続化
+        try:
+            self._persist_all_bookmarks()
+        except Exception:
+            pass
+
         # 未保存タブの確認
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
@@ -4915,6 +5577,123 @@ def _substitute_params(sql: str, params: dict) -> str:
 
 
 # ---------------------------------------------------------------------------
+# ログ → ソースファイル ジャンプ (エラー調査でソースまで辿る)
+# ---------------------------------------------------------------------------
+
+# 検索対象のソース拡張子 (クラス名のみの参照で候補ファイル名を組み立てる際に使う)
+_SOURCE_EXTS = (
+    'java', 'kt', 'scala', 'py', 'js', 'jsx', 'ts', 'tsx',
+    'cpp', 'cxx', 'cc', 'c', 'hpp', 'hh', 'h', 'cs', 'go', 'rb', 'php',
+)
+_SRC_EXT_RE = '(?:' + '|'.join(_SOURCE_EXTS) + ')'
+# 再帰検索でスキップするディレクトリ (ビルド成果物・VCS・依存物)
+_SOURCE_SKIP_DIRS = {
+    '.git', '.svn', '.hg', 'node_modules', '__pycache__', '.idea', '.vscode',
+    'dist', 'build', 'out', 'bin', 'obj', '.gradle', 'venv', '.venv', 'target',
+}
+
+# 1) Class#method():line  例: WP50121Servlet#createValueList():995  (Java)
+_REF_CLASS_METHOD = re.compile(r'\b([A-Za-z_]\w*)#(\w+)\s*\(\s*\)\s*:\s*(\d+)')
+# 2) (File.ext:line)  Java/JS スタックトレースの括弧内  例: (WP50121Servlet.java:995)
+_REF_PAREN_FILE = re.compile(
+    r'\(([\w.$\-]+\.' + _SRC_EXT_RE + r')\s*:\s*(\d+)\)', re.IGNORECASE)
+# 3) File.ext:line / File.ext:line N (C#)  例: utils.py:42  /  Foo.cs:line 88
+_REF_FILE_LINE = re.compile(
+    r'([\w./\\$\-]+\.' + _SRC_EXT_RE + r')\s*:\s*(?:line\s+)?(\d+)', re.IGNORECASE)
+# 4) Class::method(  例: ReqCarrier::reqCarrierCurrentStatus()  (C++ / 行番号なし)
+#    行番号が無いので、ファイル特定後にメソッド定義を検索してジャンプする。
+_REF_CPP_METHOD = re.compile(r'\b([A-Za-z_]\w*)::([A-Za-z_]\w*)\s*\(')
+# Java/C# スタックの完全修飾名: at com.foo.Bar.method(  /  at Ns.Cls.Method(
+_REF_FQCN = re.compile(r'\bat\s+([\w.$]+)\.[\w$<>]+\s*\(', re.IGNORECASE)
+
+
+def _extract_source_refs(text: str) -> list[dict]:
+    """テキストから「ソース参照」を抽出する。
+    返す各要素: {
+      'raw': 表示用の生文字列, 'line': 行番号(int, 不明なら0),
+      'filename': 検索すべきファイル名 (拡張子付き / 不明なら ''),
+      'classname': クラス名 (拡張子不明時の検索用 / 無ければ ''),
+      'method':   メソッド名 (行番号が無い時の定義検索用 / 無ければ ''),
+      'fqcn': 完全修飾名 com.foo.Bar (パッケージ優先用 / 無ければ ''),
+    }
+    重複 (同じ filename/classname + line + method) は除去する。
+    """
+    refs: list[dict] = []
+    seen: set[tuple] = set()
+
+    def add(raw, line, filename='', classname='', method='', fqcn=''):
+        key = ((filename or classname).lower(), line, method.lower())
+        if key in seen:
+            return
+        seen.add(key)
+        refs.append({'raw': raw.strip(), 'line': line, 'filename': filename,
+                     'classname': classname, 'method': method, 'fqcn': fqcn})
+
+    for line in text.splitlines():
+        fqcn_m = _REF_FQCN.search(line)
+        fqcn = fqcn_m.group(1) if fqcn_m else ''
+        # 2) 括弧内 File.ext:line (スタックトレース)
+        paren_spans = []
+        for m in _REF_PAREN_FILE.finditer(line):
+            paren_spans.append(m.span())
+            add(m.group(0), int(m.group(2)),
+                filename=os.path.basename(m.group(1)), fqcn=fqcn)
+        # 3) 素の File.ext:line (括弧内で既に拾った範囲は除く)
+        for m in _REF_FILE_LINE.finditer(line):
+            if any(s <= m.start() and m.end() <= e for s, e in paren_spans):
+                continue
+            add(m.group(0), int(m.group(2)),
+                filename=os.path.basename(m.group(1)))
+        # 1) Class#method():line  (Java)
+        for m in _REF_CLASS_METHOD.finditer(line):
+            add(m.group(0), int(m.group(3)),
+                classname=m.group(1), method=m.group(2))
+        # 4) Class::method(  (C++ / 行番号なし) — メソッド定義を後で検索
+        for m in _REF_CPP_METHOD.finditer(line):
+            cls, mth = m.group(1), m.group(2)
+            add(f"{cls}::{mth}()", 0, classname=cls, method=mth)
+
+    return refs
+
+
+def _resolve_source_file(ref: dict, source_dirs: list[str]) -> list[str]:
+    """参照に対応するソースファイルの絶対パス候補を返す。
+    - filename があればそのファイル名で、無ければ classname.<各拡張子> で再帰検索
+    - fqcn (パッケージ) があれば、パスがパッケージ階層を含む候補を優先
+    """
+    if not source_dirs:
+        return []
+    targets = set()
+    if ref.get('filename'):
+        targets.add(ref['filename'].lower())
+    elif ref.get('classname'):
+        for e in _SOURCE_EXTS:
+            targets.add(f"{ref['classname']}.{e}".lower())
+    if not targets:
+        return []
+
+    hits: list[str] = []
+    for root in source_dirs:
+        if not root or not os.path.isdir(root):
+            continue
+        for dirpath, dirnames, filenames in os.walk(root):
+            dirnames[:] = [d for d in dirnames if d not in _SOURCE_SKIP_DIRS]
+            for fn in filenames:
+                if fn.lower() in targets:
+                    hits.append(os.path.join(dirpath, fn))
+
+    if len(hits) > 1 and ref.get('fqcn'):
+        # パッケージ階層 (com/foo/...) を含むパスを優先
+        pkg = ref['fqcn'].rsplit('.', 1)[0] if '.' in ref['fqcn'] else ''
+        if pkg:
+            pkg_path = pkg.replace('.', os.sep).lower()
+            preferred = [h for h in hits if pkg_path in h.lower()]
+            if preferred:
+                return preferred
+    return hits
+
+
+# ---------------------------------------------------------------------------
 # DB 実行ダイアログ — SSH 経由で sqlplus/mysql/psql 等を実行し SELECT 結果を取得
 # ---------------------------------------------------------------------------
 
@@ -5194,7 +5973,8 @@ class DBExecuteDialog(QDialog):
         # SQL入力欄: 入力可能を示す明るめの枠線で結果欄と区別
         self.sql_input.setObjectName("sqlInput")
         self.sql_input.setStyleSheet(
-            "QPlainTextEdit#sqlInput { border: 2px solid #4a90c8; background:#1e1e1e; }"
+            f"QPlainTextEdit#sqlInput {{ border: 2px solid #4a90c8;"
+            f" background:{_theme()['editor_bg']}; color:{_theme()['text']}; }}"
         )
         self.sql_input.setToolTip("ここが SQL 入力欄です (実行結果欄ではありません)")
         # SQL シンタックスハイライト (LogViewer/SqlExtract と同じ配色)
@@ -5386,26 +6166,27 @@ class DBExecuteDialog(QDialog):
         self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
         self.result_table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectRows)
         # viewport (テーブル右側の空白領域含む) もダークに染める
+        _t = _theme()
         self.result_table.setStyleSheet(
-            "QTableWidget { background:#1e1e1e; color:#d0d0d0; border:1px dashed #666;"
-            " gridline-color:#444; alternate-background-color:#252525; }"
-            "QTableWidget QTableCornerButton::section { background:#2f2f2f; border:1px solid #444; }"
-            "QHeaderView { background:#2f2f2f; }"
-            "QHeaderView::section { background:#2f2f2f; color:#c0c0c0; border:1px solid #444;"
-            " padding:2px 6px; font-weight:600; }"
+            f"QTableWidget {{ background:{_t['panel_bg']}; color:{_t['text']}; border:1px dashed {_t['border']};"
+            f" gridline-color:{_t['border']}; alternate-background-color:{_t['control_bg']}; }}"
+            f"QTableWidget QTableCornerButton::section {{ background:{_t['toolbar_bg']}; border:1px solid {_t['border']}; }}"
+            f"QHeaderView {{ background:{_t['toolbar_bg']}; }}"
+            f"QHeaderView::section {{ background:{_t['toolbar_bg']}; color:{_t['text']}; border:1px solid {_t['border']};"
+            f" padding:2px 6px; font-weight:600; }}"
             # 縦/横ヘッダーともに緑系で視認性を上げる
-            "QHeaderView::section:horizontal { background:#2f2f2f; color:#9ED969;"
-            " font-weight:700; padding:2px 8px; }"
-            "QHeaderView::section:vertical { background:#2f2f2f; color:#9ED969;"
-            " font-weight:700; padding:2px 8px; text-align:left; }"
-            "QTableWidget::item:selected { background:#2a4a8a; color:#fff; }"
+            f"QHeaderView::section:horizontal {{ background:{_t['toolbar_bg']}; color:#4a9e4a;"
+            f" font-weight:700; padding:2px 8px; }}"
+            f"QHeaderView::section:vertical {{ background:{_t['toolbar_bg']}; color:#4a9e4a;"
+            f" font-weight:700; padding:2px 8px; text-align:left; }}"
+            f"QTableWidget::item:selected {{ background:{_t['selection']}; color:{_t['text']}; }}"
         )
-        # viewport 自体のパレットも明示的にダーク化 (Qt 既定の白を上書き)
+        # viewport 自体のパレットもテーマ色で明示的に設定 (Qt 既定色を上書き)
         from PyQt6.QtGui import QPalette
         pal = self.result_table.viewport().palette()
-        pal.setColor(QPalette.ColorRole.Base, QColor("#1e1e1e"))
-        pal.setColor(QPalette.ColorRole.AlternateBase, QColor("#252525"))
-        pal.setColor(QPalette.ColorRole.Window, QColor("#1e1e1e"))
+        pal.setColor(QPalette.ColorRole.Base, QColor(_t['panel_bg']))
+        pal.setColor(QPalette.ColorRole.AlternateBase, QColor(_t['control_bg']))
+        pal.setColor(QPalette.ColorRole.Window, QColor(_t['panel_bg']))
         self.result_table.viewport().setPalette(pal)
         self.result_table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeMode.Interactive)
         # 最終列が余白を埋めるようストレッチ
@@ -5441,17 +6222,22 @@ class DBExecuteDialog(QDialog):
         self.setLayout(main)
 
         # テーマ適用 (SqlExtractDialog と同じダーク基調)
-        self.setStyleSheet("""
-            QDialog { background: #2b2b2b; }
-            QLabel  { color: #a9b7c6; }
-            QPushButton { background:#4a4a4a; color:#a9b7c6; border:none; padding:4px 10px; border-radius:2px; }
-            QPushButton:hover { background:#5a5a5a; }
-            QPushButton:disabled { color:#666; }
-            QComboBox { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
-            QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6; selection-background-color:#214283; }
-            QPlainTextEdit { background:#1e1e1e; color:#a9b7c6; border:1px solid #444;
-                             selection-background-color:#214283; }
-            QCheckBox { color:#a9b7c6; }
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background: {t['bg']}; }}
+            QLabel  {{ color: {t['text']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']}; border:none; padding:4px 10px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:disabled {{ color:{t['text_dim']}; }}
+            QComboBox {{ background:{t['control_bg']}; color:{t['text']}; border:1px solid {t['border']}; padding:1px 3px; }}
+            QComboBox QAbstractItemView {{ background:{t['panel_bg']}; color:{t['text']}; selection-background-color:{t['selection']}; }}
+            QPlainTextEdit {{ background:{t['panel_bg']}; color:{t['text']}; border:1px solid {t['border']};
+                             selection-background-color:{t['selection']}; }}
+            QCheckBox {{ color:{t['text']}; spacing:5px; }}
+            QCheckBox::indicator {{ width:15px; height:15px; border:1px solid {t['border']};
+                                   background:{t['panel_bg']}; border-radius:3px; }}
+            QCheckBox::indicator:hover {{ border:1px solid #4a90c8; }}
+            QCheckBox::indicator:checked {{ background:#3a8e3a; border:1px solid #4caf50; }}
         """)
 
     # ─── 折りたたみトグル ─────────────────────────────────────────────────
@@ -6441,12 +7227,25 @@ class SqlExtractDialog(QDialog):
 
         row2.addSpacing(8)
         row2.addWidget(QLabel("インデント"))
+        # 検索バーの ▲▼ と同じ操作感: 数値欄(矢印なし) + ▲▼ ボタン
         self.indent_spin = QSpinBox()
         self.indent_spin.setRange(2, 8)
         self.indent_spin.setValue(4)
-        self.indent_spin.setMaximumWidth(60)
+        self.indent_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.indent_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.indent_spin.setFixedWidth(34)
         self.indent_spin.setToolTip("インデントのスペース数 (2〜8)")
         row2.addWidget(self.indent_spin)
+        _ind_up = QPushButton("▲")
+        _ind_up.setFixedWidth(24)
+        _ind_up.setToolTip("インデントを増やす")
+        _ind_up.clicked.connect(lambda: self.indent_spin.stepBy(1))
+        _ind_down = QPushButton("▼")
+        _ind_down.setFixedWidth(24)
+        _ind_down.setToolTip("インデントを減らす")
+        _ind_down.clicked.connect(lambda: self.indent_spin.stepBy(-1))
+        row2.addWidget(_ind_up)
+        row2.addWidget(_ind_down)
 
         row2.addSpacing(12)
         self.subst_check = QCheckBox("パラメータ置換")
@@ -6583,22 +7382,24 @@ class SqlExtractDialog(QDialog):
         main.addLayout(bottom, 0)
 
         self.setLayout(main)
-        self.setStyleSheet("""
-            QDialog { background: #2b2b2b; }
-            QLabel  { color: #a9b7c6; }
-            QPushButton { background:#4a4a4a; color:#a9b7c6; border:none; padding:2px 8px; border-radius:2px; }
-            QPushButton:hover { background:#5a5a5a; }
-            QListWidget { background:#1e1e1e; color:#e0e0e0; border:none;
-                          alternate-background-color:#252525; font-family:Consolas, monospace; font-size:12px; }
-            QListWidget::item { padding:4px 6px; border-bottom:1px solid #2a2a2a; }
-            QListWidget::item:selected { background:#2a4a8a; color:#ffffff; }
-            QListWidget::item:hover { background:#34425e; }
-            QLineEdit { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
-            QComboBox { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
-            QComboBox QAbstractItemView { background:#2b2b2b; color:#a9b7c6; selection-background-color:#214283; }
-            QSpinBox  { background:#3a3a3a; color:#a9b7c6; border:1px solid #555; padding:1px 3px; }
-            QCheckBox { color:#a9b7c6; }
-            QSplitter::handle { background:#3a3a3a; width:4px; }
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background: {t['bg']}; }}
+            QLabel  {{ color: {t['text']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']}; border:none; padding:2px 8px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QListWidget {{ background:{t['panel_bg']}; color:{t['text']}; border:none;
+                          alternate-background-color:{t['control_bg']}; font-family:Consolas, monospace; font-size:12px; }}
+            QListWidget::item {{ padding:4px 6px; border-bottom:1px solid {t['border']}; }}
+            QListWidget::item:selected {{ background:{t['selection']}; color:{t['text']}; }}
+            QListWidget::item:hover {{ background:{t['control_hover']}; }}
+            QLineEdit {{ background:{t['panel_bg']}; color:{t['text']}; border:1px solid {t['border']}; padding:1px 3px; }}
+            QComboBox {{ background:{t['control_bg']}; color:{t['text']}; border:1px solid {t['border']}; padding:1px 3px; }}
+            QComboBox QAbstractItemView {{ background:{t['panel_bg']}; color:{t['text']}; selection-background-color:{t['selection']}; }}
+            QSpinBox  {{ background:{t['control_bg']}; color:{t['text']}; border:1px solid {t['border']};
+                        padding:1px 3px; min-height:22px; min-width:54px; }}
+            QCheckBox {{ color:{t['text']}; spacing:6px; }}
+            QSplitter::handle {{ background:{t['border']}; width:4px; }}
         """)
 
     # ─── 抽出・整形ロジック ────────────────────────────────────────────
@@ -6666,19 +7467,21 @@ class SqlExtractDialog(QDialog):
             has_params = bool(entry['params'])
             marker = ' [?]' if '?' in entry['sql'] and has_params else ''
             sql_kind = ''
-            color = QColor("#e0e0e0")
+            # 種別色はテーマ明暗で切替 (ライト背景・選択青背景でも読めるように)
+            _light = _is_light_theme()
+            color = QColor("#333333" if _light else "#e0e0e0")
             if re.match(r'\s*(SELECT|WITH)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'SEL'
-                color = QColor("#9ED969")
+                color = QColor("#2E7D32" if _light else "#9ED969")
             elif re.match(r'\s*(INSERT|MERGE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'INS'
-                color = QColor("#82AAFF")
+                color = QColor("#1565C0" if _light else "#82AAFF")
             elif re.match(r'\s*(UPDATE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'UPD'
-                color = QColor("#FFB454")
+                color = QColor("#B05A00" if _light else "#FFB454")
             elif re.match(r'\s*(DELETE)\b', entry['sql'], re.IGNORECASE):
                 sql_kind = 'DEL'
-                color = QColor("#FF6E6E")
+                color = QColor("#C0392B" if _light else "#FF6E6E")
             kind_label = f"[{sql_kind}]" if sql_kind else "[?  ]"
             # 元の連番 i+1 を保持して表示 (絞り込み後も元の番号が分かる)
             item = QListWidgetItem(f" {i+1:>3}. {kind_label}{marker}  {preview}")
