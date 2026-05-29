@@ -35,10 +35,11 @@ import datetime
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QPushButton, QPlainTextEdit, QTextEdit, QCheckBox, QMessageBox,
-    QTabWidget, QStatusBar, QSplitter,
+    QTabWidget, QStatusBar, QSplitter, QLineEdit, QTableWidget, QTableWidgetItem,
+    QHeaderView,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QShortcut, QKeySequence
+from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor
 
 # ── 既存資産の流用 (失敗してもツール自体は最低限動くようフォールバック) ──────
 try:
@@ -50,11 +51,30 @@ try:
     from text_editor import (
         SyntaxHighlighter, _theme, _DB_PROFILES_PATH,
         _load_db_profiles, _save_db_profiles,
+        _DB_CMD_PRESETS, _clean_sqlplus_output,
     )
 except Exception:  # pragma: no cover
     SyntaxHighlighter = None
     _DB_PROFILES_PATH = os.path.join(os.path.expanduser('~'),
                                      '.ssh_log_viewer_profiles.json')
+    # 参照(SELECT)用 CSV 出力テンプレート (text_editor 流用失敗時のフォールバック)
+    _DB_CMD_PRESETS = {
+        "Oracle (sqlplus)": (
+            "sqlplus -S USER/PASS@SID <<'EOF'\n"
+            "set sqlblanklines on define off\n"
+            "set markup csv on quote on\n"
+            "set feedback off pagesize 0 trimspool on\n"
+            "{SQL};\n"
+            "exit\nEOF"
+        ),
+        "MySQL/MariaDB":  'mysql -u USER -pPASS -h localhost DBNAME -e "{SQL}"',
+        "PostgreSQL":     'PGPASSWORD=PASS psql -h localhost -U USER -d DBNAME -c "{SQL}"',
+        "SQLite":         'sqlite3 -header -csv /path/to/db.sqlite "{SQL}"',
+        "SQL Server (sqlcmd)": 'sqlcmd -S localhost -U USER -P PASS -d DBNAME -Q "{SQL}"',
+    }
+
+    def _clean_sqlplus_output(text: str) -> str:
+        return text
 
     def _theme() -> dict:
         return {'bg': '#2b2b2b', 'editor_bg': '#1e1e1e', 'text': '#dcdcdc'}
@@ -235,6 +255,54 @@ def _classify(sql: str) -> tuple[str, list[str]]:
             # 未知キーワードは編集扱い (安全側)
             kind = 'edit'
     return kind, notes
+
+
+def _parse_csv_lines(text: str) -> list[list[str]]:
+    """SELECT 出力 (CSV / 固定幅) を行列にパースする (text_editor の手法を踏襲)。"""
+    import csv
+    from io import StringIO
+    if not text or not text.strip():
+        return []
+    lines = text.splitlines()
+    first = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s or s.startswith('--'):
+            continue
+        if s.startswith('(') and s.endswith(')'):
+            continue
+        first = i
+        break
+    clean = '\n'.join(lines[first:])
+    if not clean.strip():
+        return []
+    if clean.count(',') >= 1:
+        try:
+            rows = [r for r in csv.reader(StringIO(clean)) if r]
+            if max((len(r) for r in rows), default=0) >= 2:
+                return rows
+        except Exception:
+            pass
+    rows = []
+    for line in clean.splitlines():
+        if line.strip():
+            rows.append(re.split(r' {2,}|\t+', line.strip()))
+    return rows
+
+
+def _sql_literal(text: str, empty_as_null: bool = True) -> str:
+    """セル値を SQL リテラルに変換する。
+    - None / (空欄 かつ empty_as_null) / 'NULL' トークン → NULL
+    - それ以外 → シングルクォートで囲み '' エスケープ (型は暗黙変換に任せる)
+    """
+    if text is None:
+        return 'NULL'
+    s = str(text)
+    if s.strip().upper() == 'NULL':
+        return 'NULL'
+    if s == '' and empty_as_null:
+        return 'NULL'
+    return "'" + s.replace("'", "''") + "'"
 
 
 def _append_audit(profile: str, sql: str, status: str, detail: str = ''):
@@ -690,6 +758,486 @@ class SqlEditTab(QWidget):
 
 
 # ---------------------------------------------------------------------------
+# グリッド編集タブ (Phase 2)
+# ---------------------------------------------------------------------------
+
+class GridEditTab(QWidget):
+    """SELECT 結果を表で表示 → セル編集 → 主キーから UPDATE 自動生成 →
+    ステージング → 一括コミット。
+
+    - SELECT は参照用テンプレート (CSV出力) で実行 (プロファイルの db_cmd を流用)
+    - 編集適用は編集用テンプレート (BEGIN..COMMIT) で実行 (db_edit_cmd を流用)
+    - 変更は表内にステージングされ、「変更を適用」で 1 トランザクション送信
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._profiles = _load_db_profiles()
+        self._worker = None
+        self._mode = None              # 'select' / 'apply'
+        self._header: list[str] = []
+        self._original: list[list[str]] = []   # 取得直後の値スナップショット
+        self._dirty: set[tuple[int, int]] = set()
+        self._pending_sql = ''
+        self._pending_profile = ''
+        self._build_ui()
+        self._refresh_profiles()
+
+    # ── UI 構築 ──────────────────────────────────────────────────────────
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        root.setContentsMargins(8, 8, 8, 8)
+        root.setSpacing(6)
+
+        top = QHBoxLayout()
+        top.addWidget(QLabel("接続プロファイル:"))
+        self.profile_combo = QComboBox()
+        self.profile_combo.setMinimumWidth(200)
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
+        top.addWidget(self.profile_combo)
+        top.addSpacing(8)
+        self.tmpl_toggle = QPushButton("▶ コマンドテンプレート設定")
+        self.tmpl_toggle.setCheckable(True)
+        self.tmpl_toggle.clicked.connect(self._toggle_tmpl)
+        top.addWidget(self.tmpl_toggle)
+        top.addStretch()
+        self.allow_edit_chk = QCheckBox("このプロファイルで編集を許可")
+        self.allow_edit_chk.setToolTip(
+            "OFF の間は『変更を適用』をブロックします (本番誤実行防止)。")
+        self.allow_edit_chk.stateChanged.connect(self._on_allow_edit_changed)
+        top.addWidget(self.allow_edit_chk)
+        root.addLayout(top)
+
+        # テンプレート設定 (折りたたみ): SELECT用 / 編集用
+        self.tmpl_box = QWidget()
+        tb = QVBoxLayout(self.tmpl_box)
+        tb.setContentsMargins(0, 0, 0, 0)
+        tb.setSpacing(2)
+        sel_row = QHBoxLayout()
+        sel_row.addWidget(QLabel("SELECT用 (CSV出力):"))
+        self.sel_preset = QComboBox()
+        self.sel_preset.addItem("（プリセット）")
+        for name in _DB_CMD_PRESETS:
+            self.sel_preset.addItem(name)
+        self.sel_preset.currentIndexChanged.connect(
+            lambda: self._apply_preset(self.sel_preset, _DB_CMD_PRESETS, self.sel_cmd))
+        sel_row.addWidget(self.sel_preset)
+        sel_row.addStretch()
+        tb.addLayout(sel_row)
+        self.sel_cmd = QPlainTextEdit()
+        self.sel_cmd.setFont(QFont("Consolas", 9))
+        self.sel_cmd.setMaximumHeight(80)
+        self.sel_cmd.setPlaceholderText("SELECT を CSV (1行目=ヘッダー) で返すテンプレート。{SQL} を置換。")
+        tb.addWidget(self.sel_cmd)
+
+        edit_row = QHBoxLayout()
+        edit_row.addWidget(QLabel("編集用 (BEGIN..COMMIT):"))
+        self.edit_preset = QComboBox()
+        self.edit_preset.addItem("（プリセット）")
+        for name in _DB_EDIT_PRESETS:
+            self.edit_preset.addItem(name)
+        self.edit_preset.currentIndexChanged.connect(
+            lambda: self._apply_preset(self.edit_preset, _DB_EDIT_PRESETS, self.edit_cmd))
+        edit_row.addWidget(self.edit_preset)
+        edit_row.addStretch()
+        self.save_tmpl_btn = QPushButton("テンプレートをプロファイルに保存")
+        self.save_tmpl_btn.clicked.connect(self._save_templates)
+        edit_row.addWidget(self.save_tmpl_btn)
+        tb.addLayout(edit_row)
+        self.edit_cmd = QPlainTextEdit()
+        self.edit_cmd.setFont(QFont("Consolas", 9))
+        self.edit_cmd.setMaximumHeight(80)
+        self.edit_cmd.setPlaceholderText("UPDATE 群を流す編集テンプレート。{SQL} を置換。")
+        tb.addWidget(self.edit_cmd)
+        self.tmpl_box.setVisible(False)
+        root.addWidget(self.tmpl_box)
+
+        # テーブル名 / 主キー / SELECT 入力
+        meta = QHBoxLayout()
+        meta.addWidget(QLabel("テーブル:"))
+        self.table_input = QLineEdit()
+        self.table_input.setPlaceholderText("例: SCOTT.EMP")
+        self.table_input.setMaximumWidth(220)
+        meta.addWidget(self.table_input)
+        meta.addWidget(QLabel("主キー列 (, 区切り):"))
+        self.pk_input = QLineEdit()
+        self.pk_input.setPlaceholderText("例: EMPNO  /  ID,SUB_ID")
+        self.pk_input.setMaximumWidth(220)
+        meta.addWidget(self.pk_input)
+        self.empty_null_chk = QCheckBox("空欄を NULL にする")
+        self.empty_null_chk.setChecked(True)
+        meta.addWidget(self.empty_null_chk)
+        meta.addStretch()
+        root.addLayout(meta)
+
+        sql_row = QHBoxLayout()
+        sql_row.addWidget(QLabel("SELECT 文:"))
+        self.fetch_btn = QPushButton("データ取得")
+        self.fetch_btn.clicked.connect(self._fetch)
+        sql_row.addStretch()
+        sql_row.addWidget(self.fetch_btn)
+        root.addLayout(sql_row)
+        self.sql_input = QPlainTextEdit()
+        self.sql_input.setFont(QFont("Consolas", 10))
+        self.sql_input.setMaximumHeight(80)
+        self.sql_input.setPlaceholderText("例: SELECT EMPNO, ENAME, SAL FROM SCOTT.EMP WHERE DEPTNO = 10")
+        if SyntaxHighlighter is not None:
+            try:
+                self._hl = SyntaxHighlighter(self.sql_input.document(), 'sql')
+            except Exception:
+                self._hl = None
+        root.addWidget(self.sql_input)
+
+        # グリッド + 結果ログのスプリッタ
+        splitter = QSplitter(Qt.Orientation.Vertical)
+        self.table = QTableWidget()
+        self.table.setEditTriggers(
+            QTableWidget.EditTrigger.DoubleClicked
+            | QTableWidget.EditTrigger.SelectedClicked
+            | QTableWidget.EditTrigger.EditKeyPressed)
+        self.table.itemChanged.connect(self._on_item_changed)
+        splitter.addWidget(self.table)
+        self.result_view = QTextEdit()
+        self.result_view.setReadOnly(True)
+        self.result_view.setFont(QFont("Consolas", 9))
+        self.result_view.setMaximumHeight(160)
+        splitter.addWidget(self.result_view)
+        splitter.setSizes([420, 140])
+        root.addWidget(splitter, 1)
+
+        # 操作ボタン
+        btn_row = QHBoxLayout()
+        self.dirty_lbl = QLabel("変更: 0 セル")
+        btn_row.addWidget(self.dirty_lbl)
+        btn_row.addStretch()
+        self.revert_btn = QPushButton("変更を破棄")
+        self.revert_btn.clicked.connect(self._revert)
+        btn_row.addWidget(self.revert_btn)
+        self.preview_btn = QPushButton("変更をプレビュー (UPDATE生成)")
+        self.preview_btn.clicked.connect(self._preview)
+        btn_row.addWidget(self.preview_btn)
+        self.apply_btn = QPushButton("▶ 変更を適用")
+        self.apply_btn.setMinimumHeight(32)
+        f = self.apply_btn.font(); f.setBold(True); self.apply_btn.setFont(f)
+        self.apply_btn.setStyleSheet(
+            "QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
+            " stop:0 #e57373, stop:1 #c62828); color:#fff;"
+            " border:1px solid #8e0000; border-radius:4px; padding:4px 16px; }"
+            "QPushButton:hover { background:#d32f2f; }"
+            "QPushButton:disabled { background:#555; color:#aaa; }")
+        self.apply_btn.clicked.connect(self._apply)
+        btn_row.addWidget(self.apply_btn)
+        root.addLayout(btn_row)
+
+    # ── プロファイル / テンプレート ─────────────────────────────────────
+    def _refresh_profiles(self):
+        self._profiles = _load_db_profiles()
+        cur = self.profile_combo.currentText()
+        self.profile_combo.blockSignals(True)
+        self.profile_combo.clear()
+        for name in self._profiles:
+            self.profile_combo.addItem(name)
+        if cur:
+            idx = self.profile_combo.findText(cur)
+            if idx >= 0:
+                self.profile_combo.setCurrentIndex(idx)
+        self.profile_combo.blockSignals(False)
+        self._on_profile_changed(self.profile_combo.currentText())
+
+    def _on_profile_changed(self, name: str):
+        prof = self._profiles.get(name, {})
+        self.sel_cmd.setPlainText(prof.get('db_cmd', ''))
+        self.edit_cmd.setPlainText(prof.get('db_edit_cmd', ''))
+        self.allow_edit_chk.blockSignals(True)
+        self.allow_edit_chk.setChecked(bool(prof.get('db_edit_allowed', False)))
+        self.allow_edit_chk.blockSignals(False)
+
+    def _apply_preset(self, combo, presets, target):
+        tmpl = presets.get(combo.currentText())
+        if tmpl:
+            target.setPlainText(tmpl)
+
+    def _toggle_tmpl(self):
+        vis = self.tmpl_toggle.isChecked()
+        self.tmpl_box.setVisible(vis)
+        self.tmpl_toggle.setText(("▼ " if vis else "▶ ") + "コマンドテンプレート設定")
+
+    def _save_templates(self):
+        name = self.profile_combo.currentText()
+        if not name or name not in self._profiles:
+            QMessageBox.warning(self, "プロファイル未選択", "保存先のプロファイルを選択してください。")
+            return
+        self._profiles[name]['db_cmd'] = self.sel_cmd.toPlainText()
+        self._profiles[name]['db_edit_cmd'] = self.edit_cmd.toPlainText()
+        _save_db_profiles(self._profiles)
+        QMessageBox.information(self, "保存", f"'{name}' にテンプレートを保存しました。")
+
+    def _on_allow_edit_changed(self):
+        name = self.profile_combo.currentText()
+        if name and name in self._profiles:
+            self._profiles[name]['db_edit_allowed'] = self.allow_edit_chk.isChecked()
+            _save_db_profiles(self._profiles)
+
+    def _build_cmd_body(self, template: str, sql: str) -> str | None:
+        template = template.strip()
+        if not template:
+            QMessageBox.warning(self, "コマンド未設定",
+                "テンプレートが未設定です。『コマンドテンプレート設定』で選択/保存してください。")
+            return None
+        if '{SQL}' not in template:
+            QMessageBox.warning(self, "テンプレートエラー", "テンプレートに {SQL} がありません。")
+            return None
+        s = sql.replace('\r\n', '\n').replace('\r', '\n')
+        body = template.replace('{SQL}', s).replace('\r\n', '\n').replace('\r', '\n')
+        body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
+                      lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
+        return body
+
+    # ── データ取得 (SELECT) ─────────────────────────────────────────────
+    def _fetch(self):
+        sql = self.sql_input.toPlainText().strip().rstrip(';')
+        if not sql:
+            QMessageBox.warning(self, "SQL 未入力", "SELECT 文を入力してください。")
+            return
+        if _first_keyword(sql) not in _READ_ONLY_KEYWORDS:
+            QMessageBox.warning(self, "SELECT のみ",
+                "データ取得は参照系 (SELECT/WITH 等) のみ可能です。")
+            return
+        prof = self._profiles.get(self.profile_combo.currentText())
+        if not prof:
+            QMessageBox.warning(self, "プロファイル未選択", "接続プロファイルを選択してください。")
+            return
+        body = self._build_cmd_body(self.sel_cmd.toPlainText(), sql)
+        if body is None:
+            return
+        self._mode = 'select'
+        self._run_async(prof, body, "データ取得中...")
+
+    def _populate_grid(self, csv_text: str):
+        rows = _parse_csv_lines(csv_text)
+        self.table.blockSignals(True)
+        self.table.clear()
+        self._dirty.clear()
+        self._update_dirty_label()
+        if not rows:
+            self.table.setRowCount(0)
+            self.table.setColumnCount(0)
+            self._header = []
+            self._original = []
+            self.table.blockSignals(False)
+            return
+        ncols = max(len(r) for r in rows)
+        header = (rows[0] + [''] * (ncols - len(rows[0])))
+        self._header = [h.strip() or f"col{i+1}" for i, h in enumerate(header)]
+        body = rows[1:]
+        self._original = [
+            [(r[c] if c < len(r) else '') for c in range(ncols)] for r in body
+        ]
+        self.table.setColumnCount(ncols)
+        self.table.setHorizontalHeaderLabels(self._header)
+        self.table.setRowCount(len(body))
+        for r, row in enumerate(self._original):
+            for c in range(ncols):
+                self.table.setItem(r, c, QTableWidgetItem(row[c]))
+        self.table.resizeColumnsToContents()
+        for c in range(ncols):
+            if self.table.columnWidth(c) > 360:
+                self.table.setColumnWidth(c, 360)
+        self.table.blockSignals(False)
+
+    # ── セル編集の追跡 ───────────────────────────────────────────────────
+    def _on_item_changed(self, item: QTableWidgetItem):
+        r, c = item.row(), item.column()
+        if r >= len(self._original) or c >= len(self._original[r]):
+            return
+        orig = self._original[r][c]
+        if item.text() != orig:
+            self._dirty.add((r, c))
+            item.setBackground(QColor("#5a3a1a"))
+        else:
+            self._dirty.discard((r, c))
+            item.setBackground(QColor(0, 0, 0, 0))
+        self._update_dirty_label()
+
+    def _update_dirty_label(self):
+        rows = {r for r, _ in self._dirty}
+        self.dirty_lbl.setText(f"変更: {len(self._dirty)} セル / {len(rows)} 行")
+
+    def _revert(self):
+        if not self._dirty:
+            return
+        self.table.blockSignals(True)
+        for (r, c) in list(self._dirty):
+            it = self.table.item(r, c)
+            if it is not None:
+                it.setText(self._original[r][c])
+                it.setBackground(QColor(0, 0, 0, 0))
+        self._dirty.clear()
+        self.table.blockSignals(False)
+        self._update_dirty_label()
+
+    # ── UPDATE 生成 ──────────────────────────────────────────────────────
+    def _pk_indices(self) -> list[int] | None:
+        pk_raw = [p.strip() for p in self.pk_input.text().split(',') if p.strip()]
+        if not pk_raw:
+            QMessageBox.warning(self, "主キー未指定",
+                "UPDATE の WHERE 条件に使う主キー列を指定してください。")
+            return None
+        lower = [h.lower() for h in self._header]
+        idxs = []
+        for pk in pk_raw:
+            if pk.lower() not in lower:
+                QMessageBox.warning(self, "主キー列が見つかりません",
+                    f"列 '{pk}' は取得結果のヘッダーに存在しません。\n"
+                    f"取得列: {', '.join(self._header)}")
+                return None
+            idxs.append(lower.index(pk.lower()))
+        return idxs
+
+    def _generate_updates(self) -> list[str] | None:
+        if not self._dirty:
+            return []
+        table = self.table_input.text().strip()
+        if not table:
+            QMessageBox.warning(self, "テーブル未指定", "UPDATE 対象のテーブル名を入力してください。")
+            return None
+        pk_idx = self._pk_indices()
+        if pk_idx is None:
+            return None
+        empty_null = self.empty_null_chk.isChecked()
+        dirty_rows: dict[int, list[int]] = {}
+        for (r, c) in self._dirty:
+            dirty_rows.setdefault(r, []).append(c)
+        stmts = []
+        for r in sorted(dirty_rows):
+            set_cols = sorted(dirty_rows[r])
+            set_parts = []
+            for c in set_cols:
+                it = self.table.item(r, c)
+                new_val = it.text() if it is not None else ''
+                set_parts.append(f"{self._header[c]} = {_sql_literal(new_val, empty_null)}")
+            # WHERE は取得直後の主キー値で行を特定 (主キー自体を編集していても元の行)
+            where_parts = []
+            for c in pk_idx:
+                ov = self._original[r][c]
+                where_parts.append(f"{self._header[c]} = {_sql_literal(ov, empty_null)}")
+            stmts.append(
+                f"UPDATE {table} SET {', '.join(set_parts)} "
+                f"WHERE {' AND '.join(where_parts)};")
+        return stmts
+
+    def _preview(self):
+        stmts = self._generate_updates()
+        if stmts is None:
+            return
+        if not stmts:
+            self.result_view.setPlainText("変更がありません。")
+            return
+        self.result_view.setPlainText(
+            "-- 生成された UPDATE (適用前プレビュー) --\n" + "\n".join(stmts))
+        self._status(f"{len(stmts)} 件の UPDATE を生成")
+
+    def _apply(self):
+        stmts = self._generate_updates()
+        if stmts is None:
+            return
+        if not stmts:
+            QMessageBox.information(self, "変更なし", "適用する変更がありません。")
+            return
+        if not self.allow_edit_chk.isChecked():
+            QMessageBox.critical(self, "編集が許可されていません",
+                "⛔ このプロファイルでは編集が許可されていません。\n"
+                "『このプロファイルで編集を許可』を ON にしてください。")
+            return
+        prof = self._profiles.get(self.profile_combo.currentText())
+        if not prof:
+            QMessageBox.warning(self, "プロファイル未選択", "接続プロファイルを選択してください。")
+            return
+        sql = "\n".join(stmts)
+        body = self._build_cmd_body(self.edit_cmd.toPlainText(), sql)
+        if body is None:
+            return
+        rows = {r for r, _ in self._dirty}
+        r = QMessageBox.question(
+            self, "適用確認",
+            f"{len(rows)} 行 / {len(self._dirty)} セルの変更を適用します。\n\n"
+            f"{sql}\n\n1 トランザクションで COMMIT され、失敗時は ROLLBACK されます。",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.No)
+        if r != QMessageBox.StandardButton.Yes:
+            self._status("キャンセルしました")
+            return
+        self._mode = 'apply'
+        self._pending_sql = sql
+        self._pending_profile = self.profile_combo.currentText()
+        self._run_async(prof, body, "変更を適用中...")
+
+    # ── 非同期実行 ───────────────────────────────────────────────────────
+    def _run_async(self, prof: dict, body: str, status: str):
+        self.fetch_btn.setEnabled(False)
+        self.apply_btn.setEnabled(False)
+        self.preview_btn.setEnabled(False)
+        self._status(status)
+        self._worker = _ExecWorker(prof, body, self)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _on_done(self, out: str, err: str, exit_code: int):
+        self.fetch_btn.setEnabled(True)
+        self.apply_btn.setEnabled(True)
+        self.preview_btn.setEnabled(True)
+        if self._mode == 'select':
+            clean = _clean_sqlplus_output(out)
+            self._populate_grid(clean)
+            log = []
+            if err.strip():
+                log.append("-- [STDERR] --\n" + err.rstrip())
+            log.append(f"-- 取得完了 (exit={exit_code}), {self.table.rowCount()} 行 --")
+            self.result_view.setPlainText("\n".join(log))
+            self._status(f"取得 {self.table.rowCount()} 行 (exit={exit_code})")
+        else:  # apply
+            parts = []
+            if out.strip():
+                parts.append(out.rstrip())
+            if err.strip():
+                parts.append("\n-- [STDERR] --\n" + err.rstrip())
+            parts.append(f"\n-- exit code: {exit_code} --")
+            self.result_view.setPlainText("\n".join(parts))
+            status = "成功" if exit_code == 0 else f"失敗(exit={exit_code})"
+            _append_audit(self._pending_profile, self._pending_sql, status,
+                          detail=(err.strip().splitlines()[0] if err.strip() else ''))
+            if exit_code == 0:
+                # 適用成功: 現在のセル値を新しい original として確定し dirty をクリア
+                self.table.blockSignals(True)
+                for (r, c) in list(self._dirty):
+                    it = self.table.item(r, c)
+                    if it is not None:
+                        self._original[r][c] = it.text()
+                        it.setBackground(QColor(0, 0, 0, 0))
+                self._dirty.clear()
+                self.table.blockSignals(False)
+                self._update_dirty_label()
+                self._status("適用成功 (COMMIT 済)")
+            else:
+                self._status(f"適用エラー (exit={exit_code}) — ROLLBACK の可能性")
+
+    def _on_failed(self, msg: str):
+        self.fetch_btn.setEnabled(True)
+        self.apply_btn.setEnabled(True)
+        self.preview_btn.setEnabled(True)
+        self.result_view.setPlainText(f"接続/実行エラー:\n{msg}")
+        if self._mode == 'apply':
+            _append_audit(self._pending_profile, self._pending_sql, "接続エラー", detail=msg)
+        self._status("エラー")
+
+    def _status(self, text: str):
+        win = self.window()
+        if isinstance(win, QMainWindow):
+            win.statusBar().showMessage(text)
+
+
+# ---------------------------------------------------------------------------
 # メインウィンドウ
 # ---------------------------------------------------------------------------
 
@@ -707,17 +1255,8 @@ class DBEditorWindow(QMainWindow):
         tabs = QTabWidget()
         self.sql_tab = SqlEditTab()
         tabs.addTab(self.sql_tab, "SQL 実行")
-
-        # Phase 2: グリッド編集タブ (プレースホルダ)
-        grid_placeholder = QWidget()
-        gl = QVBoxLayout(grid_placeholder)
-        lbl = QLabel(
-            "グリッド編集タブは Phase 2 で実装予定です。\n\n"
-            "SELECT 結果を表で表示し、セルを直接編集 → 主キーから UPDATE を\n"
-            "自動生成 → ステージング → 一括コミット する機能を提供します。")
-        lbl.setAlignment(Qt.AlignmentFlag.AlignCenter)
-        gl.addWidget(lbl)
-        tabs.addTab(grid_placeholder, "グリッド編集 (Phase 2)")
+        self.grid_tab = GridEditTab()
+        tabs.addTab(self.grid_tab, "グリッド編集")
 
         self.setCentralWidget(tabs)
         self.setStatusBar(QStatusBar())
