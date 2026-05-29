@@ -36,7 +36,7 @@ from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QLabel,
     QComboBox, QPushButton, QPlainTextEdit, QTextEdit, QCheckBox, QMessageBox,
     QTabWidget, QStatusBar, QSplitter, QLineEdit, QTableWidget, QTableWidgetItem,
-    QHeaderView, QDialog, QListWidget, QListWidgetItem,
+    QHeaderView, QDialog, QListWidget, QListWidgetItem, QInputDialog,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
 from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor
@@ -155,6 +155,28 @@ _EDIT_KEYWORDS = frozenset({
     'DROP', 'CREATE', 'ALTER', 'RENAME', 'GRANT', 'REVOKE',
     'CALL', 'EXEC', 'EXECUTE', 'BEGIN', 'DECLARE', 'SET', 'REPLACE',
 })
+
+# ── 環境分類 (運用ミス防止) ─────────────────────────────────────────────
+# プロファイル毎に「本番 / 検証 / 開発 / 未分類」を設定し、常時バナー表示する。
+# 本番に対する更新操作はプロファイル名の打鍵確認を必須にする。
+_ENV_DEFS = {
+    'prod':    {'label': '本番環境 PRODUCTION', 'icon': '⛔',
+                'bg': '#b71c1c', 'fg': '#ffffff', 'border': '#7f0000'},
+    'staging': {'label': '検証環境 STAGING',    'icon': '⚠',
+                'bg': '#e65100', 'fg': '#ffffff', 'border': '#ac1900'},
+    'dev':     {'label': '開発環境 DEVELOPMENT', 'icon': '🛠',
+                'bg': '#1b5e20', 'fg': '#ffffff', 'border': '#003d00'},
+    'unknown': {'label': '環境未分類 — 分類してください', 'icon': '❔',
+                'bg': '#455a64', 'fg': '#ffffff', 'border': '#1c313a'},
+}
+_ENV_ORDER = ['unknown', 'dev', 'staging', 'prod']
+_ENV_COMBO_LABELS = {'unknown': '未分類', 'dev': '開発',
+                     'staging': '検証', 'prod': '本番'}
+
+
+def _get_env(prof: dict) -> str:
+    e = (prof or {}).get('db_env', 'unknown')
+    return e if e in _ENV_DEFS else 'unknown'
 
 
 # ---------------------------------------------------------------------------
@@ -538,10 +560,90 @@ class _ExecWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# 環境表示バナー / 環境ミックスイン (本番⇔それ以外の明確化)
+# ---------------------------------------------------------------------------
+
+class EnvBanner(QLabel):
+    """選択中プロファイルの環境分類を常時、目立つ色で表示するバナー。"""
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        f = self.font()
+        f.setBold(True)
+        f.setPointSize(max(11, f.pointSize() + 2))
+        self.setFont(f)
+        self.setMinimumHeight(36)
+        self.set_env('unknown', '')
+
+    def set_env(self, env: str, profile_name: str = ''):
+        d = _ENV_DEFS.get(env, _ENV_DEFS['unknown'])
+        name = f"  —  {profile_name}" if profile_name else ""
+        self.setText(f"{d['icon']}  {d['label']}{name}  {d['icon']}")
+        self.setStyleSheet(
+            f"QLabel {{ background:{d['bg']}; color:{d['fg']};"
+            f" border:2px solid {d['border']}; border-radius:4px; padding:5px; }}")
+
+
+class _EnvMixin:
+    """SqlEditTab / GridEditTab 共通の環境分類 UI・ガードを提供する。
+    利用側は self._profiles / self.profile_combo / self.env_combo /
+    self.env_banner を備えていることが前提。
+    """
+
+    def _make_env_combo(self) -> QComboBox:
+        combo = QComboBox()
+        for key in _ENV_ORDER:
+            combo.addItem(_ENV_COMBO_LABELS[key], key)
+        combo.setToolTip("この接続プロファイルの環境を分類します (プロファイルに保存)。\n"
+                         "本番に分類すると更新操作時にプロファイル名の打鍵確認を求めます。")
+        combo.currentIndexChanged.connect(self._on_env_changed)
+        return combo
+
+    def _on_env_changed(self):
+        name = self.profile_combo.currentText()
+        env = self.env_combo.currentData() or 'unknown'
+        if name and name in self._profiles:
+            self._profiles[name]['db_env'] = env
+            _save_db_profiles(self._profiles)
+        self.env_banner.set_env(env, name)
+
+    def _sync_env_ui(self, prof: dict, name: str):
+        env = _get_env(prof)
+        self.env_combo.blockSignals(True)
+        i = self.env_combo.findData(env)
+        self.env_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.env_combo.blockSignals(False)
+        self.env_banner.set_env(env, name)
+
+    def _is_production(self) -> bool:
+        return (self.env_combo.currentData() or 'unknown') == 'prod'
+
+    def _confirm_production(self, prof_name: str, action_desc: str) -> bool:
+        """本番環境への更新操作なら、プロファイル名の打鍵確認を求める。
+        本番でなければ常に True。"""
+        if not self._is_production():
+            return True
+        text, ok = QInputDialog.getText(
+            self, "⛔ 本番環境への操作 — 最終確認",
+            f"本番環境 ({prof_name}) に対する更新操作です。\n\n"
+            f"{action_desc}\n\n"
+            f"誤操作防止のため、実行するには接続プロファイル名\n"
+            f"『{prof_name}』を正確に入力してください:")
+        if not ok:
+            return False
+        if text.strip() != prof_name:
+            QMessageBox.critical(self, "確認失敗",
+                "入力がプロファイル名と一致しませんでした。操作を中止しました。")
+            return False
+        return True
+
+
+# ---------------------------------------------------------------------------
 # SQL 実行タブ (Phase 1 の本体)
 # ---------------------------------------------------------------------------
 
-class SqlEditTab(QWidget):
+class SqlEditTab(_EnvMixin, QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._profiles = _load_db_profiles()
@@ -557,6 +659,10 @@ class SqlEditTab(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
+        # 環境バナー (常時表示)
+        self.env_banner = EnvBanner()
+        root.addWidget(self.env_banner)
+
         # プロファイル + プリセット行
         top = QHBoxLayout()
         top.addWidget(QLabel("接続プロファイル:"))
@@ -564,6 +670,11 @@ class SqlEditTab(QWidget):
         self.profile_combo.setMinimumWidth(220)
         self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
         top.addWidget(self.profile_combo)
+
+        top.addSpacing(6)
+        top.addWidget(QLabel("環境分類:"))
+        self.env_combo = self._make_env_combo()
+        top.addWidget(self.env_combo)
 
         top.addSpacing(8)
         self.cmd_toggle = QPushButton("▶ DB実行コマンド設定")
@@ -697,6 +808,7 @@ class SqlEditTab(QWidget):
 
     def _on_profile_changed(self, name: str):
         prof = self._profiles.get(name, {})
+        self._sync_env_ui(prof, name)
         # 編集テンプレートはプロファイル別キー db_edit_cmd に保存
         tmpl = prof.get('db_edit_cmd', '')
         self.cmd_input.setPlainText(tmpl)
@@ -840,6 +952,12 @@ class SqlEditTab(QWidget):
                 self._status("キャンセルしました")
                 return
 
+        # 本番環境への更新はプロファイル名の打鍵確認を必須にする
+        if is_edit and not self._confirm_production(
+                prof_name, "更新系 SQL を実行しようとしています。"):
+            self._status("本番確認が未完了のため中止しました")
+            return
+
         self._mode = 'exec'
         self._pending_sql = sql
         self._pending_profile = prof_name
@@ -913,7 +1031,7 @@ class SqlEditTab(QWidget):
 # グリッド編集タブ (Phase 2)
 # ---------------------------------------------------------------------------
 
-class GridEditTab(QWidget):
+class GridEditTab(_EnvMixin, QWidget):
     """SELECT 結果を表で表示 → セル編集 → 主キーから UPDATE 自動生成 →
     ステージング → 一括コミット。
 
@@ -941,12 +1059,20 @@ class GridEditTab(QWidget):
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
+        # 環境バナー (常時表示)
+        self.env_banner = EnvBanner()
+        root.addWidget(self.env_banner)
+
         top = QHBoxLayout()
         top.addWidget(QLabel("接続プロファイル:"))
         self.profile_combo = QComboBox()
         self.profile_combo.setMinimumWidth(200)
         self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
         top.addWidget(self.profile_combo)
+        top.addSpacing(6)
+        top.addWidget(QLabel("環境分類:"))
+        self.env_combo = self._make_env_combo()
+        top.addWidget(self.env_combo)
         top.addSpacing(8)
         self.tmpl_toggle = QPushButton("▶ コマンドテンプレート設定")
         self.tmpl_toggle.setCheckable(True)
@@ -1098,6 +1224,7 @@ class GridEditTab(QWidget):
 
     def _on_profile_changed(self, name: str):
         prof = self._profiles.get(name, {})
+        self._sync_env_ui(prof, name)
         self.sel_cmd.setPlainText(prof.get('db_cmd', ''))
         self.edit_cmd.setPlainText(prof.get('db_edit_cmd', ''))
         self.allow_edit_chk.blockSignals(True)
@@ -1319,9 +1446,14 @@ class GridEditTab(QWidget):
         if r != QMessageBox.StandardButton.Yes:
             self._status("キャンセルしました")
             return
+        prof_name = self.profile_combo.currentText()
+        if not self._confirm_production(
+                prof_name, f"{len(rows)} 行の変更を適用しようとしています。"):
+            self._status("本番確認が未完了のため中止しました")
+            return
         self._mode = 'apply'
         self._pending_sql = sql
-        self._pending_profile = self.profile_combo.currentText()
+        self._pending_profile = prof_name
         self._run_async(prof, body, "変更を適用中...")
 
     # ── 非同期実行 ───────────────────────────────────────────────────────
