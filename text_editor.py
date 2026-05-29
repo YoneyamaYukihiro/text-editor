@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 
 import sys
 import os
@@ -24,7 +24,7 @@ from PyQt6.QtWidgets import (
 )
 from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal, QSize, QThread, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import (
-    QFont, QColor, QTextCharFormat, QSyntaxHighlighter,
+    QFont, QFontMetrics, QColor, QTextCharFormat, QSyntaxHighlighter,
     QKeySequence, QAction, QPainter, QTextFormat, QTextDocument,
 )
 
@@ -1602,6 +1602,13 @@ class FTPConnectDialog(QDialog):
         # --- 接続・キャンセル ---
         btns = QHBoxLayout()
         ok = QPushButton("接続")
+        # 主アクション → 緑で強調 (LogViewer のサーバー接続ボタンと統一)
+        ok.setStyleSheet(
+            "QPushButton{background:#3a6e3a;color:#e0f0e0;border:1px solid #4a8e4a;"
+            "font-weight:600;padding:3px 14px;border-radius:2px;}"
+            "QPushButton:hover{background:#4a8e4a;border:1px solid #5aa05a;}"
+        )
+        ok.setDefault(True)
         cancel = QPushButton("キャンセル")
         btns.addWidget(ok)
         btns.addWidget(cancel)
@@ -1744,6 +1751,105 @@ def _fmt_bytes(n: int) -> str:
     return f"{n:.1f} TB"
 
 
+class _FTPSizeDelegate(QStyledItemDelegate):
+    """FTPファイル一覧用デリゲート (2行表示)。
+    1行目に名前 (幅が足りなければ … で省略)、2行目にサイズ・日時を淡色小フォントで表示する。
+    メタ情報文字列 (例 "1.2 MB · May 22 16:51") は UserRole+1 に格納されている前提。
+    メタが無い項目 (フォルダ / 親フォルダ) は従来通り1行で縦中央に名前のみ描画する。
+    """
+    _META_ROLE = Qt.ItemDataRole.UserRole + 1
+
+    def _small_font(self, base: QFont) -> QFont:
+        f = QFont(base)
+        f.setPointSizeF(max(base.pointSizeF() - 1.5, 6.0))
+        return f
+
+    def sizeHint(self, option, index):
+        base = super().sizeHint(option, index)
+        if not index.data(self._META_ROLE):
+            return base
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        nfm = QFontMetrics(opt.font)
+        sfm = QFontMetrics(self._small_font(opt.font))
+        h = nfm.height() + sfm.height() + 6   # 上下 padding
+        return QSize(base.width(), max(base.height(), h))
+
+    def paint(self, painter, option, index):
+        meta = index.data(self._META_ROLE) or ''
+
+        opt = QStyleOptionViewItem(option)
+        self.initStyleOption(opt, index)
+        name = opt.text
+        opt.text = ''   # テキストは自前で描くので標準描画から外す (背景/選択のみ描かせる)
+        widget = opt.widget
+        style = widget.style() if widget else QApplication.style()
+        style.drawControl(QStyle.ControlElement.CE_ItemViewItem, opt, painter, widget)
+
+        text_rect = style.subElementRect(
+            QStyle.SubElement.SE_ItemViewItemText, opt, widget
+        )
+        painter.save()
+        selected = bool(opt.state & QStyle.StateFlag.State_Selected)
+
+        # 名前色 (選択中は強調色 / それ以外は項目指定色 → 既定色)
+        if selected:
+            name_color = opt.palette.color(
+                opt.palette.ColorGroup.Active,
+                opt.palette.ColorRole.HighlightedText)
+        else:
+            fg = index.data(Qt.ItemDataRole.ForegroundRole)
+            if fg is not None and hasattr(fg, 'color'):
+                name_color = fg.color()           # ディレクトリ等の指定色を尊重
+            elif fg is not None:
+                name_color = QColor(fg)
+            else:
+                name_color = opt.palette.color(
+                    opt.palette.ColorGroup.Active, opt.palette.ColorRole.Text)
+
+        left = text_rect.left() + 2
+        right_pad = 6
+        avail_w = max(text_rect.width() - 2 - right_pad, 0)
+
+        name_font = opt.font
+        nfm = QFontMetrics(name_font)
+
+        if not meta:
+            # 1行: 縦中央に名前のみ (フォルダ / 親フォルダ)
+            painter.setFont(name_font)
+            painter.setPen(name_color)
+            elided = nfm.elidedText(name, Qt.TextElideMode.ElideRight, avail_w)
+            painter.drawText(
+                text_rect.adjusted(2, 0, -right_pad, 0),
+                int(Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft),
+                elided,
+            )
+            painter.restore()
+            return
+
+        # 2行: 名前 (上) + サイズ・日時 (下 / 淡色小フォント)
+        small_font = self._small_font(name_font)
+        sfm = QFontMetrics(small_font)
+        total_h = nfm.height() + sfm.height()
+        top = text_rect.top() + max((text_rect.height() - total_h) // 2, 0)
+
+        # 1行目: 名前
+        painter.setFont(name_font)
+        painter.setPen(name_color)
+        name_elided = nfm.elidedText(name, Qt.TextElideMode.ElideRight, avail_w)
+        painter.drawText(left, top + nfm.ascent(), name_elided)
+
+        # 2行目: メタ (アイコン分インデントして名前の直下に揃える)
+        indent = nfm.horizontalAdvance("📄 ")
+        painter.setFont(small_font)
+        meta_color = (name_color if selected else QColor("#7a8290"))
+        painter.setPen(meta_color)
+        meta_elided = sfm.elidedText(meta, Qt.TextElideMode.ElideRight,
+                                     max(avail_w - indent, 0))
+        painter.drawText(left + indent, top + nfm.height() + sfm.ascent(), meta_elided)
+        painter.restore()
+
+
 class FTPPanel(QWidget):
     file_downloaded      = pyqtSignal(str, str)  # content, filename (互換用)
     file_downloaded_path = pyqtSignal(str, str)  # local_path, filename (新規)
@@ -1797,6 +1903,8 @@ class FTPPanel(QWidget):
             "Ctrl+クリック または Shift+クリック で複数選択可能\n"
             "複数選択時は「開く / ダウンロード」ボタンでまとめて取得"
         )
+        # 名前=左寄せ(省略可)/ サイズ=右端淡色 で描画するデリゲート
+        self.file_list.setItemDelegate(_FTPSizeDelegate(self.file_list))
         layout.addWidget(self.file_list)
 
         self.open_btn = QPushButton("開く / ダウンロード")
@@ -1978,9 +2086,24 @@ class FTPPanel(QWidget):
                     item = QListWidgetItem(f"📁 {name}")
                     item.setData(Qt.ItemDataRole.UserRole, ('dir', name))
                     item.setForeground(QColor("#6897BB"))
+                    item.setToolTip(name)
                 else:
                     item = QListWidgetItem(f"📄 {name}")
                     item.setData(Qt.ItemDataRole.UserRole, ('file', name))
+                    # LIST (ls -l 形式): 5列目=バイト数, 6-8列目=月 日 時刻/年
+                    size_str = ''
+                    try:
+                        size_str = _fmt_bytes(int(parts[4]))
+                    except (ValueError, IndexError):
+                        size_str = ''
+                    date_str = ' '.join(parts[5:8])   # 例: "May 22 16:51"
+                    # 2行目メタ: 「サイズ · 日時」(取得できた要素のみ連結)
+                    meta = ' · '.join(s for s in (size_str, date_str) if s)
+                    if meta:
+                        item.setData(Qt.ItemDataRole.UserRole + 1, meta)
+                        item.setToolTip(f"{name}\n{meta}")
+                    else:
+                        item.setToolTip(name)
                 self.file_list.addItem(item)
         except Exception as e:
             QMessageBox.warning(self, "エラー", str(e))
@@ -4543,8 +4666,12 @@ class MainWindow(QMainWindow):
 _LOG_PREFIX_RE = re.compile(
     r'^\s*'
     r'(?:<\d+>\s*)?'                                                # <PID>
+    # [YYYY/MM/DD HH:MM:SS.mmm][LEVEL][THREAD][Class#method():line] 形式の先頭ブラケット連鎖
+    r'(?:\[\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?\]\s*(?:\[[^\]]*\]\s*)*)?'
     r'(?:\[\w+\]\s*)?'                                              # [LEVEL]
-    r'(?:\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)?\s*)?',  # YYYY/MM/DD HH:MM:SS.mmm
+    r'(?:\d{4}[-/]\d{2}[-/]\d{2}(?:[T ]\d{1,2}:\d{2}:\d{2}(?:[.,]\d+)?)?\s*)?'  # YYYY/MM/DD HH:MM:SS.mmm
+    # 裸のレベル語 (ブラケット無し)。例: "2024-07-04 13:03:46 INFO Hibernate: ..."
+    r'(?:(?:ERROR|CRITICAL|FATAL|SEVERE|WARN(?:ING)?|INFO(?:RMATION)?|DEBUG|TRACE|VERBOSE|FINE|FINER|FINEST|CONFIG)\s+)?',
     re.IGNORECASE,
 )
 
@@ -4570,7 +4697,15 @@ _SQL_START_KW = re.compile(
     r'\b(SELECT|INSERT\s+INTO|INSERT|UPDATE|DELETE\s+FROM|DELETE|WITH|MERGE|CALL)\b',
     re.IGNORECASE,
 )
+# SQL文の開始判定: 本文の「先頭」が SQL ステートメントで始まる場合のみ採用する。
+# .search() で行中どこでもヒットさせると、ログ本文の "...History: #delete" のような
+# 語尾が DELETE/INSERT 等に誤マッチして、ログ全体を1つのSQLとして飲み込んでしまうため。
+_SQL_START_ANCHORED = re.compile(
+    r'^(SELECT\b|INSERT\s+INTO\b|UPDATE\s+\w|DELETE\s+FROM\b|WITH\s+\w|MERGE\s+INTO\b|CALL\s+\w)',
+    re.IGNORECASE,
+)
 _LOG_LINE_START = re.compile(
+    r'^\s*\[\d{4}[-/]\d{2}[-/]\d{2}[ T]\d{1,2}:\d{2}:\d{2}|'  # [YYYY/MM/DD HH:MM:SS...] 先頭ブラケット日時
     r'^\s*<\d+>\s*(?:\[\w+\])?\s*\d{4}[-/]\d{2}[-/]\d{2}|'   # <PID>[LEVEL]YYYY/MM/DD
     r'^\s*\[\w+\]\s*\d{4}[-/]\d{2}[-/]\d{2}|'                # [LEVEL]YYYY/MM/DD
     r'^\s*\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}|'     # YYYY-MM-DD HH:MM:SS
@@ -4737,11 +4872,15 @@ def _extract_sql_from_log(log_text: str, extra_prefixes: list[str]) -> list[dict
 
         # ログ行ヘッダ (<PID>[LEVEL]DATE TIME) を剥がしてから SQL プレフィックスも剥がす
         body = _LOG_PREFIX_RE.sub('', stripped, count=1).strip()
-        body = prefix_re.sub('', body, count=1).strip() if prefix_re.search(body) else body
+        # SQL プレフィックス (Hibernate: など) があれば、それ以降を本文とする
+        # (プレフィックス前に残ったログ語を確実に落とすため、後方一致で切り出す)
+        pm = prefix_re.search(body)
+        if pm:
+            body = body[pm.end():].strip()
 
-        if _SQL_START_KW.search(body) and is_log_line_start:
+        if _SQL_START_ANCHORED.match(body) and is_log_line_start:
             # 新規SQL: 直前のSQL継続中なら一度確定してから新規スタート
-            # (ログ行ヘッダ付きで SQL が始まったときのみ新規扱い、SQL内の SELECT 等は無視)
+            # (ログ行ヘッダ付きで本文が SQL で始まったときのみ新規扱い、SQL内の SELECT 等は無視)
             flush()
             current_lineno = lineno
             current_sql_parts.append(body)
@@ -4752,8 +4891,8 @@ def _extract_sql_from_log(log_text: str, extra_prefixes: list[str]) -> list[dict
             else:
                 # SQL の継続行 (折り返し)
                 current_sql_parts.append(body)
-        elif _SQL_START_KW.search(body):
-            # ログ行ヘッダなしで始まる SQL (Hibernate: の直後など)
+        elif _SQL_START_ANCHORED.match(body):
+            # ログ行ヘッダなしで本文が SQL で始まる (Hibernate: の直後など)
             flush()
             current_lineno = lineno
             current_sql_parts.append(body)

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.5"
+__version__ = "1.1.6"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1593,7 +1593,7 @@ class ServerPanel(QWidget):
         self.tree.setHeaderHidden(True)
         self.tree.itemDoubleClicked.connect(self._on_double_click)
         self.tree.itemExpanded.connect(self._on_expand)
-        # フォルダをクリックしたらパス欄に反映 (📌保存・last_dir対象を一致させる)
+        # フォルダをクリックしたらパス欄に反映 (📌保存の対象DIRと一致させる)
         self.tree.itemClicked.connect(self._on_tree_clicked)
         self.tree.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
         self.tree.customContextMenuRequested.connect(self._on_tree_context_menu)
@@ -1684,29 +1684,8 @@ class ServerPanel(QWidget):
         self.path_input.setText(path)
         self.tree.clear()
         self._fill(self.tree.invisibleRootItem(), path)
-        # ナビゲートしたディレクトリをプロファイルに自動永続化
-        self._persist_last_dir(path)
-
-    def _persist_last_dir(self, path: str):
-        """現在のディレクトリを接続中プロファイルの last_dir に保存。
-        - プロファイル名が無い (-- 新規 -- や手動接続) 場合は何もしない
-        - 値が前回と同じならスキップ (無駄な disk write を防ぐ)
-        - log_dir は手動「📌 保存」用に温存し、ここでは触らない
-        """
-        name = getattr(self, '_profile_name', '')
-        if not name or name == '-- 新規 --':
-            return
-        try:
-            profs = _load_profiles()
-            if name not in profs:
-                return
-            normalized = (path or '').rstrip('/') or '/'
-            if profs[name].get('last_dir') == normalized:
-                return
-            profs[name]['last_dir'] = normalized
-            _save_profiles(profs)
-        except Exception:
-            pass
+        # 接続時の初期DIRは設定済みの log_dir (📌で保存する初期値) を使う方針のため、
+        # ここでナビゲート先を自動保存することはしない (前回DIRの自動復元は廃止)。
 
     def _fill(self, parent, path: str):
         try:
@@ -1855,6 +1834,8 @@ class SSHConnectDialog(QDialog):
 
         btns = QHBoxLayout()
         ok = QPushButton("接続")
+        ok.setProperty("primary", True)   # 主アクション → 緑で強調
+        ok.setDefault(True)
         ok.clicked.connect(self.accept)
         cancel = QPushButton("キャンセル")
         cancel.clicked.connect(self.reject)
@@ -1868,6 +1849,8 @@ class SSHConnectDialog(QDialog):
             QLineEdit{background:#3a3a3a;color:#a9b7c6;border:1px solid #555;padding:1px 3px;}
             QPushButton{background:#4a4a4a;color:#a9b7c6;border:none;padding:2px 8px;border-radius:2px;}
             QPushButton:hover{background:#5a5a5a;}
+            QPushButton[primary='true']{background:#3a6e3a;color:#e0f0e0;border:1px solid #4a8e4a;font-weight:600;padding:3px 14px;}
+            QPushButton[primary='true']:hover{background:#4a8e4a;border:1px solid #5aa05a;}
             QComboBox{background:#3a3a3a;color:#a9b7c6;border:1px solid #555;padding:1px 3px;}
             QComboBox::drop-down{border:none;width:14px;}
             QComboBox QAbstractItemView{background:#2b2b2b;color:#a9b7c6;selection-background-color:#214283;}
@@ -3287,18 +3270,9 @@ class MainWindow(QMainWindow):
             conn.connect(info['host'], info['port'], info['user'],
                          info['password'], info.get('key_path', ''))
             color_idx  = len(self._panels)
-            # 接続ダイアログで選択した保存済みプロファイル名から last_dir を参照
-            # (前回切断時に居たディレクトリで開く)
-            prof_name_init = dlg.combo.currentText() if dlg.combo.currentText() != '-- 新規 --' else ''
+            # 接続時の初期DIRは設定済みの log_dir (📌で保存した初期値) を使う。
+            # 前回切断時DIRの自動復元 (last_dir) は廃止した。
             log_dir = info.get('log_dir', '/var/log') or '/var/log'
-            if prof_name_init:
-                try:
-                    profs = _load_profiles()
-                    last = (profs.get(prof_name_init, {}) or {}).get('last_dir')
-                    if last:
-                        log_dir = last
-                except Exception:
-                    pass
             panel = ServerPanel(conn, color_idx, log_dir, self)
             panel.file_open_requested.connect(self._open_log)
             panel.edit_open_requested.connect(self._open_in_text_editor)
@@ -3518,8 +3492,8 @@ class MainWindow(QMainWindow):
         user = info.get('user', '')
         password = info.get('password', '')
         key_path = info.get('key_path', '')
-        # last_dir があれば優先 (前回切断時のDIRを自動復元)、無ければ log_dir
-        log_dir = (info.get('last_dir') or info.get('log_dir') or '/var/log') or '/var/log'
+        # 設定済みの初期DIR (log_dir) を使う (前回DIRの自動復元は廃止)
+        log_dir = (info.get('log_dir') or '/var/log') or '/var/log'
 
         if not password and not (key_path and proto == 'SSH'):
             password, ok = QInputDialog.getText(
@@ -4144,13 +4118,10 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "警告", f"プロファイル「{name}」が見つかりません。")
             return
         dir_value = path.strip()
+        # 初期DIR = log_dir のみを保存 (last_dir 自動復元は廃止したため書かない)
         profiles[name]['log_dir'] = dir_value
-        # 接続時の初期DIR解決は last_dir を優先する。📌 で明示保存した時は
-        # その意図を尊重し last_dir も同じ値に揃える (自動記憶に上書きされて
-        # 効かない問題を防ぐ)。
-        profiles[name]['last_dir'] = dir_value
         _save_profiles(profiles)
-        # パネル側の path_input も保存値に合わせておく (以降の last_dir 追従の基準)
+        # パネル側の path_input も保存値に合わせておく
         try:
             panel.path_input.setText(dir_value)
         except Exception:
