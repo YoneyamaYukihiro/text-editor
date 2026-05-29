@@ -6,6 +6,7 @@
 |---|---|
 | **Multi-Server Log Viewer** ([ssh_log_viewer.py](ssh_log_viewer.py)) | 複数サーバーへ SSH/Telnet 同時接続、グリッドでログをリアルタイム表示 |
 | **Sora Editor** ([text_editor.py](text_editor.py)) | 過去ログの編集・整形、Grep、SQL抽出/整形/実行、各種シンタックスハイライト |
+| **DB Editor** ([db_editor.py](db_editor.py)) *(Phase 1)* | 既存の SSH 接続プロファイルを流用し、更新系 SQL を安全装置付きで実行する DB 編集ツール |
 
 - バージョン: **1.1.8**
 - 対応OS: Windows 10/11 (Linux/macOS も Python経由で動作)
@@ -482,6 +483,50 @@ SQL抽出ダイアログから呼ばれた場合は、DB実行ダイアログ内
 - `set markup csv on quote on` を自動適用
 - `csv.reader` でクォート付き CSV を正しくパース
 - **値内に改行を含む CSV** (Oracle の複数行 COMMENTS 列等) も正しく解釈
+
+---
+
+## DB Editor — SSH経由DB編集ツール (Phase 1)
+
+[db_editor.py](db_editor.py) は、Sora Editor の `DBExecuteDialog` が **参照専用**
+(SELECT/WITH 等のみ) なのに対し、**更新系 SQL (INSERT/UPDATE/DELETE/MERGE/DDL)**
+を実行できる独立アプリです。
+
+```bash
+python db_editor.py
+```
+
+### 設計方針
+
+- **既存の SSH 接続を流用**: 接続層は `ssh_log_viewer.SSHConnection`、接続プロファイルは
+  両アプリ共通の `~/.ssh_log_viewer_profiles.json` をそのまま使う (再設定不要)
+- **シンタックスハイライト/テーマ**も Sora Editor のものを流用
+- **トランザクション方式 (案A: ステージング + 一括TX)**: 編集 SQL は 1 回の
+  `exec_command` でまとめて送信し、テンプレート側で `BEGIN ... COMMIT` /
+  失敗時 `ROLLBACK` を保証する
+
+### 安全装置
+
+| 装置 | 内容 |
+|---|---|
+| プロファイル別 編集許可 | 「このプロファイルで編集を許可」を ON にしない限り更新系 SQL をブロック (本番誤実行防止) |
+| WHERE 句必須チェック | WHERE のない UPDATE/DELETE を警告 |
+| 危険操作の警告 | DROP / TRUNCATE / ALTER 等を検出して警告表示 |
+| 影響行プレビュー | UPDATE/DELETE の WHERE 条件を `SELECT COUNT(*)` に変換して件数確認 |
+| ドライラン | 実行せず、生成スクリプト全文を表示 |
+| 実行前の最終確認 | 更新系 SQL は内容・注意点を提示して明示確認 |
+| 監査ログ | 実行した編集系 SQL を `~/.db_editor_audit.log` に追記 |
+
+### DBプリセット (編集系テンプレート)
+
+Oracle (sqlplus) / MySQL・MariaDB / PostgreSQL / SQLite / SQL Server (sqlcmd) の
+雛形を内蔵。いずれもトランザクションで包み、エラー時に ROLLBACK される構成。
+`USER/PASS/SID` 等を実値に書き換え、プロファイルへ保存できます。
+
+### タブ構成
+
+1. **SQL 実行** — 更新系 SQL を直接実行 (Phase 1 実装済み)
+2. **グリッド編集** — SELECT 結果をセル編集 → UPDATE 自動生成 (Phase 2 予定)
 
 ---
 
