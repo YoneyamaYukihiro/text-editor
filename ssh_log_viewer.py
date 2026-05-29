@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.7"
+__version__ = "1.1.8"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1018,6 +1018,9 @@ class MiniLogViewer(QWidget):
     editor_requested = pyqtSignal(object, str)   # conn, path
     sql_selection_requested = pyqtSignal(object, str)  # conn, 選択テキスト
 
+    # tail 放置時のメモリ無限増加を防ぐ保持上限 (元データ・表示の両方に適用)
+    _MAX_LINES = 50000
+
     def __init__(self, conn: SSHConnection, path: str,
                  server_label: str, color_idx: int, parent=None):
         super().__init__(parent)
@@ -1116,6 +1119,8 @@ class MiniLogViewer(QWidget):
         # ── テキストエリア ────────────────────────────────────────────
         self.text = QPlainTextEdit()
         self.text.setReadOnly(True)
+        # 行数上限を設定し、古い行を自動破棄してメモリ無限増加を防ぐ
+        self.text.setMaximumBlockCount(self._MAX_LINES)
         mode = LogHighlighter.detect_mode_for_file(self.filepath)
         self.highlighter = LogHighlighter(self.text.document(), mode=mode)
         # 右クリックで「選択範囲をSoraでSQL抽出」を出すためカスタムメニュー
@@ -1248,6 +1253,9 @@ class MiniLogViewer(QWidget):
 
     def _append(self, text: str):
         self._all_lines.extend(text.splitlines())
+        # 元データも上限で丸めてメモリ無限増加を防ぐ (表示は maximumBlockCount で別途制限)
+        if len(self._all_lines) > self._MAX_LINES:
+            del self._all_lines[:len(self._all_lines) - self._MAX_LINES]
         if not self.filter_input.text() and self._level_key() == 'ALL':
             self.text.appendPlainText(text)
         else:
