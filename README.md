@@ -505,6 +505,21 @@ python db_editor.py
   `exec_command` でまとめて送信し、テンプレート側で `BEGIN ... COMMIT` /
   失敗時 `ROLLBACK` を保証する
 
+### 実行OS (Unix/Linux ⇔ Windows)
+
+SSH 接続先の OS に応じて実行方式を切り替えられます。各タブの「**実行OS**」で選択し、
+プロファイル (`db_exec_os`) に保存されます。
+
+| 実行OS | 実行方式 | 想定構成 |
+|---|---|---|
+| **Unix/Linux** (既定) | SFTP で一時スクリプトを `/tmp` に置き `bash --login` + heredoc で実行 | SSH先が Linux。MySQL/PG が別の Windows 機でも、`-h <Windowsホスト>` で接続すれば OK |
+| **Windows** | bash/heredoc/`/tmp` を使わず、`cmd.exe`/PowerShell で単一行コマンド (`mysql -e` / `psql -c` / `sqlcmd -Q`) を直接実行 | **Windows サーバーに直接 SSH** (Windows OpenSSH) する構成 |
+
+- Windows モードでは MySQL / PostgreSQL / SQL Server 用の**単一行テンプレート**
+  (トランザクションをインライン埋め込み) を内蔵。`HOST`/`USER`/`PASS`/`DBNAME` を実値に
+- インライン実行の事故防止のため、Windows モードでは SQL の **コメント除去＋改行平坦化**
+  を自動で行います (複数文は `;` 区切りで連結)
+
 ### 環境分類 (本番⇔それ以外の明確化 / 運用ミス防止)
 
 接続プロファイル毎に **本番 / 検証 / 開発 / 未分類** を分類でき、選択中の環境を

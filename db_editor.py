@@ -143,6 +143,53 @@ _DB_EDIT_PRESETS = {
     ),
 }
 
+# ── Windows 直 SSH 用テンプレート ───────────────────────────────────────
+# Windows OpenSSH に直接 SSH する構成では bash/heredoc/tmp が使えないため、
+# cmd.exe/PowerShell で動く単一行コマンド (mysql -e / psql -c / sqlcmd -Q) を使う。
+# トランザクションはインラインに埋め込み、{SQL} は改行平坦化された SQL で置換する。
+_DB_EDIT_PRESETS_WIN = {
+    "MySQL/MariaDB": (
+        'mysql -u USER -pPASS -h HOST DBNAME '
+        '-e "START TRANSACTION; {SQL} COMMIT;"'
+    ),
+    "PostgreSQL": (
+        'psql "host=HOST user=USER password=PASS dbname=DBNAME" '
+        '-v ON_ERROR_STOP=1 -c "BEGIN; {SQL} COMMIT;"'
+    ),
+    "SQL Server (sqlcmd)": (
+        'sqlcmd -S HOST -U USER -P PASS -d DBNAME -b '
+        '-Q "SET XACT_ABORT ON; BEGIN TRAN; {SQL} COMMIT TRAN"'
+    ),
+}
+_DB_CMD_PRESETS_WIN = {
+    "MySQL/MariaDB": 'mysql -u USER -pPASS -h HOST DBNAME --batch -e "{SQL}"',
+    "PostgreSQL": 'psql "host=HOST user=USER password=PASS dbname=DBNAME" --csv -c "{SQL}"',
+    "SQL Server (sqlcmd)": 'sqlcmd -S HOST -U USER -P PASS -d DBNAME -s "," -W -Q "{SQL}"',
+}
+
+
+def _edit_presets_for(exec_os: str) -> dict:
+    return _DB_EDIT_PRESETS_WIN if exec_os == 'windows' else _DB_EDIT_PRESETS
+
+
+def _read_presets_for(exec_os: str) -> dict:
+    return _DB_CMD_PRESETS_WIN if exec_os == 'windows' else _DB_CMD_PRESETS
+
+
+def _prepare_sql_for_os(sql: str, exec_os: str) -> str:
+    """実行OSに応じて SQL を整形する。
+    Windows のインライン -e/-c/-Q では改行が使えず、`--` 行コメントを平坦化すると
+    後続が全部コメント化する危険があるため、コメントを除去し改行を空白へ畳む。
+    """
+    s = sql.replace('\r\n', '\n').replace('\r', '\n')
+    if exec_os != 'windows':
+        return s
+    s = re.sub(r'--[^\n]*', ' ', s)              # 行コメント除去
+    s = re.sub(r'/\*.*?\*/', ' ', s, flags=re.DOTALL)  # ブロックコメント除去
+    s = ' '.join(line.strip() for line in s.splitlines())  # 改行を空白へ
+    return re.sub(r'\s+', ' ', s).strip()
+
+
 # テーブルブラウザ用のメタデータ照会 (DB種別ごと)。{T} をテーブル名で置換する。
 # いずれも単一列を返す参照クエリで、参照用テンプレート (db_cmd) 経由で実行する。
 _DB_META_QUERIES = {
@@ -559,10 +606,11 @@ class _ExecWorker(QThread):
     finished_ok = pyqtSignal(str, str, int)   # stdout, stderr, exit_code
     failed = pyqtSignal(str)                   # error message
 
-    def __init__(self, profile: dict, cmd_body: str, parent=None):
+    def __init__(self, profile: dict, cmd_body: str, parent=None, exec_os: str = 'unix'):
         super().__init__(parent)
         self._profile = profile
         self._cmd_body = cmd_body
+        self._exec_os = exec_os
 
     def run(self):
         try:
@@ -592,40 +640,52 @@ class _ExecWorker(QThread):
                                password=password, timeout=15,
                                look_for_keys=False, allow_agent=False)
 
-            # SFTP で一時スクリプトを書いて bash -l で実行 (DBExecuteDialog と同方式)
-            script_path = f"/tmp/db_editor_{int(time.time() * 1000)}_{os.getpid()}.sh"
-            script_content = (
-                "#!/bin/bash --login\n"
-                "set -o pipefail\n"
-                + self._cmd_body
-                + ("\n" if not self._cmd_body.endswith("\n") else "")
-            )
-            sftp = client.open_sftp()
-            try:
-                with sftp.open(script_path, "w") as f:
-                    f.write(script_content)
-                sftp.chmod(script_path, 0o700)
-            finally:
+            if self._exec_os == 'windows':
+                # Windows OpenSSH: bash/heredoc/tmp は使えない。既定シェル
+                # (cmd.exe/PowerShell) で単一行コマンドを直接実行する。
+                # cmd_body は単一行テンプレート (mysql -e / psql -c / sqlcmd -Q) 前提。
+                run_cmd = " ".join(self._cmd_body.splitlines()).strip()
+                _, stdout, stderr = client.exec_command(
+                    run_cmd, timeout=180, get_pty=False)
+                out = stdout.read().decode('utf-8', errors='replace')
+                err = stderr.read().decode('utf-8', errors='replace')
+                exit_code = stdout.channel.recv_exit_status()
+                self.finished_ok.emit(out, err, exit_code)
+            else:
+                # Unix/Linux: SFTP で一時スクリプトを書いて bash -l で実行
+                script_path = f"/tmp/db_editor_{int(time.time() * 1000)}_{os.getpid()}.sh"
+                script_content = (
+                    "#!/bin/bash --login\n"
+                    "set -o pipefail\n"
+                    + self._cmd_body
+                    + ("\n" if not self._cmd_body.endswith("\n") else "")
+                )
+                sftp = client.open_sftp()
                 try:
+                    with sftp.open(script_path, "w") as f:
+                        f.write(script_content)
+                    sftp.chmod(script_path, 0o700)
+                finally:
+                    try:
+                        sftp.close()
+                    except Exception:
+                        pass
+
+                _, stdout, stderr = client.exec_command(
+                    f"bash --login {script_path}", timeout=180, get_pty=False
+                )
+                out = stdout.read().decode('utf-8', errors='replace')
+                err = stderr.read().decode('utf-8', errors='replace')
+                exit_code = stdout.channel.recv_exit_status()
+
+                try:
+                    sftp = client.open_sftp()
+                    sftp.remove(script_path)
                     sftp.close()
                 except Exception:
                     pass
 
-            _, stdout, stderr = client.exec_command(
-                f"bash --login {script_path}", timeout=180, get_pty=False
-            )
-            out = stdout.read().decode('utf-8', errors='replace')
-            err = stderr.read().decode('utf-8', errors='replace')
-            exit_code = stdout.channel.recv_exit_status()
-
-            try:
-                sftp = client.open_sftp()
-                sftp.remove(script_path)
-                sftp.close()
-            except Exception:
-                pass
-
-            self.finished_ok.emit(out, err, exit_code)
+                self.finished_ok.emit(out, err, exit_code)
         except Exception as e:
             self.failed.emit(str(e))
         finally:
@@ -652,8 +712,9 @@ class TableBrowserDialog(QDialog):
     table_selected = pyqtSignal(str, list, list)
 
     def __init__(self, profile: dict, read_template: str,
-                 db_type: str = '', parent=None):
+                 db_type: str = '', parent=None, exec_os: str = 'unix'):
         super().__init__(parent)
+        self._exec_os = exec_os
         self.setWindowTitle("テーブルブラウザ")
         self.resize(720, 560)
         self.setWindowFlags(
@@ -733,14 +794,15 @@ class TableBrowserDialog(QDialog):
                 "参照用 (SELECT) テンプレートが未設定です。\n"
                 "グリッド編集タブの『コマンドテンプレート設定』で設定してください。")
             return
-        body = body.replace('{SQL}', sql.replace('\r\n', '\n').replace('\r', '\n'))
-        body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
-                      lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
+        body = body.replace('{SQL}', _prepare_sql_for_os(sql, self._exec_os))
+        if self._exec_os != 'windows':
+            body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
+                          lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
         self._action = action
         self.list_btn.setEnabled(False)
         self.use_btn.setEnabled(False)
         self.status_lbl.setText("照会中...")
-        self._worker = _ExecWorker(self._profile, body, self)
+        self._worker = _ExecWorker(self._profile, body, self, exec_os=self._exec_os)
         self._worker.finished_ok.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
@@ -926,6 +988,16 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.env_combo = self._make_env_combo()
         top.addWidget(self.env_combo)
 
+        top.addSpacing(6)
+        top.addWidget(QLabel("実行OS:"))
+        self.os_combo = QComboBox()
+        self.os_combo.addItem("Unix/Linux", "unix")
+        self.os_combo.addItem("Windows", "windows")
+        self.os_combo.setToolTip("SSH接続先のOS。Windows直SSHではbash/heredocを使わず\n"
+                                 "単一行コマンド(mysql -e/psql -c/sqlcmd -Q)で実行します。")
+        self.os_combo.currentIndexChanged.connect(self._on_os_changed)
+        top.addWidget(self.os_combo)
+
         top.addSpacing(8)
         self.cmd_toggle = QPushButton("▶ DB実行コマンド設定")
         self.cmd_toggle.setCheckable(True)
@@ -1056,9 +1128,17 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.profile_combo.blockSignals(False)
         self._on_profile_changed(self.profile_combo.currentText())
 
+    def _exec_os(self) -> str:
+        return self.os_combo.currentData() or 'unix'
+
     def _on_profile_changed(self, name: str):
         prof = self._profiles.get(name, {})
         self._sync_env_ui(prof, name)
+        self.os_combo.blockSignals(True)
+        i = self.os_combo.findData(prof.get('db_exec_os', 'unix'))
+        self.os_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.os_combo.blockSignals(False)
+        self._refill_presets()
         # 編集テンプレートはプロファイル別キー db_edit_cmd に保存
         tmpl = prof.get('db_edit_cmd', '')
         self.cmd_input.setPlainText(tmpl)
@@ -1066,9 +1146,24 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.allow_edit_chk.setChecked(bool(prof.get('db_edit_allowed', False)))
         self.allow_edit_chk.blockSignals(False)
 
+    def _on_os_changed(self):
+        name = self.profile_combo.currentText()
+        if name and name in self._profiles:
+            self._profiles[name]['db_exec_os'] = self._exec_os()
+            _save_db_profiles(self._profiles)
+        self._refill_presets()
+
+    def _refill_presets(self):
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.clear()
+        self.preset_combo.addItem("（選択）")
+        for nm in _edit_presets_for(self._exec_os()):
+            self.preset_combo.addItem(nm)
+        self.preset_combo.blockSignals(False)
+
     def _on_preset_changed(self, idx: int):
         name = self.preset_combo.currentText()
-        tmpl = _DB_EDIT_PRESETS.get(name)
+        tmpl = _edit_presets_for(self._exec_os()).get(name)
         if tmpl:
             self.cmd_input.setPlainText(tmpl)
             if not self.cmd_input.isVisible():
@@ -1107,9 +1202,12 @@ class SqlEditTab(_EnvMixin, QWidget):
             QMessageBox.warning(self, "テンプレートエラー",
                 "テンプレートに {SQL} プレースホルダーが含まれていません。")
             return None
-        # 改行正規化 + heredoc の安全弁 (<<EOF を <<'EOF' に補正)
-        s = sql.replace('\r\n', '\n').replace('\r', '\n')
+        exec_os = self._exec_os()
+        s = _prepare_sql_for_os(sql, exec_os)
         cmd_body = cmd_template.replace('{SQL}', s)
+        if exec_os == 'windows':
+            return cmd_body
+        # Unix: 改行正規化 + heredoc の安全弁 (<<EOF を <<'EOF' に補正)
         cmd_body = cmd_body.replace('\r\n', '\n').replace('\r', '\n')
         cmd_body = re.sub(
             r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
@@ -1222,7 +1320,7 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.preview_btn.setEnabled(False)
         self._status(status)
         self.result_view.setPlainText(f"-- {status} --\n")
-        self._worker = _ExecWorker(prof, cmd_body, self)
+        self._worker = _ExecWorker(prof, cmd_body, self, exec_os=self._exec_os())
         self._worker.finished_ok.connect(self._on_exec_done)
         self._worker.failed.connect(self._on_exec_failed)
         self._worker.start()
@@ -1341,6 +1439,14 @@ class GridEditTab(_EnvMixin, QWidget):
         top.addWidget(QLabel("環境分類:"))
         self.env_combo = self._make_env_combo()
         top.addWidget(self.env_combo)
+        top.addSpacing(6)
+        top.addWidget(QLabel("実行OS:"))
+        self.os_combo = QComboBox()
+        self.os_combo.addItem("Unix/Linux", "unix")
+        self.os_combo.addItem("Windows", "windows")
+        self.os_combo.setToolTip("SSH接続先のOS。Windows直SSHでは単一行コマンドで実行します。")
+        self.os_combo.currentIndexChanged.connect(self._on_os_changed)
+        top.addWidget(self.os_combo)
         top.addSpacing(8)
         self.tmpl_toggle = QPushButton("▶ コマンドテンプレート設定")
         self.tmpl_toggle.setCheckable(True)
@@ -1362,11 +1468,9 @@ class GridEditTab(_EnvMixin, QWidget):
         sel_row = QHBoxLayout()
         sel_row.addWidget(QLabel("SELECT用 (CSV出力):"))
         self.sel_preset = QComboBox()
-        self.sel_preset.addItem("（プリセット）")
-        for name in _DB_CMD_PRESETS:
-            self.sel_preset.addItem(name)
         self.sel_preset.currentIndexChanged.connect(
-            lambda: self._apply_preset(self.sel_preset, _DB_CMD_PRESETS, self.sel_cmd))
+            lambda: self._apply_preset(
+                self.sel_preset, _read_presets_for(self._exec_os()), self.sel_cmd))
         sel_row.addWidget(self.sel_preset)
         sel_row.addStretch()
         tb.addLayout(sel_row)
@@ -1379,11 +1483,9 @@ class GridEditTab(_EnvMixin, QWidget):
         edit_row = QHBoxLayout()
         edit_row.addWidget(QLabel("編集用 (BEGIN..COMMIT):"))
         self.edit_preset = QComboBox()
-        self.edit_preset.addItem("（プリセット）")
-        for name in _DB_EDIT_PRESETS:
-            self.edit_preset.addItem(name)
         self.edit_preset.currentIndexChanged.connect(
-            lambda: self._apply_preset(self.edit_preset, _DB_EDIT_PRESETS, self.edit_cmd))
+            lambda: self._apply_preset(
+                self.edit_preset, _edit_presets_for(self._exec_os()), self.edit_cmd))
         edit_row.addWidget(self.edit_preset)
         edit_row.addStretch()
         self.save_tmpl_btn = QPushButton("テンプレートをプロファイルに保存")
@@ -1503,14 +1605,40 @@ class GridEditTab(_EnvMixin, QWidget):
         self.profile_combo.blockSignals(False)
         self._on_profile_changed(self.profile_combo.currentText())
 
+    def _exec_os(self) -> str:
+        return self.os_combo.currentData() or 'unix'
+
     def _on_profile_changed(self, name: str):
         prof = self._profiles.get(name, {})
         self._sync_env_ui(prof, name)
+        self.os_combo.blockSignals(True)
+        i = self.os_combo.findData(prof.get('db_exec_os', 'unix'))
+        self.os_combo.setCurrentIndex(i if i >= 0 else 0)
+        self.os_combo.blockSignals(False)
+        self._refill_presets()
         self.sel_cmd.setPlainText(prof.get('db_cmd', ''))
         self.edit_cmd.setPlainText(prof.get('db_edit_cmd', ''))
         self.allow_edit_chk.blockSignals(True)
         self.allow_edit_chk.setChecked(bool(prof.get('db_edit_allowed', False)))
         self.allow_edit_chk.blockSignals(False)
+
+    def _on_os_changed(self):
+        name = self.profile_combo.currentText()
+        if name and name in self._profiles:
+            self._profiles[name]['db_exec_os'] = self._exec_os()
+            _save_db_profiles(self._profiles)
+        self._refill_presets()
+
+    def _refill_presets(self):
+        for combo, presets in (
+                (self.sel_preset, _read_presets_for(self._exec_os())),
+                (self.edit_preset, _edit_presets_for(self._exec_os()))):
+            combo.blockSignals(True)
+            combo.clear()
+            combo.addItem("（プリセット）")
+            for nm in presets:
+                combo.addItem(nm)
+            combo.blockSignals(False)
 
     def _apply_preset(self, combo, presets, target):
         tmpl = presets.get(combo.currentText())
@@ -1547,8 +1675,12 @@ class GridEditTab(_EnvMixin, QWidget):
         if '{SQL}' not in template:
             QMessageBox.warning(self, "テンプレートエラー", "テンプレートに {SQL} がありません。")
             return None
-        s = sql.replace('\r\n', '\n').replace('\r', '\n')
-        body = template.replace('{SQL}', s).replace('\r\n', '\n').replace('\r', '\n')
+        exec_os = self._exec_os()
+        s = _prepare_sql_for_os(sql, exec_os)
+        body = template.replace('{SQL}', s)
+        if exec_os == 'windows':
+            return body
+        body = body.replace('\r\n', '\n').replace('\r', '\n')
         body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
                       lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
         return body
@@ -1566,7 +1698,8 @@ class GridEditTab(_EnvMixin, QWidget):
                 "参照用 (SELECT) テンプレートを設定してください。\n"
                 "『コマンドテンプレート設定』の SELECT用プリセットから選べます。")
             return
-        dlg = TableBrowserDialog(prof, read_tmpl, prof.get('db_type', ''), self)
+        dlg = TableBrowserDialog(prof, read_tmpl, prof.get('db_type', ''), self,
+                                 exec_os=self._exec_os())
         # DB種別の変更をプロファイルへ保存
         dlg.type_combo.currentTextChanged.connect(
             lambda t, n=name: self._save_db_type(n, t))
@@ -1895,7 +2028,7 @@ class GridEditTab(_EnvMixin, QWidget):
         self.apply_btn.setEnabled(False)
         self.preview_btn.setEnabled(False)
         self._status(status)
-        self._worker = _ExecWorker(prof, body, self)
+        self._worker = _ExecWorker(prof, body, self, exec_os=self._exec_os())
         self._worker.finished_ok.connect(self._on_done)
         self._worker.failed.connect(self._on_failed)
         self._worker.start()
