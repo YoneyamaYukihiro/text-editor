@@ -143,6 +143,57 @@ _DB_EDIT_PRESETS = {
     ),
 }
 
+# テーブルブラウザ用のメタデータ照会 (DB種別ごと)。{T} をテーブル名で置換する。
+# いずれも単一列を返す参照クエリで、参照用テンプレート (db_cmd) 経由で実行する。
+_DB_META_QUERIES = {
+    "Oracle (sqlplus)": {
+        'tables':  "SELECT table_name FROM user_tables ORDER BY table_name",
+        'columns': "SELECT column_name FROM user_tab_columns "
+                   "WHERE table_name = '{T}' ORDER BY column_id",
+        'pk':      "SELECT cols.column_name FROM user_constraints cons "
+                   "JOIN user_cons_columns cols "
+                   "ON cons.constraint_name = cols.constraint_name "
+                   "WHERE cons.constraint_type = 'P' "
+                   "AND cols.table_name = '{T}' ORDER BY cols.position",
+    },
+    "MySQL/MariaDB": {
+        'tables':  "SELECT table_name FROM information_schema.tables "
+                   "WHERE table_schema = DATABASE() ORDER BY table_name",
+        'columns': "SELECT column_name FROM information_schema.columns "
+                   "WHERE table_schema = DATABASE() AND table_name = '{T}' "
+                   "ORDER BY ordinal_position",
+        'pk':      "SELECT column_name FROM information_schema.key_column_usage "
+                   "WHERE table_schema = DATABASE() AND table_name = '{T}' "
+                   "AND constraint_name = 'PRIMARY' ORDER BY ordinal_position",
+    },
+    "PostgreSQL": {
+        'tables':  "SELECT table_name FROM information_schema.tables "
+                   "WHERE table_schema = 'public' ORDER BY table_name",
+        'columns': "SELECT column_name FROM information_schema.columns "
+                   "WHERE table_name = '{T}' ORDER BY ordinal_position",
+        'pk':      "SELECT a.attname FROM pg_index i "
+                   "JOIN pg_attribute a ON a.attrelid = i.indrelid "
+                   "AND a.attnum = ANY(i.indkey) "
+                   "WHERE i.indrelid = '{T}'::regclass AND i.indisprimary",
+    },
+    "SQLite": {
+        'tables':  "SELECT name FROM sqlite_master WHERE type = 'table' ORDER BY name",
+        'columns': "SELECT name FROM pragma_table_info('{T}')",
+        'pk':      "SELECT name FROM pragma_table_info('{T}') WHERE pk > 0 ORDER BY pk",
+    },
+    "SQL Server (sqlcmd)": {
+        'tables':  "SELECT table_name FROM information_schema.tables "
+                   "WHERE table_type = 'BASE TABLE' ORDER BY table_name",
+        'columns': "SELECT column_name FROM information_schema.columns "
+                   "WHERE table_name = '{T}' ORDER BY ordinal_position",
+        'pk':      "SELECT kcu.column_name FROM information_schema.table_constraints tc "
+                   "JOIN information_schema.key_column_usage kcu "
+                   "ON tc.constraint_name = kcu.constraint_name "
+                   "WHERE tc.constraint_type = 'PRIMARY KEY' "
+                   "AND tc.table_name = '{T}' ORDER BY kcu.ordinal_position",
+    },
+}
+
 # 参照系の先頭キーワード (これらは「編集」ではないので影響行確認をスキップ)
 _READ_ONLY_KEYWORDS = frozenset({'SELECT', 'WITH', 'EXPLAIN', 'DESC', 'DESCRIBE', 'SHOW'})
 # 行に影響を与える DML (WHERE 必須チェックの対象)
@@ -325,6 +376,19 @@ def _extract_counts(text: str) -> list[int]:
         s = line.strip().strip(',').replace(',', '')
         if re.fullmatch(r'\d+', s):
             out.append(int(s))
+    return out
+
+
+def _first_column(text: str) -> list[str]:
+    """メタデータ照会 (単一列) の出力から、ヘッダーを除いた1列目の値を返す。"""
+    rows = _parse_csv_lines(text)
+    if not rows:
+        return []
+    out = []
+    for r in rows[1:]:                      # 1行目はヘッダー
+        v = (r[0] if r else '').strip()
+        if v:
+            out.append(v)
     return out
 
 
@@ -570,6 +634,179 @@ class _ExecWorker(QThread):
                     client.close()
             except Exception:
                 pass
+
+
+# ---------------------------------------------------------------------------
+# テーブルブラウザ
+# ---------------------------------------------------------------------------
+
+class TableBrowserDialog(QDialog):
+    """DB種別ごとのメタデータ照会でテーブル/カラム/主キーを取得し、
+    選択したテーブルをグリッド編集に反映する。
+
+    照会は参照用テンプレート (db_cmd) 経由で実行する。DB種別はプロファイルの
+    db_type に永続化する。
+    """
+
+    # table, columns, primary_keys
+    table_selected = pyqtSignal(str, list, list)
+
+    def __init__(self, profile: dict, read_template: str,
+                 db_type: str = '', parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("テーブルブラウザ")
+        self.resize(720, 560)
+        self.setWindowFlags(
+            self.windowFlags()
+            | Qt.WindowType.WindowMinimizeButtonHint
+            | Qt.WindowType.WindowMaximizeButtonHint)
+        th = _theme()
+        self.setStyleSheet(
+            f"QDialog, QWidget {{ background:{th.get('bg', '#2b2b2b')};"
+            f" color:{th.get('text', '#dcdcdc')}; }}")
+        self._profile = profile
+        self._read_template = read_template
+        self._worker = None
+        self._action = None          # 'tables' / 'columns' / 'pk'
+        self._sel_table = ''
+        self._sel_columns: list[str] = []
+        self._sel_pks: list[str] = []
+        self._build_ui()
+        if db_type in _DB_META_QUERIES:
+            i = self.type_combo.findText(db_type)
+            if i >= 0:
+                self.type_combo.setCurrentIndex(i)
+
+    def _build_ui(self):
+        root = QVBoxLayout(self)
+        top = QHBoxLayout()
+        top.addWidget(QLabel("DB種別:"))
+        self.type_combo = QComboBox()
+        for name in _DB_META_QUERIES:
+            self.type_combo.addItem(name)
+        top.addWidget(self.type_combo)
+        self.list_btn = QPushButton("テーブル一覧取得")
+        self.list_btn.clicked.connect(self._fetch_tables)
+        top.addWidget(self.list_btn)
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("絞り込み (部分一致)")
+        self.filter_input.textChanged.connect(self._apply_filter)
+        top.addWidget(self.filter_input, 1)
+        root.addLayout(top)
+
+        splitter = QSplitter(Qt.Orientation.Horizontal)
+        left = QWidget(); lv = QVBoxLayout(left); lv.setContentsMargins(0, 0, 0, 0)
+        lv.addWidget(QLabel("テーブル:"))
+        self.table_list = QListWidget()
+        self.table_list.currentTextChanged.connect(self._on_table_changed)
+        self.table_list.itemDoubleClicked.connect(lambda _i: self._use_selected())
+        lv.addWidget(self.table_list)
+        splitter.addWidget(left)
+        right = QWidget(); rv = QVBoxLayout(right); rv.setContentsMargins(0, 0, 0, 0)
+        rv.addWidget(QLabel("カラム (🔑=主キー):"))
+        self.col_list = QListWidget()
+        rv.addWidget(self.col_list)
+        splitter.addWidget(right)
+        splitter.setSizes([320, 360])
+        root.addWidget(splitter, 1)
+
+        self.status_lbl = QLabel("")
+        root.addWidget(self.status_lbl)
+
+        btn_row = QHBoxLayout()
+        btn_row.addStretch()
+        self.use_btn = QPushButton("このテーブルをグリッド編集で使う")
+        self.use_btn.clicked.connect(self._use_selected)
+        btn_row.addWidget(self.use_btn)
+        close_btn = QPushButton("閉じる")
+        close_btn.clicked.connect(self.reject)
+        btn_row.addWidget(close_btn)
+        root.addLayout(btn_row)
+
+    def _db_type(self) -> str:
+        return self.type_combo.currentText()
+
+    def _run(self, sql: str, action: str):
+        body = self._read_template.strip()
+        if not body or '{SQL}' not in body:
+            QMessageBox.warning(self, "テンプレート未設定",
+                "参照用 (SELECT) テンプレートが未設定です。\n"
+                "グリッド編集タブの『コマンドテンプレート設定』で設定してください。")
+            return
+        body = body.replace('{SQL}', sql.replace('\r\n', '\n').replace('\r', '\n'))
+        body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
+                      lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
+        self._action = action
+        self.list_btn.setEnabled(False)
+        self.use_btn.setEnabled(False)
+        self.status_lbl.setText("照会中...")
+        self._worker = _ExecWorker(self._profile, body, self)
+        self._worker.finished_ok.connect(self._on_done)
+        self._worker.failed.connect(self._on_failed)
+        self._worker.start()
+
+    def _fetch_tables(self):
+        q = _DB_META_QUERIES[self._db_type()]['tables']
+        self._run(q, 'tables')
+
+    def _on_table_changed(self, name: str):
+        name = (name or '').strip()
+        self.col_list.clear()
+        if not name:
+            return
+        self._sel_table = name
+        qs = _DB_META_QUERIES[self._db_type()]
+        self._run(qs['columns'].replace('{T}', name), 'columns')
+
+    def _on_done(self, out: str, err: str, exit_code: int):
+        self.list_btn.setEnabled(True)
+        self.use_btn.setEnabled(True)
+        vals = _first_column(_clean_sqlplus_output(out))
+        if self._action == 'tables':
+            self._all_tables = vals
+            self._apply_filter()
+            self.status_lbl.setText(f"{len(vals)} テーブル")
+        elif self._action == 'columns':
+            self._sel_columns = vals
+            self.col_list.clear()
+            for c in vals:
+                self.col_list.addItem(c)
+            # 続けて主キーを取得
+            qs = _DB_META_QUERIES[self._db_type()]
+            self._run(qs['pk'].replace('{T}', self._sel_table), 'pk')
+        elif self._action == 'pk':
+            self._sel_pks = vals
+            pkset = {p.lower() for p in vals}
+            for i in range(self.col_list.count()):
+                it = self.col_list.item(i)
+                if it.text().lower() in pkset:
+                    it.setText("🔑 " + it.text())
+            self.status_lbl.setText(
+                f"{self._sel_table}: {len(self._sel_columns)} 列, "
+                f"主キー {', '.join(vals) if vals else '(検出なし)'}")
+
+    def _on_failed(self, msg: str):
+        self.list_btn.setEnabled(True)
+        self.use_btn.setEnabled(True)
+        self.status_lbl.setText(f"照会エラー: {msg}")
+
+    def _apply_filter(self):
+        kw = self.filter_input.text().strip().lower()
+        self.table_list.blockSignals(True)
+        self.table_list.clear()
+        for t in getattr(self, '_all_tables', []):
+            if not kw or kw in t.lower():
+                self.table_list.addItem(t)
+        self.table_list.blockSignals(False)
+
+    def _use_selected(self):
+        it = self.table_list.currentItem()
+        if it is None:
+            QMessageBox.information(self, "テーブル未選択", "テーブルを選択してください。")
+            return
+        self.table_selected.emit(
+            it.text().strip(), list(self._sel_columns), list(self._sel_pks))
+        self.accept()
 
 
 # ---------------------------------------------------------------------------
@@ -1176,6 +1413,11 @@ class GridEditTab(_EnvMixin, QWidget):
         self.empty_null_chk = QCheckBox("空欄を NULL にする")
         self.empty_null_chk.setChecked(True)
         meta.addWidget(self.empty_null_chk)
+        meta.addSpacing(8)
+        self.browse_btn = QPushButton("テーブルブラウザ…")
+        self.browse_btn.setToolTip("テーブル/カラム/主キーを一覧から選んで反映します")
+        self.browse_btn.clicked.connect(self._open_table_browser)
+        meta.addWidget(self.browse_btn)
         meta.addStretch()
         root.addLayout(meta)
 
@@ -1310,6 +1552,40 @@ class GridEditTab(_EnvMixin, QWidget):
         body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
                       lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
         return body
+
+    # ── テーブルブラウザ ─────────────────────────────────────────────────
+    def _open_table_browser(self):
+        name = self.profile_combo.currentText()
+        prof = self._profiles.get(name)
+        if not prof:
+            QMessageBox.warning(self, "プロファイル未選択", "接続プロファイルを選択してください。")
+            return
+        read_tmpl = self.sel_cmd.toPlainText().strip()
+        if not read_tmpl:
+            QMessageBox.warning(self, "テンプレート未設定",
+                "参照用 (SELECT) テンプレートを設定してください。\n"
+                "『コマンドテンプレート設定』の SELECT用プリセットから選べます。")
+            return
+        dlg = TableBrowserDialog(prof, read_tmpl, prof.get('db_type', ''), self)
+        # DB種別の変更をプロファイルへ保存
+        dlg.type_combo.currentTextChanged.connect(
+            lambda t, n=name: self._save_db_type(n, t))
+        dlg.table_selected.connect(self._apply_table_selection)
+        dlg.exec()
+
+    def _save_db_type(self, profile_name: str, db_type: str):
+        if profile_name in self._profiles:
+            self._profiles[profile_name]['db_type'] = db_type
+            _save_db_profiles(self._profiles)
+
+    def _apply_table_selection(self, table: str, columns: list, pks: list):
+        self.table_input.setText(table)
+        if pks:
+            self.pk_input.setText(', '.join(pks))
+        cols_sql = ', '.join(columns) if columns else '*'
+        self.sql_input.setPlainText(f"SELECT {cols_sql} FROM {table}")
+        self._status(f"テーブル {table} を反映しました (主キー: "
+                     f"{', '.join(pks) if pks else '未検出'})")
 
     # ── データ取得 (SELECT) ─────────────────────────────────────────────
     def _fetch(self):
