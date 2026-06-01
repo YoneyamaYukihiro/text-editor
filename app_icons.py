@@ -12,7 +12,8 @@ import sys
 
 from PyQt6.QtCore import Qt, QRectF
 from PyQt6.QtGui import (
-    QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPen, QPixmap,
+    QBrush, QColor, QFont, QIcon, QLinearGradient, QPainter, QPainterPath,
+    QPen, QPixmap,
 )
 
 
@@ -45,52 +46,56 @@ def _rounded_bg(p: QPainter, size: int,
 
 
 # ---------------------------------------------------------------------------
-# SSH/Telnet Log Viewer アイコン
+# Multi-Server Log Viewer アイコン
 # ---------------------------------------------------------------------------
-# テーマ: ターミナル風。緑の `>` プロンプト + 青の_カーソル + ERROR/WARN/INFO のログバー
+# テーマ: ダーク背景に "MLV" を中央配置。
 
 def ssh_log_viewer_pixmap(size: int = 256) -> QPixmap:
     pixmap, p = _new_pixmap(size)
+    # ダーク背景 (上が少し明るく、下に向かって沈んでいくグラデ)
     _rounded_bg(p, size,
-                top_color='#1f1f1f',
+                top_color='#2c2c2c',
                 bottom_color='#0c0c0c',
-                border_color='#3a5a3a')
+                border_color='#444444')
 
-    # `>` プロンプト記号
-    p.setPen(QColor('#5FBF5F'))
-    f = QFont('Consolas', max(8, int(size * 0.32)))
+    # 極小サイズ (16px 等) は "MLV" 3文字が判読不能なので "M" 単体で大きく描く。
+    # 色はログレベル赤系 (ERROR) でアイコンの世界観を保つ。
+    if size <= 20:
+        p.setPen(QColor('#CF6679'))
+        pt = max(8, int(size * 0.85))
+        f = QFont('Arial', pt)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(0, 0, size, size),
+                   Qt.AlignmentFlag.AlignCenter, 'M')
+        p.end()
+        return pixmap
+
+    # 文字色: ダーク背景に映える明るいオフホワイト (大サイズの fallback 用)
+    p.setPen(QColor('#E8E8E8'))
+
+    # "MLV" — 中央配置 + ログレベル色のグラデーション (ERROR赤 → WARN黄 → INFO緑)
+    pt = max(9, int(size * 0.34))
+    f = QFont('Arial', pt)
     f.setBold(True)
     p.setFont(f)
-    prompt_rect = QRectF(size * 0.10, size * 0.10, size * 0.45, size * 0.45)
-    p.drawText(prompt_rect,
-               Qt.AlignmentFlag.AlignLeft | Qt.AlignmentFlag.AlignVCenter,
-               '>')
+    fm = p.fontMetrics()
+    text = 'MLV'
+    text_w = fm.horizontalAdvance(text)
+    # 縦中央のための baseline 計算
+    x = (size - text_w) / 2
+    baseline_y = (size + fm.ascent() - fm.descent()) / 2
 
-    # `_` カーソル (点滅イメージ)
-    cur_x = size * 0.46
-    cur_w = size * 0.20
-    cur_y = size * 0.42
-    cur_h = max(2, size * 0.04)
-    p.fillRect(QRectF(cur_x, cur_y, cur_w, cur_h), QColor('#4A9EFF'))
-
-    # ログ行 (ERROR/WARN/INFO 風の3本バー)
-    bars = [
-        ('#CF6679', 0.62, 0.58),   # 赤系: ERROR
-        ('#E8B26A', 0.74, 0.46),   # 黄系: WARN
-        ('#6A9F6A', 0.84, 0.66),   # 緑系: INFO
-    ]
-    bar_h = max(2, size * 0.045)
-    for color, y_ratio, w_ratio in bars:
-        p.fillRect(
-            QRectF(size * 0.16, size * y_ratio, size * w_ratio, bar_h),
-            QColor(color),
-        )
-        # 行頭ドット (タイムスタンプ風)
-        p.setBrush(QColor('#4EC9B0'))
-        p.setPen(Qt.PenStyle.NoPen)
-        dot_r = bar_h * 0.6
-        p.drawEllipse(QRectF(size * 0.10, size * y_ratio + (bar_h - dot_r) / 2,
-                             dot_r, dot_r))
+    # 文字形状を path に展開してグラデーションで fill
+    path = QPainterPath()
+    path.addText(float(x), float(baseline_y), f, text)
+    grad = QLinearGradient(float(x), 0.0, float(x + text_w), 0.0)
+    grad.setColorAt(0.0, QColor('#CF6679'))   # ERROR (赤)
+    grad.setColorAt(0.5, QColor('#E8B26A'))   # WARN  (黄)
+    grad.setColorAt(1.0, QColor('#6A9F6A'))   # INFO  (緑)
+    p.setBrush(QBrush(grad))
+    p.setPen(Qt.PenStyle.NoPen)
+    p.drawPath(path)
 
     p.end()
     return pixmap
@@ -104,47 +109,80 @@ def ssh_log_viewer_icon() -> QIcon:
 
 
 # ---------------------------------------------------------------------------
-# Text Editor アイコン
+# Sora Editor アイコン
 # ---------------------------------------------------------------------------
-# テーマ: ドキュメント + I-beam カーソル
+# テーマ: "Sora" = 空。晴天色のグラデ背景に、大きな "S" と小さな "ora"。
 
 def text_editor_pixmap(size: int = 256) -> QPixmap:
     pixmap, p = _new_pixmap(size)
+    # 晴天色: 上が淡い水色、下がやや深い空色のグラデーション
     _rounded_bg(p, size,
-                top_color='#21283a',
-                bottom_color='#0e1320',
-                border_color='#3a4d70')
+                top_color='#BFE3F5',
+                bottom_color='#5BA8D8',
+                border_color='#3A87B0')
 
-    # 大きな "T"
-    p.setPen(QColor('#E8E8E8'))
-    f = QFont('Georgia', max(10, int(size * 0.42)))
-    f.setBold(True)
-    p.setFont(f)
-    t_rect = QRectF(0, size * 0.06, size, size * 0.62)
-    p.drawText(t_rect, Qt.AlignmentFlag.AlignCenter, 'T')
+    # 文字色: 晴天背景に映える濃紺
+    p.setPen(QColor('#0E2F5A'))
 
-    # 右下に I-beam カーソル
-    pen = QPen(QColor('#4A9EFF'), max(2, size // 56))
-    p.setPen(pen)
-    cur_cx = size * 0.74
-    cur_top = size * 0.62
-    cur_bot = size * 0.86
-    arm = size * 0.05
-    # 縦棒
-    p.drawLine(int(cur_cx), int(cur_top), int(cur_cx), int(cur_bot))
-    # 上下のセリフ
-    p.drawLine(int(cur_cx - arm), int(cur_top), int(cur_cx + arm), int(cur_top))
-    p.drawLine(int(cur_cx - arm), int(cur_bot), int(cur_cx + arm), int(cur_bot))
+    # 極小サイズ (16px 等) は ora が判読不能なので S 単体でアイコンいっぱいに描く
+    if size <= 20:
+        small_pt = max(8, int(size * 0.85))
+        f = QFont('Arial', small_pt)
+        f.setBold(True)
+        p.setFont(f)
+        p.drawText(QRectF(0, 0, size, size),
+                   Qt.AlignmentFlag.AlignCenter, 'S')
+        p.end()
+        return pixmap
 
-    # 下部に文字行を示す3本の薄いライン (装飾)
-    p.setPen(Qt.PenStyle.NoPen)
-    p.setBrush(QColor('#3a4d70'))
-    line_h = max(1, size * 0.022)
-    for i, w_ratio in enumerate((0.50, 0.42, 0.32)):
-        y = size * (0.76 + i * 0.06)
-        if y + line_h > size * 0.94:
-            break
-        p.drawRect(QRectF(size * 0.14, y, size * w_ratio, line_h))
+    # 大きな S - アイコンの主役 (ほぼアイコンを埋める大きさ)
+    big_pt = max(14, int(size * 0.72))
+    f_big = QFont('Arial', big_pt)
+    f_big.setBold(True)
+    p.setFont(f_big)
+    fm_big = p.fontMetrics()
+    s_w = fm_big.horizontalAdvance('S')
+    s_box = fm_big.boundingRect('S')          # baseline 基準の bounding rect
+    s_top_neg = s_box.top()                    # 負値: baseline より上方向
+    s_h = s_box.height()
+
+    # 小さな ora — S にオーバーラップさせる
+    small_pt = max(8, int(size * 0.24))
+    f_small = QFont('Arial', small_pt)
+    f_small.setBold(True)
+    p.setFont(f_small)
+    fm_small = p.fontMetrics()
+    ora_w = fm_small.horizontalAdvance('ora')
+
+    # コンポジット全体 (S + S にかぶる ora) を中央寄せ。
+    # ora は S の幅の 68% 付近から開始 → o の左端だけが S にかぶる程度。
+    ora_offset_in_s = s_w * 0.68
+    composite_w = max(s_w, ora_offset_in_s + ora_w)
+    s_left_x = (size - composite_w) / 2
+    ora_x = s_left_x + ora_offset_in_s
+
+    # S の視覚中央
+    baseline_y = int(size / 2 - s_top_neg - s_h / 2)
+    ora_baseline_y = baseline_y
+
+    # まず S を描画 (濃紺)
+    p.setFont(f_big)
+    p.drawText(int(s_left_x), baseline_y, 'S')
+
+    # ora を 2 段描画して「S と重なる部分だけ色違い」を表現する。
+    # 1) 通常色 (濃紺) で全体を描く → S の外に出た部分はこの色で表示
+    p.setFont(f_small)
+    p.drawText(int(ora_x), ora_baseline_y, 'ora')
+
+    # 2) S の文字形状を clip path にして、ora を明色で重ね描き
+    #    → S と重なる部分だけ明色に切り替わって視認可能になる
+    s_path = QPainterPath()
+    s_path.addText(float(s_left_x), float(baseline_y), f_big, 'S')
+    p.save()
+    p.setClipPath(s_path)
+    p.setPen(QColor('#BFE3F5'))  # 背景上端と同じ淡水色 = 「S を切り抜いた」印象
+    p.drawText(int(ora_x), ora_baseline_y, 'ora')
+    p.restore()
 
     p.end()
     return pixmap

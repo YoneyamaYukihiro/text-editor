@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.12"
+__version__ = "1.1.13"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
