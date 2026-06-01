@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.8"
+__version__ = "1.1.9"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1019,7 +1019,8 @@ class MiniLogViewer(QWidget):
     sql_selection_requested = pyqtSignal(object, str)  # conn, 選択テキスト
 
     # tail 放置時のメモリ無限増加を防ぐ保持上限 (元データ・表示の両方に適用)
-    _MAX_LINES = 50000
+    # 12 セルグリッドでも 110〜130 MB 程度に収まる値。スクロール履歴より省メモリ優先。
+    _MAX_LINES = 5000
 
     def __init__(self, conn: SSHConnection, path: str,
                  server_label: str, color_idx: int, parent=None):
@@ -1121,6 +1122,9 @@ class MiniLogViewer(QWidget):
         self.text.setReadOnly(True)
         # 行数上限を設定し、古い行を自動破棄してメモリ無限増加を防ぐ
         self.text.setMaximumBlockCount(self._MAX_LINES)
+        # 読み取り専用ログでは undo 履歴は不要。tail 中 append/setPlainText の
+        # たびに undo エントリが累積し、長時間放置でメモリが青天井に増えるため無効化。
+        self.text.document().setUndoRedoEnabled(False)
         mode = LogHighlighter.detect_mode_for_file(self.filepath)
         self.highlighter = LogHighlighter(self.text.document(), mode=mode)
         # 右クリックで「選択範囲をSoraでSQL抽出」を出すためカスタムメニュー
@@ -2946,6 +2950,11 @@ class TerminalDialog(QDialog):
 
         self.output = QPlainTextEdit()
         self.output.setReadOnly(True)
+        # ターミナル出力も追記専用 / 読み取り専用なので undo 履歴を切る
+        # (長時間放置で undo スタックが無限に膨らむのを防ぐ)
+        self.output.document().setUndoRedoEnabled(False)
+        # 行数上限。長時間ストリーム時のメモリ青天井防止。
+        self.output.setMaximumBlockCount(10000)
         lay.addWidget(self.output, 1)
 
         row = QHBoxLayout()
