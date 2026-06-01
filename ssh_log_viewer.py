@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.11"
+__version__ = "1.1.12"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1334,8 +1334,11 @@ class MiniLogViewer(QWidget):
             self.text.appendPlainText(text)
         else:
             self._apply_filter()
-        sb = self.text.verticalScrollBar()
-        sb.setValue(sb.maximum())
+        # 末尾追従。setValue(sb.maximum()) は append 直後の最大値計算 +
+        # viewport_height % line_height の余りで「最終行が見切れる」状況が
+        # 出るため (狭縦セル/4:3 ディスプレイ等)、cursor 経由で確実に末尾へ。
+        self.text.moveCursor(QTextCursor.MoveOperation.End)
+        self.text.ensureCursorVisible()
 
     def _stop_worker(self):
         if self._worker:
