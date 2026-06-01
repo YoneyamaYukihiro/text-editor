@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.9"
+__version__ = "1.1.10"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -746,6 +746,21 @@ class _SSHChannel:
         except Exception:
             return b''
 
+    def drain_stderr(self, n: int = 65536) -> int:
+        """tail -F のローテーション通知等が溜まる stderr を空読みして捨てる。
+        paramiko の channel window (~2MB) で頭打ちにはなるが、長時間運用で
+        無駄なメモリを抱えないよう定期的に drain する。"""
+        total = 0
+        try:
+            while self._chan.recv_stderr_ready():
+                data = self._chan.recv_stderr(n)
+                if not data:
+                    break
+                total += len(data)
+        except Exception:
+            pass
+        return total
+
     def send(self, data: bytes):
         # 例外は呼び出し側で見たいので飲み込まない
         self._chan.send(data)
@@ -782,6 +797,10 @@ class _TelnetChannel:
         del self._buf[:n]
         return data
 
+    def drain_stderr(self) -> int:
+        """Telnet は stdout/stderr 分離なしのため no-op。"""
+        return 0
+
     def send(self, data: bytes):
         # 例外は呼び出し側で見たいので飲み込まない
         self._tn.write(data)
@@ -810,25 +829,54 @@ class TailWorker(QThread):
     def stop(self):
         self._stop = True
 
+    # 改行待ち中の不完全行を強制 flush する待ち時間 (ローテーション直後の旧
+    # ファイル末端で、改行なしのまま新ファイルへ切り替わるケースを救済)
+    _PARTIAL_FLUSH_SEC = 0.5
+    # 不完全行が異常に大きくなった場合の防御 cap (バイナリログ等)
+    _MAX_PARTIAL_BYTES = 65536
+    # stderr drain の実行間隔 (秒)
+    _STDERR_DRAIN_INTERVAL = 5.0
+
     def run(self):
         chan = None
         try:
             chan = self._conn.open_tail_channel(self._path)
             buf = b''
+            last_recv = time.time()
+            last_drain = time.time()
             while not self._stop:
+                now = time.time()
                 if chan.recv_ready(0.1):
                     data = chan.recv(4096)
                     if not data:
                         time.sleep(0.05)
-                        continue
-                    buf += data
-                    parts = buf.split(b'\n')
-                    buf   = parts[-1]
-                    text  = b'\n'.join(parts[:-1]).decode('utf-8', errors='replace')
-                    if text:
-                        self.new_text.emit(text)
+                    else:
+                        buf += data
+                        last_recv = now
+                        parts = buf.split(b'\n')
+                        buf   = parts[-1]
+                        text  = b'\n'.join(parts[:-1]).decode('utf-8', errors='replace')
+                        if text:
+                            self.new_text.emit(text)
+                        # buf が異常肥大した場合は強制 flush (改行なしの長行ガード)
+                        if len(buf) > self._MAX_PARTIAL_BYTES:
+                            self.new_text.emit(buf.decode('utf-8', errors='replace'))
+                            buf = b''
                 else:
+                    # 新データが暫く来ず、不完全行が残っていれば flush。
+                    # ローテーション時に旧ファイルの末端を表示するため。
+                    if buf and (now - last_recv) > self._PARTIAL_FLUSH_SEC:
+                        self.new_text.emit(buf.decode('utf-8', errors='replace'))
+                        buf = b''
+                        last_recv = now
                     time.sleep(0.05)
+                # 定期的に stderr を drain (`tail -F` のローテーション通知等)
+                if (now - last_drain) > self._STDERR_DRAIN_INTERVAL:
+                    try:
+                        chan.drain_stderr()
+                    except Exception:
+                        pass
+                    last_drain = now
         except Exception as e:
             self.error.emit(str(e))
         finally:
