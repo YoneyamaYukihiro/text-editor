@@ -37,9 +37,10 @@ from PyQt6.QtWidgets import (
     QComboBox, QPushButton, QPlainTextEdit, QTextEdit, QCheckBox, QMessageBox,
     QTabWidget, QStatusBar, QSplitter, QLineEdit, QTableWidget, QTableWidgetItem,
     QHeaderView, QDialog, QListWidget, QListWidgetItem, QInputDialog,
+    QToolBar, QSizePolicy,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal
-from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor
+from PyQt6.QtGui import QFont, QShortcut, QKeySequence, QColor, QAction
 
 # ── 既存資産の流用 (失敗してもツール自体は最低限動くようフォールバック) ──────
 try:
@@ -52,9 +53,16 @@ try:
         SyntaxHighlighter, _theme, _DB_PROFILES_PATH,
         _load_db_profiles, _save_db_profiles,
         _DB_CMD_PRESETS, _clean_sqlplus_output,
+        SETTINGS, _save_settings, _THEME_PRESETS,
     )
+    _SETTINGS_AVAILABLE = True
 except Exception:  # pragma: no cover
     SyntaxHighlighter = None
+    SETTINGS = {'theme': 'Dark'}
+    _THEME_PRESETS = {}
+    def _save_settings(s):
+        pass
+    _SETTINGS_AVAILABLE = False
     _DB_PROFILES_PATH = os.path.join(os.path.expanduser('~'),
                                      '.ssh_log_viewer_profiles.json')
     # 参照(SELECT)用 CSV 出力テンプレート (text_editor 流用失敗時のフォールバック)
@@ -258,13 +266,13 @@ _EDIT_KEYWORDS = frozenset({
 # プロファイル毎に「本番 / 検証 / 開発 / 未分類」を設定し、常時バナー表示する。
 # 本番に対する更新操作はプロファイル名の打鍵確認を必須にする。
 _ENV_DEFS = {
-    'prod':    {'label': '本番環境 PRODUCTION', 'icon': '⛔',
+    'prod':    {'label': '本番 PRODUCTION',     'icon': '⛔',
                 'bg': '#b71c1c', 'fg': '#ffffff', 'border': '#7f0000'},
-    'staging': {'label': '検証環境 STAGING',    'icon': '⚠',
+    'staging': {'label': '検証 STAGING',         'icon': '⚠',
                 'bg': '#e65100', 'fg': '#ffffff', 'border': '#ac1900'},
-    'dev':     {'label': '開発環境 DEVELOPMENT', 'icon': '🛠',
+    'dev':     {'label': '開発 DEVELOPMENT',    'icon': '🛠',
                 'bg': '#1b5e20', 'fg': '#ffffff', 'border': '#003d00'},
-    'unknown': {'label': '環境未分類 — 分類してください', 'icon': '❔',
+    'unknown': {'label': '環境未分類',           'icon': '❔',
                 'bg': '#455a64', 'fg': '#ffffff', 'border': '#1c313a'},
 }
 _ENV_ORDER = ['unknown', 'dev', 'staging', 'prod']
@@ -697,6 +705,96 @@ class _ExecWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
+# テーブル一覧パネル (GridEditTab 左サイドバー / MySQL Workbench イメージ)
+# ---------------------------------------------------------------------------
+
+class _TablesPanel(QWidget):
+    """GridEditTab の左側に常駐するテーブル一覧パネル。
+    フィルタ + DB種別 + 更新 + テーブルリスト。
+    ダブルクリックで右側の編集領域にテーブル名を反映する。
+    取得そのものは親 (GridEditTab) が `refresh_requested` を受けて実行し、
+    結果を `set_tables()` でパネルへ流し込む構造 (パネルは UI 専任)。"""
+
+    refresh_requested = pyqtSignal()    # 更新ボタン押下
+    table_chosen      = pyqtSignal(str) # テーブルがダブルクリックで選択された
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._all_tables: list[str] = []
+        self._build_ui()
+
+    def _build_ui(self):
+        v = QVBoxLayout(self)
+        v.setContentsMargins(4, 4, 4, 4)
+        v.setSpacing(4)
+
+        hdr = QLabel("📋 テーブル一覧")
+        hf = hdr.font(); hf.setBold(True); hdr.setFont(hf)
+        v.addWidget(hdr)
+
+        type_row = QHBoxLayout()
+        type_row.addWidget(QLabel("DB種別:"))
+        self.type_combo = QComboBox()
+        for name in _DB_META_QUERIES:
+            self.type_combo.addItem(name)
+        type_row.addWidget(self.type_combo, 1)
+        v.addLayout(type_row)
+
+        self.filter_input = QLineEdit()
+        self.filter_input.setPlaceholderText("絞り込み (部分一致)")
+        self.filter_input.textChanged.connect(self._apply_filter)
+        v.addWidget(self.filter_input)
+
+        self.refresh_btn = QPushButton("🔄 更新")
+        self.refresh_btn.setToolTip("接続プロファイル+SELECTテンプレートでテーブル一覧を取得")
+        self.refresh_btn.clicked.connect(self.refresh_requested.emit)
+        v.addWidget(self.refresh_btn)
+
+        self.list_widget = QListWidget()
+        self.list_widget.itemDoubleClicked.connect(
+            lambda it: self.table_chosen.emit(it.text()))
+        v.addWidget(self.list_widget, 1)
+
+        self.status_lbl = QLabel("「🔄 更新」でテーブル取得")
+        self.status_lbl.setStyleSheet("color:#888; font-size:10px;")
+        self.status_lbl.setWordWrap(True)
+        v.addWidget(self.status_lbl)
+
+    # ── 親から呼ぶ API ───────────────────────────────────────────────
+    def db_type(self) -> str:
+        return self.type_combo.currentText()
+
+    def set_db_type(self, db_type: str):
+        if not db_type:
+            return
+        i = self.type_combo.findText(db_type)
+        if i >= 0:
+            self.type_combo.setCurrentIndex(i)
+
+    def set_busy(self, busy: bool, message: str = ""):
+        self.refresh_btn.setEnabled(not busy)
+        if message:
+            self.status_lbl.setText(message)
+        elif busy:
+            self.status_lbl.setText("照会中...")
+
+    def set_tables(self, tables: list[str]):
+        self._all_tables = sorted(t for t in tables if t)
+        self._apply_filter()
+        self.status_lbl.setText(f"{len(self._all_tables)} テーブル")
+
+    def set_error(self, msg: str):
+        self.status_lbl.setText(f"エラー: {msg}")
+
+    def _apply_filter(self):
+        f = self.filter_input.text().strip().lower()
+        self.list_widget.clear()
+        for t in self._all_tables:
+            if not f or f in t.lower():
+                self.list_widget.addItem(t)
+
+
+# ---------------------------------------------------------------------------
 # テーブルブラウザ
 # ---------------------------------------------------------------------------
 
@@ -883,18 +981,23 @@ class EnvBanner(QLabel):
         self.setAlignment(Qt.AlignmentFlag.AlignCenter)
         f = self.font()
         f.setBold(True)
-        f.setPointSize(max(11, f.pointSize() + 2))
+        f.setPointSize(max(11, f.pointSize() + 1))
         self.setFont(f)
-        self.setMinimumHeight(36)
+        self.setMinimumHeight(28)
         self.set_env('unknown', '')
 
     def set_env(self, env: str, profile_name: str = ''):
         d = _ENV_DEFS.get(env, _ENV_DEFS['unknown'])
-        name = f"  —  {profile_name}" if profile_name else ""
-        self.setText(f"{d['icon']}  {d['label']}{name}  {d['icon']}")
+        # `{icon} {label}` を主、プロファイル名と未分類時の補助文は中黒・小さめで添える
+        text = f"{d['icon']}  {d['label']}"
+        if profile_name:
+            text += f"  ·  {profile_name}"
+        if env == 'unknown':
+            text += "    — 環境分類を選択してください"
+        self.setText(text)
         self.setStyleSheet(
             f"QLabel {{ background:{d['bg']}; color:{d['fg']};"
-            f" border:2px solid {d['border']}; border-radius:4px; padding:5px; }}")
+            f" border:1px solid {d['border']}; border-radius:3px; padding:3px 8px; }}")
 
 
 class _EnvMixin:
@@ -956,6 +1059,16 @@ class _EnvMixin:
 # ---------------------------------------------------------------------------
 
 class SqlEditTab(_EnvMixin, QWidget):
+    def apply_theme(self):
+        """テーマ変更時に SQL 入力欄のテーマ依存色を再適用する。"""
+        if not hasattr(self, 'sql_input'):
+            return
+        th = _theme()
+        self.sql_input.setStyleSheet(
+            f"QPlainTextEdit {{ border:1px solid {th.get('border', '#444')};"
+            f" background:{th.get('editor_bg', '#1e1e1e')};"
+            f" color:{th.get('text', '#dcdcdc')}; }}")
+
     def __init__(self, parent=None):
         super().__init__(parent)
         self._profiles = _load_db_profiles()
@@ -1048,15 +1161,26 @@ class SqlEditTab(_EnvMixin, QWidget):
         sql_box = QWidget()
         sql_layout = QVBoxLayout(sql_box)
         sql_layout.setContentsMargins(0, 0, 0, 0)
-        sql_layout.addWidget(QLabel("実行する SQL (INSERT/UPDATE/DELETE 等。複数文は ; 区切り):"))
+        # 編集モードを示す控えめなバッジ + ラベル (太い赤枠の代わり)
+        hdr = QHBoxLayout()
+        hdr.setContentsMargins(0, 0, 0, 0)
+        hdr.addWidget(QLabel("実行する SQL (INSERT/UPDATE/DELETE 等。複数文は ; 区切り):"))
+        self._edit_badge = QLabel("● 編集モード")
+        self._edit_badge.setStyleSheet(
+            "color:#ffffff; background:#c0392b; border-radius:3px;"
+            " padding:1px 6px; font-weight:600; font-size:10px;")
+        self._edit_badge.setToolTip("更新系SQLを実行できる編集モードです")
+        hdr.addWidget(self._edit_badge)
+        hdr.addStretch()
+        sql_layout.addLayout(hdr)
         self.sql_input = QPlainTextEdit()
         self.sql_input.setFont(QFont("Consolas", 11))
         th = _theme()
         self.sql_input.setStyleSheet(
-            f"QPlainTextEdit {{ border:2px solid #c84a4a;"
+            f"QPlainTextEdit {{ border:1px solid {th.get('border', '#444444')};"
             f" background:{th.get('editor_bg', '#1e1e1e')};"
             f" color:{th.get('text', '#dcdcdc')}; }}")
-        self.sql_input.setToolTip("更新系 SQL を入力します (赤枠 = 編集モード)")
+        self.sql_input.setToolTip("更新系 SQL を入力します (上の赤バッジ = 編集モード)")
         if SyntaxHighlighter is not None:
             try:
                 self._hl = SyntaxHighlighter(self.sql_input.document(), 'sql')
@@ -1098,12 +1222,11 @@ class SqlEditTab(_EnvMixin, QWidget):
         self.run_btn.setMinimumHeight(34)
         f = self.run_btn.font(); f.setBold(True); self.run_btn.setFont(f)
         self.run_btn.setStyleSheet(
-            "QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            " stop:0 #e57373, stop:1 #c62828); color:#fff;"
-            " border:1px solid #8e0000; border-radius:4px; padding:4px 18px; }"
-            "QPushButton:hover { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            " stop:0 #ef9a9a, stop:1 #d32f2f); }"
-            "QPushButton:disabled { background:#555; color:#aaa; }")
+            "QPushButton { background:#c0392b; color:#ffffff;"
+            " border:1px solid #e05545; font-weight:600;"
+            " padding:5px 18px; border-radius:3px; }"
+            "QPushButton:hover { background:#e0432f; border:1px solid #ff6b5a; }"
+            "QPushButton:disabled { background:#555; color:#aaa; border:1px solid #555; }")
         self.run_btn.clicked.connect(self._execute)
         btn_row.addWidget(self.run_btn)
         root.addLayout(btn_row)
@@ -1421,7 +1544,28 @@ class GridEditTab(_EnvMixin, QWidget):
 
     # ── UI 構築 ──────────────────────────────────────────────────────────
     def _build_ui(self):
-        root = QVBoxLayout(self)
+        # 左: テーブル一覧パネル / 右: 既存の編集領域 (水平スプリッタで分割)
+        outer = QHBoxLayout(self)
+        outer.setContentsMargins(0, 0, 0, 0)
+        outer.setSpacing(0)
+        h_split = QSplitter(Qt.Orientation.Horizontal)
+        outer.addWidget(h_split)
+
+        self.tables_panel = _TablesPanel()
+        self.tables_panel.refresh_requested.connect(self._refresh_tables_panel)
+        self.tables_panel.table_chosen.connect(self._on_left_table_chosen)
+        # 左パネルで DB種別を変えたら、それを現プロファイルへ永続化 (単一の真実点)
+        self.tables_panel.type_combo.currentTextChanged.connect(
+            self._on_panel_db_type_changed)
+        h_split.addWidget(self.tables_panel)
+
+        right = QWidget()
+        h_split.addWidget(right)
+        h_split.setSizes([220, 780])
+        h_split.setStretchFactor(0, 0)   # 左パネルは固定気味
+        h_split.setStretchFactor(1, 1)   # 右が伸縮
+
+        root = QVBoxLayout(right)
         root.setContentsMargins(8, 8, 8, 8)
         root.setSpacing(6)
 
@@ -1581,11 +1725,11 @@ class GridEditTab(_EnvMixin, QWidget):
         self.apply_btn.setMinimumHeight(32)
         f = self.apply_btn.font(); f.setBold(True); self.apply_btn.setFont(f)
         self.apply_btn.setStyleSheet(
-            "QPushButton { background:qlineargradient(x1:0,y1:0,x2:0,y2:1,"
-            " stop:0 #e57373, stop:1 #c62828); color:#fff;"
-            " border:1px solid #8e0000; border-radius:4px; padding:4px 16px; }"
-            "QPushButton:hover { background:#d32f2f; }"
-            "QPushButton:disabled { background:#555; color:#aaa; }")
+            "QPushButton { background:#c0392b; color:#ffffff;"
+            " border:1px solid #e05545; font-weight:600;"
+            " padding:5px 16px; border-radius:3px; }"
+            "QPushButton:hover { background:#e0432f; border:1px solid #ff6b5a; }"
+            "QPushButton:disabled { background:#555; color:#aaa; border:1px solid #555; }")
         self.apply_btn.clicked.connect(self._apply)
         btn_row.addWidget(self.apply_btn)
         root.addLayout(btn_row)
@@ -1621,6 +1765,23 @@ class GridEditTab(_EnvMixin, QWidget):
         self.allow_edit_chk.blockSignals(True)
         self.allow_edit_chk.setChecked(bool(prof.get('db_edit_allowed', False)))
         self.allow_edit_chk.blockSignals(False)
+        # 左パネルの DB種別を新プロファイルに自動追従 (空欄なら現在値維持)
+        db_type = prof.get('db_type', '')
+        if db_type:
+            self.tables_panel.type_combo.blockSignals(True)
+            self.tables_panel.set_db_type(db_type)
+            self.tables_panel.type_combo.blockSignals(False)
+
+    def _on_panel_db_type_changed(self, db_type: str):
+        """左パネルで DB種別を変更したら現プロファイルへ保存。"""
+        if not db_type:
+            return
+        name = self.profile_combo.currentText()
+        if name and name in self._profiles:
+            if self._profiles[name].get('db_type', '') == db_type:
+                return
+            self._profiles[name]['db_type'] = db_type
+            _save_db_profiles(self._profiles)
 
     def _on_os_changed(self):
         name = self.profile_combo.currentText()
@@ -1686,6 +1847,52 @@ class GridEditTab(_EnvMixin, QWidget):
         return body
 
     # ── テーブルブラウザ ─────────────────────────────────────────────────
+    # ── 左サイドのテーブル一覧パネル ─────────────────────────────────
+    def _refresh_tables_panel(self):
+        """左パネルの「🔄 更新」が押された時のフェッチ起点。"""
+        name = self.profile_combo.currentText()
+        prof = self._profiles.get(name)
+        if not prof:
+            self.tables_panel.set_error("プロファイル未選択")
+            return
+        read_tmpl = self.sel_cmd.toPlainText().strip()
+        if not read_tmpl or '{SQL}' not in read_tmpl:
+            self.tables_panel.set_error("SELECT用テンプレート未設定")
+            return
+        # 起動時にプロファイルの db_type を左パネルへ反映 (空欄なら現在値を保持)
+        self.tables_panel.set_db_type(prof.get('db_type', ''))
+        db_type = self.tables_panel.db_type()
+        if db_type not in _DB_META_QUERIES:
+            self.tables_panel.set_error("DB種別未対応")
+            return
+        sql = _DB_META_QUERIES[db_type]['tables']
+        body = read_tmpl.replace('{SQL}', _prepare_sql_for_os(sql, self._exec_os()))
+        if self._exec_os() != 'windows':
+            body = re.sub(r'(<<-?)([A-Za-z_][A-Za-z0-9_]*)(\s*\n)',
+                          lambda m: f"{m.group(1)}'{m.group(2)}'{m.group(3)}", body)
+        self.tables_panel.set_busy(True)
+        self._left_worker = _ExecWorker(prof, body, self, exec_os=self._exec_os())
+        self._left_worker.finished_ok.connect(self._on_left_tables_done)
+        self._left_worker.failed.connect(
+            lambda e: (self.tables_panel.set_busy(False),
+                       self.tables_panel.set_error(e)))
+        self._left_worker.start()
+
+    def _on_left_tables_done(self, out: str, err: str, exit_code: int):
+        self.tables_panel.set_busy(False)
+        tables = _first_column(_clean_sqlplus_output(out))
+        if not tables:
+            self.tables_panel.set_error("テーブル取得結果なし")
+            return
+        self.tables_panel.set_tables(tables)
+
+    def _on_left_table_chosen(self, table: str):
+        """左パネルでテーブルがダブルクリックされた時。"""
+        self.table_input.setText(table)
+        cols_sql = '*'
+        self.sql_input.setPlainText(f"SELECT {cols_sql} FROM {table}")
+        self._status(f"テーブル {table} を反映 (列名は「テーブルブラウザ…」で取得可)")
+
     def _open_table_browser(self):
         name = self.profile_combo.currentText()
         prof = self._profiles.get(name)
@@ -2089,28 +2296,315 @@ class GridEditTab(_EnvMixin, QWidget):
 # メインウィンドウ
 # ---------------------------------------------------------------------------
 
+# ---------------------------------------------------------------------------
+# 設定ダイアログ (テーマ切替 — Sora/LogViewer と同じ SETTINGS を共有)
+# ---------------------------------------------------------------------------
+
+class DBEditorSettingsDialog(QDialog):
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("設定")
+        self.setMinimumWidth(360)
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        tabs = QTabWidget()
+        # 表示タブ (テーマ)
+        page = QWidget()
+        v = QVBoxLayout(page)
+        v.setContentsMargins(10, 10, 10, 10)
+        v.setSpacing(6)
+        v.addWidget(QLabel("テーマ"))
+        row = QHBoxLayout()
+        row.addWidget(QLabel("プリセット:"))
+        self.theme_combo = QComboBox()
+        if _THEME_PRESETS:
+            self.theme_combo.addItems(list(_THEME_PRESETS.keys()))
+            cur = SETTINGS.get('theme', 'Dark')
+            i = self.theme_combo.findText(cur)
+            if i >= 0:
+                self.theme_combo.setCurrentIndex(i)
+        else:
+            self.theme_combo.setEnabled(False)
+            self.theme_combo.setToolTip("text_editor から SETTINGS を読み込めませんでした")
+        row.addWidget(self.theme_combo, 1)
+        v.addLayout(row)
+        hint = QLabel("テーマは Sora Editor / Multi-Server Log Viewer と共有されます。")
+        hint.setStyleSheet("color:#888; font-size:10px; padding:4px 0;")
+        v.addWidget(hint)
+        v.addStretch()
+        tabs.addTab(page, "表示")
+        lay.addWidget(tabs)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        ok = QPushButton("OK")
+        ok.setDefault(True)
+        ok.clicked.connect(self.accept)
+        cancel = QPushButton("キャンセル")
+        cancel.clicked.connect(self.reject)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog{{background:{t.get('bg', '#2b2b2b')};}}
+            QLabel{{color:{t.get('text', '#dcdcdc')};}}
+            QTabWidget::pane{{border:1px solid {t.get('border', '#444')};
+                             background:{t.get('panel_bg', '#1e1e1e')};top:-1px;}}
+            QTabBar::tab{{background:{t.get('control_bg', '#3a3a3a')};
+                         color:{t.get('text_dim', '#888')};
+                         padding:5px 14px;border:1px solid {t.get('border', '#444')};
+                         border-bottom:none;margin-right:2px;}}
+            QTabBar::tab:selected{{background:{t.get('panel_bg', '#1e1e1e')};
+                                  color:{t.get('text', '#dcdcdc')};
+                                  border-bottom:1px solid {t.get('panel_bg', '#1e1e1e')};}}
+            QComboBox{{background:{t.get('control_bg', '#3a3a3a')};
+                      color:{t.get('text', '#dcdcdc')};
+                      border:1px solid {t.get('border', '#444')};
+                      padding:2px 4px;min-height:24px;}}
+            QComboBox QAbstractItemView{{background:{t.get('panel_bg', '#1e1e1e')};
+                                        color:{t.get('text', '#dcdcdc')};
+                                        selection-background-color:{t.get('selection', '#214283')};}}
+            QPushButton{{background:{t.get('control_bg', '#3a3a3a')};
+                        color:{t.get('text', '#dcdcdc')};border:none;
+                        padding:4px 12px;border-radius:2px;}}
+            QPushButton:hover{{background:{t.get('control_hover', '#4a4a4a')};}}
+            QPushButton:default{{background:{t.get('selection', '#214283')};
+                                color:{t.get('text', '#dcdcdc')};}}
+        """)
+
+    def accept(self):
+        if _SETTINGS_AVAILABLE and self.theme_combo.isEnabled():
+            SETTINGS['theme'] = self.theme_combo.currentText()
+            try:
+                _save_settings(SETTINGS)
+            except Exception:
+                pass
+        super().accept()
+
+
 class DBEditorWindow(QMainWindow):
     def __init__(self):
         super().__init__()
         self.setWindowTitle(f"DB Editor v{__version__} — SSH経由DB編集ツール")
         self.resize(1000, 720)
 
-        th = _theme()
-        self.setStyleSheet(
-            f"QMainWindow, QWidget {{ background:{th.get('bg', '#2b2b2b')};"
-            f" color:{th.get('text', '#dcdcdc')}; }}")
+        self._build_toolbar()
 
         tabs = QTabWidget()
         self.sql_tab = SqlEditTab()
         tabs.addTab(self.sql_tab, "SQL 実行")
         self.grid_tab = GridEditTab()
         tabs.addTab(self.grid_tab, "グリッド編集")
-
+        tabs.setCurrentWidget(self.grid_tab)   # 起動時はグリッド編集タブを表示
         self.setCentralWidget(tabs)
+
+        # 接続プロファイル選択を両タブで共通化 (どちらで選んでも片方に反映)
+        self._sync_lock = False
+        self.sql_tab.profile_combo.currentTextChanged.connect(
+            lambda name: self._sync_profile(self.grid_tab.profile_combo, name))
+        self.grid_tab.profile_combo.currentTextChanged.connect(
+            lambda name: self._sync_profile(self.sql_tab.profile_combo, name))
+        # 実行OS も両タブで共通化
+        self._os_lock = False
+        self.sql_tab.os_combo.currentIndexChanged.connect(
+            lambda _i: self._sync_os(self.grid_tab.os_combo, self.sql_tab.os_combo))
+        self.grid_tab.os_combo.currentIndexChanged.connect(
+            lambda _i: self._sync_os(self.sql_tab.os_combo, self.grid_tab.os_combo))
+        # 起動時の初期同期 (SQL実行タブの選択を正とする)
+        init_name = self.sql_tab.profile_combo.currentText()
+        if init_name:
+            self._sync_profile(self.grid_tab.profile_combo, init_name)
+        self._sync_os(self.grid_tab.os_combo, self.sql_tab.os_combo)
+
         self.setStatusBar(QStatusBar())
         self.statusBar().showMessage(
             f"プロファイルは {os.path.basename(_DB_PROFILES_PATH)} を共有 / "
             f"監査ログ: {_AUDIT_LOG_PATH}")
+
+        self._apply_theme()
+
+    # ── ツールバー ──────────────────────────────────────────────────────
+    def _build_toolbar(self):
+        tb = QToolBar("Quick Access")
+        tb.setMovable(False)
+        self._toolbar = tb
+
+        act_hist = QAction("📜 履歴", self)
+        act_hist.setToolTip("SQL 実行履歴を表示")
+        act_hist.triggered.connect(self._open_history)
+        tb.addAction(act_hist)
+
+        tb.addSeparator()
+
+        self._tb_spacer = QWidget()
+        self._tb_spacer.setSizePolicy(QSizePolicy.Policy.Expanding,
+                                     QSizePolicy.Policy.Preferred)
+        tb.addWidget(self._tb_spacer)
+
+        act_settings = QAction("⚙ 設定", self)
+        act_settings.setToolTip("テーマ等の設定")
+        act_settings.triggered.connect(self._open_settings)
+        tb.addAction(act_settings)
+
+        self.addToolBar(tb)
+
+    # ── プロファイル選択の両タブ同期 ─────────────────────────────────
+    def _sync_profile(self, target_combo, name: str):
+        """片方のタブで選んだ接続プロファイルをもう片方へ反映する。
+        再帰防止に self._sync_lock を使う。"""
+        if self._sync_lock or not name:
+            return
+        if target_combo.currentText() == name:
+            return
+        idx = target_combo.findText(name)
+        if idx < 0:
+            return
+        self._sync_lock = True
+        try:
+            target_combo.setCurrentIndex(idx)
+        finally:
+            self._sync_lock = False
+
+    def _sync_os(self, target_combo, source_combo):
+        """片方のタブで選んだ実行OSをもう片方へ反映する。
+        再帰防止に self._os_lock を使う。"""
+        if self._os_lock:
+            return
+        data = source_combo.currentData()
+        if data is None:
+            return
+        if target_combo.currentData() == data:
+            return
+        idx = target_combo.findData(data)
+        if idx < 0:
+            return
+        self._os_lock = True
+        try:
+            target_combo.setCurrentIndex(idx)
+        finally:
+            self._os_lock = False
+
+    def _open_history(self):
+        dlg = HistoryDialog(self)
+        dlg.sql_chosen.connect(self._set_sql_from_history)
+        dlg.exec()
+
+    def _set_sql_from_history(self, sql: str):
+        try:
+            self.sql_tab.sql_input.setPlainText(sql)
+            self.centralWidget().setCurrentWidget(self.sql_tab)
+        except Exception:
+            pass
+
+    def _open_settings(self):
+        dlg = DBEditorSettingsDialog(self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            self._apply_theme()
+
+    # ── テーマ適用 (ライブ切替) ─────────────────────────────────────────
+    def _apply_theme(self):
+        t = _theme()
+        self.setStyleSheet(f"""
+            QMainWindow, QWidget {{ background:{t.get('bg', '#2b2b2b')};
+                                    color:{t.get('text', '#dcdcdc')}; }}
+            QToolTip {{ background-color:#2b2b2b; color:#ffffff;
+                        border:1px solid #666; padding:3px 6px; }}
+            QTabWidget::pane {{ border:1px solid {t.get('border', '#444')};
+                                background:{t.get('panel_bg', '#1e1e1e')}; }}
+            QTabBar::tab {{ background:{t.get('control_bg', '#3a3a3a')};
+                           color:{t.get('text_dim', '#888')};
+                           padding:6px 14px; border:1px solid {t.get('border', '#444')};
+                           border-bottom:none; margin-right:2px; }}
+            QTabBar::tab:selected {{ background:{t.get('panel_bg', '#1e1e1e')};
+                                    color:{t.get('text', '#dcdcdc')};
+                                    border-bottom:1px solid {t.get('panel_bg', '#1e1e1e')}; }}
+            QPushButton {{ background:{t.get('control_bg', '#3a3a3a')};
+                          color:{t.get('text', '#dcdcdc')}; border:none;
+                          padding:4px 10px; border-radius:2px; }}
+            QPushButton:hover {{ background:{t.get('control_hover', '#4a4a4a')}; }}
+            QLineEdit {{ background:{t.get('panel_bg', '#1e1e1e')};
+                        color:{t.get('text', '#dcdcdc')};
+                        border:1px solid {t.get('border', '#444')}; padding:1px 3px; }}
+            QPlainTextEdit, QTextEdit {{ background:{t.get('editor_bg', '#1e1e1e')};
+                                        color:{t.get('text', '#dcdcdc')};
+                                        border:1px solid {t.get('border', '#444')};
+                                        selection-background-color:{t.get('selection', '#214283')}; }}
+            QComboBox {{ background:{t.get('control_bg', '#3a3a3a')};
+                        color:{t.get('text', '#dcdcdc')};
+                        border:1px solid {t.get('border', '#444')}; padding:1px 3px; }}
+            QComboBox QAbstractItemView {{ background:{t.get('panel_bg', '#1e1e1e')};
+                                          color:{t.get('text', '#dcdcdc')};
+                                          selection-background-color:{t.get('selection', '#214283')}; }}
+            QCheckBox {{ color:{t.get('text', '#dcdcdc')}; spacing:5px; }}
+            QStatusBar {{ background:{t.get('toolbar_bg', '#2a2a2a')};
+                          color:{t.get('text_dim', '#888')}; }}
+            QSplitter::handle {{ background:{t.get('border', '#444')}; }}
+            QTableWidget {{ background:{t.get('panel_bg', '#1e1e1e')};
+                           color:{t.get('text', '#dcdcdc')};
+                           gridline-color:{t.get('border', '#444')}; }}
+            QHeaderView::section {{ background:{t.get('toolbar_bg', '#2a2a2a')};
+                                   color:{t.get('text', '#dcdcdc')};
+                                   border:1px solid {t.get('border', '#444')};
+                                   padding:2px 6px; font-weight:600; }}
+            QListWidget {{ background:{t.get('panel_bg', '#1e1e1e')};
+                          color:{t.get('text', '#dcdcdc')};
+                          border:1px solid {t.get('border', '#444')}; }}
+            QListWidget::item:selected {{ background:{t.get('selection', '#214283')};
+                                         color:{t.get('text', '#dcdcdc')}; }}
+        """)
+        self._apply_toolbar_style()
+        if hasattr(self, '_tb_spacer') and self._tb_spacer is not None:
+            self._tb_spacer.setStyleSheet(f"background:{t.get('toolbar_bg', '#2a2a2a')};")
+        # タブ側のインライン色も再適用
+        for tab in (getattr(self, 'sql_tab', None), getattr(self, 'grid_tab', None)):
+            if tab is not None and hasattr(tab, 'apply_theme'):
+                try:
+                    tab.apply_theme()
+                except Exception:
+                    pass
+        self._force_restyle()
+
+    def _apply_toolbar_style(self):
+        tb = getattr(self, '_toolbar', None)
+        if tb is None:
+            return
+        t = _theme()
+        tb.setStyleSheet(
+            f"QToolBar {{ background:{t.get('toolbar_bg', '#2a2a2a')}; border:none;"
+            f"            spacing:3px; padding:4px 6px; }}"
+            f"QToolBar::separator {{ background:{t.get('border', '#444')};"
+            f"                      width:1px; margin:4px 6px; }}"
+            f"QToolBar QPushButton, QToolBar QToolButton {{"
+            f"  background:{t.get('control_bg', '#3a3a3a')};"
+            f"  color:{t.get('text', '#dcdcdc')};"
+            f"  border:1px solid {t.get('border', '#444')};"
+            f"  padding:5px 10px; border-radius:4px; }}"
+            f"QToolBar QPushButton:hover, QToolBar QToolButton:hover {{"
+            f"  background:{t.get('control_hover', '#4a4a4a')};"
+            f"  border:1px solid {t.get('border', '#444')}; }}"
+        )
+
+    def _force_restyle(self):
+        """ライブのテーマ変更で子ウィジェットが再描画されない問題への対策。"""
+        try:
+            from PyQt6.QtWidgets import QWidget as _QW
+            widgets = self.findChildren(_QW)
+            widgets.append(self)
+            for w in widgets:
+                try:
+                    st = w.style()
+                    st.unpolish(w); st.polish(w); w.update()
+                except Exception:
+                    pass
+        except Exception:
+            pass
 
 
 def main():
