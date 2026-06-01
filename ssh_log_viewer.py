@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.10"
+__version__ = "1.1.11"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -836,14 +836,22 @@ class TailWorker(QThread):
     _MAX_PARTIAL_BYTES = 65536
     # stderr drain の実行間隔 (秒)
     _STDERR_DRAIN_INTERVAL = 5.0
+    # emit のバッチ間隔 (秒): recv ごとに emit すると多セル × 高 tail rate で
+    # Qt のクロススレッド・シグナルキューが蓄積するため、確定行をここで束ねる
+    _EMIT_INTERVAL = 0.15
+    # バッチが大きくなった場合は時間待たず即 flush するしきい値 (バイト)
+    _EMIT_MAX_BYTES = 65536
 
     def run(self):
         chan = None
         try:
             chan = self._conn.open_tail_channel(self._path)
             buf = b''
+            pending: list[bytes] = []   # 確定行を蓄積 (改行なしの完了テキストの集合)
+            pending_size = 0
             last_recv = time.time()
             last_drain = time.time()
+            last_emit = time.time()
             while not self._stop:
                 now = time.time()
                 if chan.recv_ready(0.1):
@@ -855,21 +863,35 @@ class TailWorker(QThread):
                         last_recv = now
                         parts = buf.split(b'\n')
                         buf   = parts[-1]
-                        text  = b'\n'.join(parts[:-1]).decode('utf-8', errors='replace')
-                        if text:
-                            self.new_text.emit(text)
+                        if len(parts) > 1:
+                            chunk = b'\n'.join(parts[:-1])
+                            pending.append(chunk)
+                            pending_size += len(chunk) + 1
                         # buf が異常肥大した場合は強制 flush (改行なしの長行ガード)
                         if len(buf) > self._MAX_PARTIAL_BYTES:
-                            self.new_text.emit(buf.decode('utf-8', errors='replace'))
+                            pending.append(buf)
+                            pending_size += len(buf)
                             buf = b''
                 else:
-                    # 新データが暫く来ず、不完全行が残っていれば flush。
-                    # ローテーション時に旧ファイルの末端を表示するため。
+                    # 新データが暫く来ず、不完全行が残っていれば pending に積む。
+                    # (ローテーション時に旧ファイルの末端を表示するため)
                     if buf and (now - last_recv) > self._PARTIAL_FLUSH_SEC:
-                        self.new_text.emit(buf.decode('utf-8', errors='replace'))
+                        pending.append(buf)
+                        pending_size += len(buf)
                         buf = b''
                         last_recv = now
                     time.sleep(0.05)
+                # pending を時間 or サイズで flush (シグナルキュー累積を抑制)
+                if pending and (
+                    (now - last_emit) >= self._EMIT_INTERVAL or
+                    pending_size >= self._EMIT_MAX_BYTES
+                ):
+                    text = b'\n'.join(pending).decode('utf-8', errors='replace')
+                    if text:
+                        self.new_text.emit(text)
+                    pending.clear()
+                    pending_size = 0
+                    last_emit = now
                 # 定期的に stderr を drain (`tail -F` のローテーション通知等)
                 if (now - last_drain) > self._STDERR_DRAIN_INTERVAL:
                     try:
