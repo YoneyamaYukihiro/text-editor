@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.14"
+__version__ = "1.1.15"
 
 import sys
 import os

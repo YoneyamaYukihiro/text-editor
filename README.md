@@ -7,7 +7,7 @@
 | **Multi-Server Log Viewer** ([ssh_log_viewer.py](ssh_log_viewer.py)) | 複数サーバーへ SSH/Telnet 同時接続、グリッドでログをリアルタイム表示 |
 | **Sora Editor** ([text_editor.py](text_editor.py)) | 過去ログの編集・整形、Grep、SQL抽出/整形/実行、各種シンタックスハイライト |
 
-- バージョン: **1.1.14**
+- バージョン: **1.1.15**
 - 対応OS: Windows 10/11 (Linux/macOS も Python経由で動作)
 - ライセンス: 内部利用
 
@@ -679,6 +679,7 @@ v1.1.1 から **設定ダイアログ内に集約**: めったに使わない機
 
 | バージョン | 主な変更 |
 |---|---|
+| **1.1.15** | **ターミナル機能を TeraTerm 風に大幅刷新 (LogViewer)**: 旧来「下の入力欄にコマンドを書いて送信ボタン」だったのを、**画面に直接タイプ**できる対話型ターミナルに置換。出力ウィジェット (`_TerminalView`) が直接キー入力を受け、event filter で SSH チャネルへ送信。対応キー: 通常文字 / Enter / BackSpace / Tab / Esc / 矢印 / Home/End / PgUp/PgDn / Del / Ctrl+A〜Z 制御文字 / Ctrl+V ペースト / Ctrl+Shift+C コピー (Ctrl+C は中断シグナル)。**ターミナルエミュレーション**: CSI K/J (消去) / CSI D/C/G/H/f (カーソル位置) / OSC / 文字セット切替を解釈、CR/LF/BS/BEL を適切に処理。チャンク境界で分割された ANSI シーケンスは `_pending_partial` に保留して次回連結。**カーソル**: 500ms タイマーで自前ブロックカーソル点滅 (`_TerminalView`)。**Ctrl+D (シェル終了) で dialog 自動 close**: `TerminalReader` が `channel.closed/eof_received/exit_status_ready` を毎ループ監視し、`channel_closed` シグナル → `TerminalDialog.close()`。**性能**: 連続通常文字を 1 回の `insertText` でまとめる高速パス、`TerminalReader` は recv ごとではなく **50ms or 32KB 単位** で emit バッチ化 + 末尾 UTF-8 不完全分は次回保留 (Japanese ログで ? が出ない)。**UI**: 上部に コピー / ペースト / Ctrl+C / クリア ボタン、右クリックメニュー (コピー / ペースト / 全選択 / クリア)、ボタン autoDefault=False で Enter 競合回避。**接続色との一体化**: ターミナル上部バーを接続パネルと同色 (`_palette(color_idx)` の bg) で塗りつぶし、サーバー識別を一目化。**メイン ToolBar 微調整**: 「▶ 全Tail開始」「■ 全停止」の派手な primary/danger 色を外し他のツールバーボタンと統一スタイルに。**終了処理の漏れ修正**: `WA_DeleteOnClose` で X ボタン時に dialog 確実破棄 → `_terminals` から自動除外、reader signal を停止前に disconnect、chan.close を try/except、wait(2000) 失敗時の terminate フォールバック。 |
 | **1.1.14** | **アラート調査からの Sora 検索を多条件化 + 初期画面で末尾追従 + Light テーマの可読性大幅改善 + Sora 末尾自動ジャンプ**: アラート調査でこれまで `lot` しか Sora に渡せなかった検索条件を多項目化。LogViewer 側に `AlertSearchFieldsDialog` を追加し、抽出済みの **ロット / 日時 (YYYY/MM/DD HH:MM:SS) / 装置 / キャリア / 工程 / エラーコード / プロセス / ホスト** をチェックボックスで選択、AND (同行に全部) / OR (どれか含む) を QComboBox で切替えて Sora 用の regex を組み立て、`--regex` フラグ付きで Sora を起動。Sora 側は `--regex` を受けて検索バーの正規表現トグルを自動 ON、`QTimer.singleShot(0)` で**最初のマッチへ自動カーソル移動**するように。**Light テーマの視認性**: 検索バー背景を淡い青みの色 (`#d8e2f0`) に + 上下ボーダーで編集エリアから分離、入力欄/ボタンの境界は `text_dim` で濃く。行番号ガターは `gutter_bg`/`gutter_fg` を可読化 (Light: `#f0f0f0 → #e0e0e0` / `#888888 → #444444`、Solarized Light: 同様調整)、現在行アクセントは黄 `#FFEB3B` を Dark 専用に、Light では濃いオレンジ `#E65100` に切替。**LogViewer (副次)**: ワークスペース読み込み直後にスクロールが先頭から動かない問題を `showEvent` で末尾追従、アラート調査ダイアログのタイトルを「アラート調査」に簡素化。 |
 | **1.1.13** | **アイコン刷新 (両アプリ)**: テンプレ感のある旧アイコンを刷新。**Sora**: 晴天色グラデ背景 (淡水色→空色) に大きな濃紺の "S" を配置、その右下に小さな "ora" をオーバーラップ。S と重なる部分だけ淡水色 (背景上端と同色) で塗り直して「切り抜き」効果を出し、視認性を確保。16px は ora を省いて S 単体で大きく描画。**LogViewer**: ダークグラデ背景 (#2c2c2c→#0c0c0c) に "MLV" を中央配置、文字はログレベル色の横方向グラデーション (M=ERROR赤 / L=WARN黄 / V=INFO緑) で世界観を表現。16px は M 単体・ERROR赤で描画。`app_icons.py` で QPainter から再生成、`.ico` も同時更新。 |
 | **1.1.12** | **末尾追従の最終行欠け修正 + 副次的にメモリ・描画負荷も軽減(LogViewer)**: 4:3 ディスプレイ等で 3×4 グリッドのように 1 セルあたりの縦が狭くなる構成において、`tail` の最新行が見切れる (半分だけ表示 / 表示されない) 問題を修正。原因は append 直後の `sb.setValue(sb.maximum())` が、`viewport_height % line_height` の余りと append 直後のレイアウト未確定タイミングが重なって 「ズレ位置にスクロール → 正位置にスクロール」 のペイント二重発火を引き起こしていたこと。`moveCursor(End)` + `ensureCursorVisible()` に置き換え、必要な時だけ 1 回スクロールするよう変更。最終行が確実に可視範囲に入るほか、ペイント発火回数減 → Qt の paint cache 負荷減 → 多セル時の RSS も若干低下する副次効果あり。 |

@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.14"
+__version__ = "1.1.15"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -21,7 +21,7 @@ from PyQt6.QtWidgets import (
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
     QFont, QColor, QTextCharFormat, QSyntaxHighlighter,
-    QAction, QKeySequence, QTextCursor,
+    QAction, QKeySequence, QTextCursor, QPainter,
 )
 
 
@@ -3132,8 +3132,15 @@ class SettingsDialog(QDialog):
 # ---------------------------------------------------------------------------
 
 class TerminalReader(QThread):
-    new_text = pyqtSignal(str)
-    error    = pyqtSignal(str)
+    new_text       = pyqtSignal(str)
+    error          = pyqtSignal(str)
+    channel_closed = pyqtSignal()   # シェルが exit / Ctrl+D 等で閉じた時
+
+    # 受信バイトをまとめて emit する間隔。recv ごとに emit するとシグナル
+    # キューが詰まって UI がガタつくため、〜50ms 単位でバッチ化する。
+    _EMIT_INTERVAL_SEC = 0.05
+    # バッファがこれを超えたら時間待たずに即 flush
+    _EMIT_MAX_BYTES = 32 * 1024
 
     def __init__(self, channel):
         super().__init__()
@@ -3144,36 +3151,179 @@ class TerminalReader(QThread):
         self._stop = True
 
     def run(self):
+        buf = bytearray()
+        last_emit = time.time()
         try:
             while not self._stop:
-                if self._chan.recv_ready(0.1):
+                now = time.time()
+                got = False
+                if self._chan.recv_ready(0.02):
                     data = self._chan.recv(4096)
-                    if not data:
-                        time.sleep(0.05)
-                        continue
-                    self.new_text.emit(data.decode('utf-8', errors='replace'))
-                else:
-                    time.sleep(0.05)
+                    if data:
+                        buf.extend(data)
+                        got = True
+                if buf and (
+                    (now - last_emit) >= self._EMIT_INTERVAL_SEC
+                    or len(buf) >= self._EMIT_MAX_BYTES
+                ):
+                    # 末尾の UTF-8 不完全分は次回まで保留 (decode で ? を出さない)
+                    hold = self._partial_utf8_keep(buf)
+                    if hold:
+                        flush_bytes = bytes(buf[:len(buf) - hold])
+                        del buf[:len(buf) - hold]
+                    else:
+                        flush_bytes = bytes(buf)
+                        buf.clear()
+                    if flush_bytes:
+                        self.new_text.emit(
+                            flush_bytes.decode('utf-8', errors='replace'))
+                    last_emit = now
+                # シェル側の終了 (Ctrl+D / exit / kill) を検知してダイアログを閉じる
+                if self._chan_is_closed():
+                    # 残りバッファを最後にもう一度 flush してから通知
+                    if buf:
+                        try:
+                            self.new_text.emit(
+                                bytes(buf).decode('utf-8', errors='replace'))
+                        except Exception:
+                            pass
+                        buf.clear()
+                    self.channel_closed.emit()
+                    return
+                if not got:
+                    time.sleep(0.02)
         except Exception as e:
             self.error.emit(str(e))
 
+    def _chan_is_closed(self) -> bool:
+        """paramiko/Telnet channel が閉じている (= shell exit 等) か判定。"""
+        chan = self._chan
+        if chan is None:
+            return True
+        # 我々のラッパー (_SSHChannel) の内側に paramiko Channel がある
+        inner = getattr(chan, '_chan', None)
+        if inner is not None:
+            try:
+                if getattr(inner, 'closed', False):
+                    return True
+                if hasattr(inner, 'eof_received') and inner.eof_received:
+                    return True
+                if (hasattr(inner, 'exit_status_ready')
+                        and inner.exit_status_ready()):
+                    return True
+            except Exception:
+                pass
+        return False
 
-_ANSI_ESCAPE_RE = re.compile(r'\x1b\[[0-9;?]*[a-zA-Z]')
+    @staticmethod
+    def _partial_utf8_keep(buf: bytearray) -> int:
+        """末尾に不完全な UTF-8 シーケンスがあれば保留すべきバイト数 (1〜3) を返す。
+        完結していれば 0。"""
+        n = len(buf)
+        if n == 0:
+            return 0
+        last = buf[n - 1]
+        if last < 0x80:
+            return 0  # ASCII 完結
+        if (last & 0xC0) == 0xC0:
+            # 末尾が 開始バイト (110xxxxx / 1110xxxx / 11110xxx) — 単独不完全
+            return 1
+        # 末尾が継続バイト 10xxxxxx → 開始バイトを最大 3 つ前まで探す
+        for offset in range(2, min(5, n + 1)):
+            b = buf[n - offset]
+            if (b & 0xC0) == 0xC0:
+                if (b & 0xE0) == 0xC0:   need = 2
+                elif (b & 0xF0) == 0xE0: need = 3
+                elif (b & 0xF8) == 0xF0: need = 4
+                else: return 0  # 壊れたシーケンス
+                return 0 if offset >= need else offset
+            if b < 0x80:
+                return 0  # 継続バイトの前が ASCII = 壊れている
+        return 0
+
+
+# ターミナル出力の制御コードは TerminalDialog._append のステートマシンで
+# 逐次処理する (CSI K/J は意味のあるものとして反映、他はスキップ)。
+
+
+class _TerminalView(QPlainTextEdit):
+    """ターミナル画面用 QPlainTextEdit。
+    QPlainTextEdit 標準のテキストカーソルは read-only 時に点滅しない
+    (Qt 6 / Windows) ため、500ms タイマーでフォーカス時にブロックカーソルを
+    オーバーレイ描画して点滅させる。
+    """
+
+    _BLINK_INTERVAL_MS = 500
+    _CURSOR_WIDTH_PX   = 8
+    _CURSOR_COLOR      = QColor("#d0d0d0")  # ターミナル文字色に近い淡色
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._cursor_visible = True
+        self._blink_timer = QTimer(self)
+        self._blink_timer.setInterval(self._BLINK_INTERVAL_MS)
+        self._blink_timer.timeout.connect(self._toggle_blink)
+        self._blink_timer.start()
+        # フォーカス/カーソル位置が変わったら次の周期まで待たず点灯
+        self.cursorPositionChanged.connect(self._reset_blink_visible)
+
+    def _toggle_blink(self):
+        self._cursor_visible = not self._cursor_visible
+        self.viewport().update()
+
+    def _reset_blink_visible(self):
+        self._cursor_visible = True
+        self._blink_timer.start(self._BLINK_INTERVAL_MS)  # 再起動
+        self.viewport().update()
+
+    def focusInEvent(self, event):
+        super().focusInEvent(event)
+        self._reset_blink_visible()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self._cursor_visible = False
+        self.viewport().update()
+
+    def paintEvent(self, event):
+        super().paintEvent(event)
+        if not (self.hasFocus() and self._cursor_visible):
+            return
+        rect = self.cursorRect()
+        painter = QPainter(self.viewport())
+        painter.fillRect(
+            rect.x(), rect.y(),
+            self._CURSOR_WIDTH_PX, rect.height(),
+            self._CURSOR_COLOR,
+        )
 
 
 class TerminalDialog(QDialog):
-    """SSH/Telnet で対話的にコマンドを送れるターミナル。"""
+    """SSH/Telnet で対話的にコマンドを送れるターミナル (TeraTerm 風直接入力)。
+    output ウィジェット自体がフォーカスを受け、押下キーを SSH チャネルへ
+    直送信する。サーバ側のエコーが output に表示される。
+    """
 
-    def __init__(self, conn, parent=None):
+    # Ctrl+A〜Z → 制御文字 1〜26 用のキー範囲 (Ctrl+C/V は別処理)
+
+    def __init__(self, conn, parent=None, color_idx: int = 0):
         super().__init__(parent)
         proto = getattr(conn, 'protocol', 'ssh').upper()
         self.setWindowTitle(f"ターミナル [{proto}] — {conn.label}")
         self.resize(820, 520)
+        # X ボタンで閉じた時に dialog を確実に破棄させる
+        # (MainWindow._terminals から自動で外す destroyed シグナルを発火させるため)
+        self.setAttribute(Qt.WidgetAttribute.WA_DeleteOnClose, True)
         self._conn = conn
+        # 接続パネルと色を揃えるため、color_idx から bg/fg を取得
+        self.color_idx = color_idx
+        self._hdr_bg, self._hdr_fg = _palette(color_idx)
         self._chan = None
         self._reader: TerminalReader | None = None
-        self._history: list[str] = []
-        self._hist_idx = 0
+        # ANSI シーケンスがチャンク分割された場合の繰り越し用バッファ
+        # (\x1b[ で始まり final byte に達してない断片を保持し、
+        #  次回 _append でこのバッファを先頭につけて再評価する)
+        self._pending_partial = ''
         self._build_ui()
         self._open_channel()
 
@@ -3182,40 +3332,106 @@ class TerminalDialog(QDialog):
         lay.setContentsMargins(4, 4, 4, 4)
         lay.setSpacing(3)
 
-        self.output = QPlainTextEdit()
+        # 出力 = 直接キー入力可能なターミナル画面
+        # _TerminalView は QPlainTextEdit + 自前ブロックカーソル点滅
+        self.output = _TerminalView()
+        # テキストとしては読み取り専用 (ユーザーがカーソル位置にテキストを
+        # 直接書き込めないよう)、ただし key event は eventFilter で SSH へ転送
         self.output.setReadOnly(True)
-        # ターミナル出力も追記専用 / 読み取り専用なので undo 履歴を切る
-        # (長時間放置で undo スタックが無限に膨らむのを防ぐ)
         self.output.document().setUndoRedoEnabled(False)
-        # 行数上限。長時間ストリーム時のメモリ青天井防止。
         self.output.setMaximumBlockCount(10000)
-        lay.addWidget(self.output, 1)
+        self.output.setFocusPolicy(Qt.FocusPolicy.StrongFocus)
+        # 読み取り専用でも選択 (コピー) は可能に
+        self.output.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+            | Qt.TextInteractionFlag.TextSelectableByKeyboard
+        )
+        # QPlainTextEdit 標準カーソルは _TerminalView の自前カーソルと
+        # 二重表示にならないよう非表示 (幅 0)
+        self.output.setCursorWidth(0)
+        self.output.installEventFilter(self)
+        # 右クリックメニュー (コピー / ペースト / 全選択 / クリア)
+        self.output.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.output.customContextMenuRequested.connect(self._on_output_context_menu)
+        self.output.setPlaceholderText(
+            "ここにそのままタイプしてください  "
+            "(Ctrl+C: 中断 / Ctrl+Shift+C: コピー / Ctrl+V: ペースト / 右クリックメニュー可)"
+        )
 
-        row = QHBoxLayout()
-        row.setSpacing(3)
-        self.input = QLineEdit()
-        self.input.setPlaceholderText("コマンド (Enter で送信 / ↑↓で履歴)")
-        self.input.returnPressed.connect(self._send)
-        self.input.installEventFilter(self)
-        row.addWidget(self.input, 1)
+        # 上部ツールバー (接続表示 + コピー/ペースト/Ctrl+C / クリア ボタン)
+        # 接続パネルと色を揃えてサーバー識別。バー全体を色で塗り、ボタンも
+        # 同色テーマで馴染ませる (objectName 経由で他のボタンと CSS 分離)
+        self._top_bar = QWidget()
+        self._top_bar.setObjectName('terminalTopBar')
+        self._top_bar.setStyleSheet(f"""
+            #terminalTopBar {{
+                background:{self._hdr_bg};
+                border-bottom:2px solid {self._hdr_fg};
+            }}
+            #terminalTopBar QLabel {{
+                color:{self._hdr_fg};
+                background:transparent;
+                font-weight:700;
+                font-size:12px;
+                padding:4px 8px;
+            }}
+            #terminalTopBar QPushButton {{
+                background:rgba(0,0,0,0.35);
+                color:{self._hdr_fg};
+                border:1px solid {self._hdr_fg};
+                padding:3px 10px;
+                border-radius:3px;
+                font-size:11px;
+                font-weight:600;
+            }}
+            #terminalTopBar QPushButton:hover {{
+                background:rgba(0,0,0,0.55);
+            }}
+        """)
+        self._top_bar.setMinimumHeight(34)
+        top_row = QHBoxLayout(self._top_bar)
+        top_row.setContentsMargins(6, 3, 6, 3)
+        top_row.setSpacing(4)
+        self._info_lbl = QLabel(f"💻  {self._conn.label}")
+        top_row.addWidget(self._info_lbl)
+        top_row.addStretch()
 
-        send_btn = QPushButton("送信")
-        send_btn.clicked.connect(self._send)
-        row.addWidget(send_btn)
+        copy_btn = QPushButton("コピー")
+        copy_btn.setToolTip("選択範囲をクリップボードへ (Ctrl+Shift+C)")
+        copy_btn.setAutoDefault(False)
+        copy_btn.setDefault(False)
+        copy_btn.clicked.connect(self.output.copy)
+        top_row.addWidget(copy_btn)
+
+        paste_btn = QPushButton("ペースト")
+        paste_btn.setToolTip("クリップボードをターミナルへ送信 (Ctrl+V)")
+        paste_btn.setAutoDefault(False)
+        paste_btn.setDefault(False)
+        paste_btn.clicked.connect(self._paste_from_clipboard)
+        top_row.addWidget(paste_btn)
 
         ctrlc_btn = QPushButton("Ctrl+C")
         ctrlc_btn.setToolTip("中断シグナル送信 (0x03)")
+        # Enter キーがダイアログの既定ボタンに奪われると Ctrl+C 送信になって
+        # しまうため autoDefault を OFF (output で Enter を確実に拾うため)
+        ctrlc_btn.setAutoDefault(False)
+        ctrlc_btn.setDefault(False)
         ctrlc_btn.clicked.connect(lambda: self._send_raw(b'\x03'))
-        row.addWidget(ctrlc_btn)
+        top_row.addWidget(ctrlc_btn)
 
         clear_btn = QPushButton("クリア")
+        clear_btn.setToolTip("画面表示をクリア (ローカル表示のみ)")
+        clear_btn.setAutoDefault(False)
+        clear_btn.setDefault(False)
         clear_btn.clicked.connect(self.output.clear)
-        row.addWidget(clear_btn)
+        top_row.addWidget(clear_btn)
 
-        lay.addLayout(row)
+        lay.addWidget(self._top_bar)
+        lay.addWidget(self.output, 1)
 
         self.setStyleSheet("""
             QDialog{background:#1a1a1a;}
+            QLabel{color:#c0c0c0;font-size:11px;padding:2px 4px;}
             QPushButton{background:#3a3a3a;color:#a9b7c6;border:none;
                         padding:3px 10px;border-radius:2px;font-size:11px;}
             QPushButton:hover{background:#4a4a4a;}
@@ -3231,29 +3447,87 @@ class TerminalDialog(QDialog):
             f"background:#0e0e0e;color:#d0d0d0;border:1px solid {t['border']};"
             f"selection-background-color:{t['selection']};"
         )
-        self.input.setStyleSheet(
-            f"background:#1e1e1e;color:#d0d0d0;border:1px solid {t['border']};padding:3px;"
-            f"font-family:Consolas; font-size:{fs + 1}px;"
-        )
 
     def eventFilter(self, obj, event):
-        if obj is self.input and event.type() == event.Type.KeyPress:
-            if event.key() == Qt.Key.Key_Up:
-                self._history_step(-1)
-                return True
-            if event.key() == Qt.Key.Key_Down:
-                self._history_step(+1)
+        if obj is self.output and event.type() == event.Type.KeyPress:
+            if self._handle_terminal_key(event):
                 return True
         return super().eventFilter(obj, event)
 
-    def _history_step(self, delta: int):
-        if not self._history:
-            return
-        self._hist_idx = max(0, min(len(self._history), self._hist_idx + delta))
-        if self._hist_idx >= len(self._history):
-            self.input.setText('')
-        else:
-            self.input.setText(self._history[self._hist_idx])
+    def _handle_terminal_key(self, event) -> bool:
+        """output が受け取ったキー押下を SSH チャネルへ直送信する。
+        True を返すと QPlainTextEdit デフォルト動作 (ローカルスクロール等) を抑止。
+        """
+        if not self._chan:
+            return False
+        key = event.key()
+        text = event.text()
+        mods = event.modifiers()
+        is_ctrl  = bool(mods & Qt.KeyboardModifier.ControlModifier)
+        is_shift = bool(mods & Qt.KeyboardModifier.ShiftModifier)
+
+        # Ctrl+Shift+C: コピー / Ctrl+C: 中断シグナル
+        if is_ctrl and key == Qt.Key.Key_C:
+            if is_shift:
+                self.output.copy()
+            else:
+                try:
+                    self._chan.send(b'\x03')
+                except Exception:
+                    pass
+            return True
+        # Ctrl+V: クリップボードのテキストを送信 (ペースト)
+        if is_ctrl and not is_shift and key == Qt.Key.Key_V:
+            clip = QApplication.clipboard().text()
+            if clip:
+                try:
+                    self._chan.send(clip.encode('utf-8'))
+                except Exception:
+                    pass
+            return True
+        # Ctrl+A〜Z (C/V を除く) → 制御文字 SOH〜SUB
+        if is_ctrl and not is_shift and Qt.Key.Key_A <= key <= Qt.Key.Key_Z:
+            try:
+                self._chan.send(bytes([key - Qt.Key.Key_A + 1]))
+            except Exception:
+                pass
+            return True
+
+        # 特殊キー → ANSI シーケンス
+        # BackSpace は \x08 (^H, TeraTerm 既定と同じ)。
+        # 多くのモダン Unix も両方受け付ける (stty erase の設定に依存)。
+        special_map = {
+            Qt.Key.Key_Return:    b'\r',
+            Qt.Key.Key_Enter:     b'\r',
+            Qt.Key.Key_Backspace: b'\x08',
+            Qt.Key.Key_Tab:       b'\t',
+            Qt.Key.Key_Escape:    b'\x1b',
+            Qt.Key.Key_Up:        b'\x1b[A',
+            Qt.Key.Key_Down:      b'\x1b[B',
+            Qt.Key.Key_Right:     b'\x1b[C',
+            Qt.Key.Key_Left:      b'\x1b[D',
+            Qt.Key.Key_Home:      b'\x1b[H',
+            Qt.Key.Key_End:       b'\x1b[F',
+            Qt.Key.Key_PageUp:    b'\x1b[5~',
+            Qt.Key.Key_PageDown:  b'\x1b[6~',
+            Qt.Key.Key_Delete:    b'\x1b[3~',
+        }
+        if key in special_map:
+            try:
+                self._chan.send(special_map[key])
+            except Exception:
+                pass
+            return True
+
+        # 通常文字 (印字可能/Unicode)
+        if text:
+            try:
+                self._chan.send(text.encode('utf-8'))
+            except Exception:
+                pass
+            return True
+
+        return False
 
     def _open_channel(self):
         try:
@@ -3265,40 +3539,296 @@ class TerminalDialog(QDialog):
         self._reader = TerminalReader(self._chan)
         self._reader.new_text.connect(self._append)
         self._reader.error.connect(lambda e: self._append(f"\n[エラー] {e}\n"))
+        # シェルログアウト時に自動でダイアログを閉じる
+        self._reader.channel_closed.connect(self.close)
         self._reader.start()
-        # 入力欄にフォーカスを当て、即座にタイプ可能にする
-        QTimer.singleShot(50, self.input.setFocus)
+        # 出力欄にフォーカスを当て、即座にタイプ可能に
+        QTimer.singleShot(50, self.output.setFocus)
 
     def showEvent(self, event):
         super().showEvent(event)
-        self.input.setFocus()
+        self.output.setFocus()
 
     def _append(self, text: str):
-        text = _ANSI_ESCAPE_RE.sub('', text)
-        text = text.replace('\r\n', '\n').replace('\r', '')
-        self.output.moveCursor(QTextCursor.MoveOperation.End)
-        self.output.insertPlainText(text)
+        """サーバ出力を最小限のターミナルエミュレーションで反映する。
+        対応:
+        - \r (CR): カーソルをブロック先頭へ
+        - \n (LF): 文書末尾へ移動して改行挿入
+        - \x08 (BS): カーソル左 (ブロック先頭は越えない)
+        - \x07 (BEL): 無視
+        - CSI K (EL): 行内消去 (0=右端まで / 1=左端から / 2=行全体)
+        - CSI J (ED): 2 = 画面全消去 (それ以外は近似)
+        - その他 CSI / OSC / Charset 切替: 表示には反映せず破棄
+        - 通常文字: 末尾なら追加、途中なら次の 1 文字を上書き
+
+        これで `\\r\\x1b[K + 新コマンド` (↑↓ 履歴) や
+        `\\x08 ' ' \\x08` (BackSpace エコー) が正しく描画される。
+
+        ANSI シーケンスが受信チャンクの境界で分割された場合は、不完全分を
+        self._pending_partial に保存して次回 _append でくっつけ直す。
+        """
+        # 前回繰り越しがあれば先頭にくっつけ直す
+        if self._pending_partial:
+            text = self._pending_partial + text
+            self._pending_partial = ''
+
+        cur = self.output.textCursor()
+        cur.movePosition(QTextCursor.MoveOperation.End)
+
+        # ターミナル出力は大半が「制御文字のない通常テキスト」のラン。
+        # 1 文字ずつ insertText するとレンダリングが重く tail で固まるため、
+        # 制御文字 ('\r' '\n' '\x08' '\x07' '\x1b') が現れるまでをひとまとめに
+        # して一括 insert する高速パスを設ける。
+        _CTRL = '\r\n\x08\x07\x1b'
+
+        i = 0
+        n = len(text)
+        while i < n:
+            # 高速パス: 次の制御文字までを 1 回の insertText でまとめて投入
+            ch = text[i]
+            if ch not in _CTRL:
+                j = i + 1
+                while j < n and text[j] not in _CTRL:
+                    j += 1
+                chunk = text[i:j]
+                if cur.atBlockEnd():
+                    # ブロック末尾 = 普通の append (tail / 出力ストリームはほぼここ)
+                    cur.insertText(chunk)
+                else:
+                    # 行内上書きモード: 1 文字ずつ既存文字を置き換え
+                    for c2 in chunk:
+                        if not cur.atBlockEnd():
+                            cur.movePosition(
+                                QTextCursor.MoveOperation.Right,
+                                QTextCursor.MoveMode.KeepAnchor,
+                            )
+                        cur.insertText(c2)
+                i = j
+                continue
+            # ここからは制御文字 1 文字を従来通り解釈する
+
+            # 改行系
+            if ch == '\r':
+                # チャンクが \r で終わってる場合、次が \n かもしれないので保留
+                if i + 1 >= n:
+                    self._pending_partial = text[i:]
+                    i = n
+                    break
+                # \r\n: 改行として処理 (Enter のエコー等)
+                if text[i + 1] == '\n':
+                    cur.movePosition(QTextCursor.MoveOperation.End)
+                    cur.insertText('\n')
+                    i += 2
+                    continue
+                # \r 単独: 行頭へ移動するだけ (消去はしない)。
+                # 後続の \x1b[K (EL) でシェル側が行末まで明示的に消去する。
+                # 行内消去をここで先回りすると、Enter エコー間に挟まる \r が
+                # 直前のプロンプトを消してしまう副作用が出るため。
+                cur.movePosition(QTextCursor.MoveOperation.StartOfBlock)
+                i += 1
+                continue
+            if ch == '\n':
+                cur.movePosition(QTextCursor.MoveOperation.End)
+                cur.insertText('\n')
+                i += 1
+                continue
+
+            # 制御文字
+            if ch == '\x08':
+                # \x08 = カーソル前の 1 文字を削除。
+                # シェルの BS エコー \x08 ' ' \x08 はストリームとして
+                # 「削除 → 空白挿入 → 空白削除」とそのまま処理され
+                # 結果として「前 1 文字が消える」になる。
+                if cur.position() > cur.block().position():
+                    cur.deletePreviousChar()
+                i += 1
+                continue
+            if ch == '\x07':
+                i += 1
+                continue
+
+            # ESC で始まるシーケンス
+            if ch == '\x1b':
+                # ESC 単体が末尾: 次回チャンクの先頭バイトと一緒に再評価
+                if i + 1 >= n:
+                    self._pending_partial = text[i:]
+                    i = n
+                    break
+                nxt = text[i + 1]
+                if nxt == '[':
+                    # CSI: \x1b [ params (digits/;/?) final
+                    j = i + 2
+                    while j < n and text[j] in '0123456789;?':
+                        j += 1
+                    if j < n:
+                        final = text[j]
+                        params = text[i + 2:j]
+                        if final == 'K':
+                            self._csi_erase_in_line(cur, params)
+                        elif final == 'J':
+                            self._csi_erase_in_display(cur, params)
+                        elif final == 'D':
+                            self._csi_cursor_left(cur, params)
+                        elif final == 'C':
+                            self._csi_cursor_right(cur, params)
+                        elif final == 'G':
+                            self._csi_cursor_to_col(cur, params)
+                        elif final in ('H', 'f'):
+                            self._csi_cursor_pos(cur, params)
+                        # その他 CSI (色/属性、A/B 上下移動など) は破棄
+                        i = j + 1
+                        continue
+                    # CSI 途中で終端 → 次回チャンクと結合して再評価
+                    self._pending_partial = text[i:]
+                    i = n
+                    break
+                if nxt == ']':
+                    # OSC: \x1b ] ... (\x07 or \x1b \\)
+                    j = i + 2
+                    terminated = False
+                    while j < n:
+                        if text[j] == '\x07':
+                            j += 1
+                            terminated = True
+                            break
+                        if text[j] == '\x1b' and j + 1 < n and text[j + 1] == '\\':
+                            j += 2
+                            terminated = True
+                            break
+                        j += 1
+                    if not terminated:
+                        self._pending_partial = text[i:]
+                        i = n
+                        break
+                    i = j
+                    continue
+                if nxt in '()':
+                    # G0/G1 文字セット切替: \x1b ( or ) + 1 char
+                    if i + 2 >= n:
+                        self._pending_partial = text[i:]
+                        i = n
+                        break
+                    i += 3
+                    continue
+                # 単独 ESC は捨てる (1 byte だけ)
+                i += 1
+                continue
+
+            # 通常文字: ブロック末尾なら追加、途中なら次の 1 文字を上書き
+            if not cur.atBlockEnd():
+                cur.movePosition(
+                    QTextCursor.MoveOperation.Right,
+                    QTextCursor.MoveMode.KeepAnchor,
+                )
+            cur.insertText(ch)
+            i += 1
+
+        self.output.setTextCursor(cur)
         sb = self.output.verticalScrollBar()
         sb.setValue(sb.maximum())
 
-    def _send(self):
-        if not self._chan:
-            self._append("\n[エラー] チャネルが閉じています\n")
+    def _csi_erase_in_line(self, cur, params: str):
+        """CSI K (EL): 行内消去。
+        0 (省略) = カーソル位置から行末まで
+        1        = 行頭からカーソル位置まで
+        2        = 行全体
+        """
+        n = int(params) if params and params.isdigit() else 0
+        block_start = cur.block().position()
+        pos = cur.position()
+
+        sel = self.output.textCursor()
+        if n == 0:
+            # カーソル位置 → 行末 (EndOfBlock は \n を含まない)
+            sel.setPosition(pos)
+            sel.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+        elif n == 1:
+            sel.setPosition(block_start)
+            sel.setPosition(pos, QTextCursor.MoveMode.KeepAnchor)
+        elif n == 2:
+            sel.setPosition(block_start)
+            sel.movePosition(
+                QTextCursor.MoveOperation.EndOfBlock,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+        else:
             return
-        cmd = self.input.text()
-        # SSH PTY は \n で十分、Telnet は \r\n が標準
-        eol = b'\r\n' if getattr(self._conn, 'protocol', 'ssh') == 'telnet' else b'\n'
-        try:
-            self._chan.send(cmd.encode('utf-8') + eol)
-        except Exception as e:
-            self._append(f"\n[送信エラー] {e}\n")
-            return
-        if cmd.strip():
-            if not self._history or self._history[-1] != cmd:
-                self._history.append(cmd)
-            self._hist_idx = len(self._history)
-        self.input.clear()
-        self.input.setFocus()
+        sel.removeSelectedText()
+        if n in (1, 2):
+            cur.setPosition(block_start)
+
+    def _csi_cursor_left(self, cur, params: str):
+        """CSI D: カーソル左 N (省略時 1)。ブロック先頭は越えない。"""
+        n = int(params) if params and params.isdigit() else 1
+        block_start = cur.block().position()
+        for _ in range(n):
+            if cur.position() <= block_start:
+                break
+            cur.movePosition(QTextCursor.MoveOperation.Left)
+
+    def _csi_cursor_right(self, cur, params: str):
+        """CSI C: カーソル右 N (省略時 1)。ブロック末尾は越えない。"""
+        n = int(params) if params and params.isdigit() else 1
+        for _ in range(n):
+            if cur.atBlockEnd():
+                break
+            cur.movePosition(QTextCursor.MoveOperation.Right)
+
+    def _csi_cursor_to_col(self, cur, params: str):
+        """CSI G: カーソルを 1-based 列 N に移動。
+        単行のブロック内移動として扱う。"""
+        n = int(params) if params and params.isdigit() else 1
+        block_start = cur.block().position()
+        cur.setPosition(block_start)
+        for _ in range(max(0, n - 1)):
+            if cur.atBlockEnd():
+                break
+            cur.movePosition(QTextCursor.MoveOperation.Right)
+
+    def _csi_cursor_pos(self, cur, params: str):
+        """CSI H / f: カーソル位置 (row;col, 1-based)。
+        row は無視 (我々は単一ブロック扱い)、col を反映。"""
+        parts = params.split(';') if params else []
+        col = 1
+        if len(parts) >= 2:
+            try:
+                col = int(parts[1]) if parts[1] else 1
+            except ValueError:
+                col = 1
+        elif len(parts) == 1:
+            try:
+                # row のみ指定 → col=1
+                col = 1
+            except ValueError:
+                pass
+        block_start = cur.block().position()
+        cur.setPosition(block_start)
+        for _ in range(max(0, col - 1)):
+            if cur.atBlockEnd():
+                break
+            cur.movePosition(QTextCursor.MoveOperation.Right)
+
+    def _csi_erase_in_display(self, cur, params: str):
+        """CSI J (ED): 画面消去。
+        2 = 全消去 (clear screen) のみ対応。
+        他は近似 (現在ブロック先頭以降の全テキストを削除)。
+        """
+        n = int(params) if params and params.isdigit() else 0
+        if n == 2:
+            self.output.clear()
+            cur.movePosition(QTextCursor.MoveOperation.End)
+        elif n == 0:
+            # 0 (カーソル位置以降全消去) を近似
+            sel = self.output.textCursor()
+            sel.setPosition(cur.position())
+            sel.movePosition(
+                QTextCursor.MoveOperation.End,
+                QTextCursor.MoveMode.KeepAnchor,
+            )
+            sel.removeSelectedText()
 
     def _send_raw(self, data: bytes):
         if not self._chan:
@@ -3309,12 +3839,71 @@ class TerminalDialog(QDialog):
         except Exception as e:
             self._append(f"\n[送信エラー] {e}\n")
 
+    def _on_output_context_menu(self, pos):
+        """ターミナル画面の右クリックメニュー。"""
+        from PyQt6.QtWidgets import QMenu
+        menu = QMenu(self.output)
+        has_sel = self.output.textCursor().hasSelection()
+        clip_text = QApplication.clipboard().text()
+
+        a_copy = menu.addAction("コピー  (Ctrl+Shift+C)")
+        a_copy.setEnabled(has_sel)
+        a_copy.triggered.connect(self.output.copy)
+
+        a_paste = menu.addAction("ペースト  (Ctrl+V)")
+        a_paste.setEnabled(bool(clip_text))
+        a_paste.triggered.connect(self._paste_from_clipboard)
+
+        menu.addSeparator()
+
+        a_all = menu.addAction("すべて選択")
+        a_all.triggered.connect(self.output.selectAll)
+
+        menu.addSeparator()
+
+        a_clear = menu.addAction("クリア (ローカル表示のみ)")
+        a_clear.triggered.connect(self.output.clear)
+
+        menu.exec(self.output.mapToGlobal(pos))
+
+    def _paste_from_clipboard(self):
+        """クリップボードの内容を SSH チャネルへ送信。"""
+        clip = QApplication.clipboard().text()
+        if not clip or not self._chan:
+            return
+        try:
+            self._chan.send(clip.encode('utf-8'))
+        except Exception:
+            pass
+
     def closeEvent(self, event):
-        if self._reader:
-            self._reader.stop()
-            self._reader.wait(2000)
-        if self._chan:
-            self._chan.close()
+        # 1) reader を止める前にシグナルを切る (close 中の最後の emit による
+        #    閉じたウィジェットへのアクセスを防ぐ)
+        if self._reader is not None:
+            for sig in (self._reader.new_text,
+                        self._reader.error,
+                        self._reader.channel_closed):
+                try:
+                    sig.disconnect()
+                except (TypeError, RuntimeError):
+                    pass
+            try:
+                self._reader.stop()
+                if not self._reader.wait(2000):
+                    # 想定外のハング: 強制終了 (paramiko 側で recv が
+                    #   ハングし続けるケース等)
+                    self._reader.terminate()
+                    self._reader.wait(500)
+            except Exception:
+                pass
+            self._reader = None
+        # 2) チャネルクローズ (既に切断済みでも安全に)
+        if self._chan is not None:
+            try:
+                self._chan.close()
+            except Exception:
+                pass
+            self._chan = None
         super().closeEvent(event)
 
 
@@ -3411,14 +4000,14 @@ class MainWindow(QMainWindow):
         tb.addSeparator()
 
         # ── Tail 制御 ─────────────────────────────────────────────────
+        # 派手な色強調 (primary/danger) は付けず、他のツールバーボタンと
+        # 同じ通常スタイルに揃える。アイコン (▶/■) の色だけ意味付け。
         btn_all_tail = QPushButton("▶ 全Tail開始")
-        btn_all_tail.setProperty("primary", True)
         btn_all_tail.setToolTip("全セルで Tail -F を開始 (新しい行が自動追従)")
         btn_all_tail.clicked.connect(lambda: self.grid.start_all_tail())
         tb.addWidget(btn_all_tail)
 
         btn_stop_all = QPushButton("■ 全停止")
-        btn_stop_all.setProperty("danger", True)
         btn_stop_all.setToolTip("全セルの Tail -F を停止")
         btn_stop_all.clicked.connect(lambda: self.grid.stop_all_tail())
         tb.addWidget(btn_stop_all)
@@ -3612,7 +4201,8 @@ class MainWindow(QMainWindow):
         self._status.setText(f"切断  残 {len(self._panels)} 台{suffix}")
 
     def _open_terminal(self, panel: ServerPanel):
-        dlg = TerminalDialog(panel.conn, self)
+        # 接続パネルと色を揃えるため color_idx を渡す
+        dlg = TerminalDialog(panel.conn, self, color_idx=panel.color_idx)
         self._terminals.append(dlg)
         dlg.destroyed.connect(lambda _=None, d=dlg: self._terminals.remove(d) if d in self._terminals else None)
         dlg.show()  # 非モーダル — 複数同時オープン可
