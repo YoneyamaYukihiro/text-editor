@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -16,6 +16,7 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QDialog, QGridLayout, QFileDialog,
     QMessageBox, QInputDialog, QCheckBox, QFrame, QToolBar, QSizePolicy,
     QListWidget, QListWidgetItem, QTabWidget,
+    QDialogButtonBox,
 )
 from PyQt6.QtCore import Qt, QThread, pyqtSignal, QSize, QTimer
 from PyQt6.QtGui import (
@@ -1103,7 +1104,27 @@ class MiniLogViewer(QWidget):
         self._worker: TailWorker | None = None
         self._bg, self._fg = _palette(color_idx)
         self._build_ui()
+        # append 直後の即時スクロールでは Qt のレイアウト計算が間に合わず
+        # 末尾が見切れる場合があるため、次イベントループでもう一度スクロール
+        # する deferred タイマー (バースト中は最後の 1 回だけ発火)
+        self._scroll_timer = QTimer(self)
+        self._scroll_timer.setSingleShot(True)
+        self._scroll_timer.setInterval(0)
+        self._scroll_timer.timeout.connect(self._scroll_to_bottom)
+        # ワークスペース読み込み時、_load() → _apply_filter() の時点ではまだ
+        # Cell に assign されておらず viewport size が 0 のため scrollbar.maximum() も 0。
+        # 実際に show されたタイミングで末尾までスクロールするためのフラグ。
+        self._initial_scroll_pending = True
         self._load()
+
+    def showEvent(self, event):
+        super().showEvent(event)
+        if self._initial_scroll_pending:
+            self._initial_scroll_pending = False
+            # show 直後はまだ resize 処理が走ってない可能性があるため、
+            # 次イベントループ + 余裕分の遅延でも末尾を狙う (2 段)。
+            QTimer.singleShot(0, self._scroll_to_bottom)
+            QTimer.singleShot(50, self._scroll_to_bottom)
 
     def _build_ui(self):
         root = QVBoxLayout(self)
@@ -1312,6 +1333,11 @@ class MiniLogViewer(QWidget):
         ec = sum(1 for l in lines if re.search(r'\b(?:ERROR|CRITICAL|FATAL)\b', l, re.I))
         wc = sum(1 for l in lines if re.search(r'\bWARN', l, re.I))
         self.stats.setText(f"ERR:{ec}  WRN:{wc}  行:{len(lines)}")
+        # setPlainText は cursor を先頭にリセットしてしまうため、ログビューアの
+        # 自然な挙動として末尾 (最新行) にスクロールする。初期 load 時 /
+        # フィルタ変更時 / レベル変更時の挙動を tail emit と統一。
+        self._scroll_to_bottom()
+        self._scroll_timer.start()
 
     def _toggle_tail(self, on: bool):
         if on:
@@ -1334,11 +1360,18 @@ class MiniLogViewer(QWidget):
             self.text.appendPlainText(text)
         else:
             self._apply_filter()
-        # 末尾追従。setValue(sb.maximum()) は append 直後の最大値計算 +
-        # viewport_height % line_height の余りで「最終行が見切れる」状況が
-        # 出るため (狭縦セル/4:3 ディスプレイ等)、cursor 経由で確実に末尾へ。
+        # 末尾追従: 即時 + 次イベントループの 2 段で確実に最終行を表示する。
+        # append 直後はレイアウト計算が間に合わず ensureCursorVisible/setValue が
+        # 古い maximum を見るケースがあるため、deferred 側で最終確定値で再スクロール。
+        self._scroll_to_bottom()
+        self._scroll_timer.start()  # バースト中は最後の append の後に 1 回発火
+
+    def _scroll_to_bottom(self):
+        """末尾へスクロール。3 つの方法を併用して確実性を上げる。"""
         self.text.moveCursor(QTextCursor.MoveOperation.End)
         self.text.ensureCursorVisible()
+        sb = self.text.verticalScrollBar()
+        sb.setValue(sb.maximum())
 
     def _stop_worker(self):
         if self._worker:
@@ -2455,6 +2488,134 @@ class LogPopup(QDialog):
         super().closeEvent(event)
 
 
+class AlertSearchFieldsDialog(QDialog):
+    """アラート抽出項目から Sora Editor 用の検索条件 (regex) を組み立てる。
+
+    各フィールドをチェックボックスで選択、AND/OR で結合方式を切替えて
+    Sora の検索バーに渡す regex を生成する。
+    - AND: lookahead で同じ行に全部含む `(?=.*v1)(?=.*v2)...`
+    - OR:  単純な交替 `v1|v2|...`
+    値は `re.escape()` で安全化。デフォルト選択は lot (従来挙動互換)。
+    """
+
+    # (info_key, ラベル, 値変換関数)
+    # 日時はメール側の表記そのままを返す (例: '2026/06/01 14:01:59')。
+    # ログのタイムスタンプ表記と一致する想定。形式差がある環境では別途検討。
+    _FIELDS = [
+        ('lot',        'ロット',                       lambda v: v),
+        ('timestamp',  '日時 (YYYY/MM/DD HH:MM:SS)',
+            lambda v: (re.search(
+                r'\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?', v
+            ).group(0)
+            if re.search(
+                r'\d{4}[-/]\d{2}[-/]\d{2}[T ]\d{2}:\d{2}:\d{2}(?:[.,]\d+)?', v
+            ) else v)),
+        ('equipment',  '装置',                         lambda v: v),
+        ('carrier',    'キャリア',                     lambda v: v),
+        ('step_major', '大工程',                       lambda v: v),
+        ('step_minor', '小工程',                       lambda v: v),
+        ('error_code', 'エラーコード',                 lambda v: v),
+        ('process',    'プロセス',                     lambda v: v),
+        ('host',       'ホスト',                       lambda v: v),
+    ]
+
+    def __init__(self, info: dict, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Sora 検索条件を選択")
+        self.setMinimumWidth(420)
+        self._info = info
+        self._checks: dict[str, QCheckBox] = {}
+        self._values: dict[str, str] = {}
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("Sora Editor で検索する条件を選択してください:"))
+
+        any_field = False
+        for info_key, label, transform in self._FIELDS:
+            raw = self._info.get(info_key, '')
+            if not raw:
+                continue
+            try:
+                value = transform(raw)
+            except Exception:
+                value = raw
+            if not value:
+                continue
+            chk = QCheckBox(f"{label}: {value}")
+            # 従来挙動互換: 初期は lot のみ ON
+            chk.setChecked(info_key == 'lot')
+            lay.addWidget(chk)
+            self._checks[info_key] = chk
+            self._values[info_key] = value
+            any_field = True
+
+        if not any_field:
+            lay.addWidget(QLabel("(抽出された検索可能なフィールドがありません)"))
+
+        # 結合方式 — QComboBox で確実に選択できるように
+        lay.addSpacing(6)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("結合方式:"))
+        self._mode_combo = QComboBox()
+        self._mode_combo.addItem("AND  (全条件を同じ行に含む)", "and")
+        self._mode_combo.addItem("OR   (いずれかを含む — ハイライト用)", "or")
+        self._mode_combo.setCurrentIndex(0)
+        row.addWidget(self._mode_combo, 1)
+        lay.addLayout(row)
+
+        # ボタン
+        btns = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok
+            | QDialogButtonBox.StandardButton.Cancel
+        )
+        btns.button(QDialogButtonBox.StandardButton.Ok).setText("Sora で開く")
+        btns.accepted.connect(self.accept)
+        btns.rejected.connect(self.reject)
+        lay.addWidget(btns)
+
+        # ダーク親ウィンドウのスタイル継承で QCheckBox のインジケータが見えなく
+        # なることがあるため、ダイアログ専用スタイルで明示的に整える。
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog {{ background:{t['bg']}; color:{t['text']}; }}
+            QLabel  {{ color:{t['text']}; }}
+            QCheckBox {{ color:{t['text']}; padding:3px; spacing:6px; }}
+            QCheckBox::indicator {{ width:14px; height:14px; }}
+            QComboBox {{ background:{t['control_bg']}; color:{t['text']};
+                        border:1px solid {t['border']};
+                        padding:3px 6px; border-radius:3px; min-height:24px; }}
+            QComboBox QAbstractItemView {{ background:{t['panel_bg']}; color:{t['text']};
+                                          selection-background-color:{t['selection']}; }}
+            QPushButton {{ background:{t['control_bg']}; color:{t['text']};
+                          border:1px solid {t['border']};
+                          padding:4px 12px; border-radius:3px; }}
+            QPushButton:hover {{ background:{t['control_hover']}; }}
+            QPushButton:default {{ background:{t['selection']}; color:{t['text']}; }}
+        """)
+
+    def build_regex(self) -> tuple[str, bool]:
+        """選択された項目から (regex, use_regex_flag) を返す。
+        - AND: (?=.*v1)(?=.*v2)... 形式 → 正規表現必須
+        - OR:  単一項目なら素のテキスト、複数なら v1|v2|... → 正規表現必須
+        - 選択ゼロなら ('', False)
+        """
+        selected = [self._values[k] for k, chk in self._checks.items() if chk.isChecked()]
+        if not selected:
+            return '', False
+        escaped = [re.escape(v) for v in selected]
+        mode = self._mode_combo.currentData()
+        if mode == 'and':
+            if len(escaped) == 1:
+                return escaped[0], False  # 1 項目だけなら素のテキストで OK
+            return ''.join(f'(?=.*{e})' for e in escaped), True
+        else:
+            if len(escaped) == 1:
+                return escaped[0], False
+            return '|'.join(escaped), True
+
+
 class AlertAnalysisDialog(QDialog):
     """アラートメールをペーストして自動でサーバー特定・調査開始"""
 
@@ -2462,7 +2623,7 @@ class AlertAnalysisDialog(QDialog):
 
     def __init__(self, parent=None):
         super().__init__(parent)
-        self.setWindowTitle("アラート調査 — メールから一発調査")
+        self.setWindowTitle("アラート調査")
         self.setMinimumSize(640, 480)
         self._parsed: dict = {}
         self._build_ui()
@@ -3658,10 +3819,12 @@ class MainWindow(QMainWindow):
 
     # ------------------------------------------------ テキストエディタで開く
 
-    def _open_in_text_editor(self, conn, remote_path: str, search: str = ''):
+    def _open_in_text_editor(self, conn, remote_path: str, search: str = '',
+                             regex_mode: bool = False):
         """リモートファイルをローカルにダウンロード → Sora Editor を起動。
         - SSH: SFTP でバイナリ取得 / Telnet: base64 経由 / .gz は自動解凍
         - search 指定時は Sora Editor 起動時に検索バー自動表示 (--search)
+        - regex_mode=True で Sora の正規表現トグルを ON にする (--regex)
         """
         import tempfile
         import subprocess
@@ -3696,14 +3859,17 @@ class MainWindow(QMainWindow):
         # DB実行ダイアログの初期プロファイルとして使う接続プロファイル名
         profile_name = getattr(conn, '_profile_name', '') or ''
 
-        if self._launch_sora(local_path, search=search, profile_name=profile_name):
+        if self._launch_sora(local_path, search=search, regex_mode=regex_mode,
+                             profile_name=profile_name):
             suffix = f" (検索: {search})" if search else ""
             self._status.setText(f"📝 Sora Editor で開きました: {local_name}{suffix}")
 
     def _launch_sora(self, local_path: str, *, search: str = '',
+                     regex_mode: bool = False,
                      profile_name: str = '', sql_extract: bool = False) -> bool:
         """Sora Editor を起動 (EXE版/スクリプト版を自動判別)。
         - search: 起動後に検索バーへ自動入力
+        - regex_mode: search を正規表現として扱う (検索バーの .* トグルを ON)
         - profile_name: DB実行ダイアログの初期プロファイル
         - sql_extract: 起動直後に SQL抽出ダイアログを自動で開く
         成功時 True。
@@ -3731,6 +3897,8 @@ class MainWindow(QMainWindow):
                 cwd = os.path.dirname(editor_script)
             if search:
                 cmd += ['--search', search]
+                if regex_mode:
+                    cmd += ['--regex']
             if profile_name:
                 cmd += ['--profile', profile_name]
             if sql_extract:
@@ -3936,16 +4104,30 @@ class MainWindow(QMainWindow):
 
         # ファイル特定 → Sora Editor で直接開く
         # (LogViewer はアラート受信〜サーバー特定までの入口。実調査は Sora Editor で)
-        lot = info.get('lot') or ''
-        self._open_in_text_editor(panel.conn, found_path, search=lot)
+        search, regex_mode = self._pick_alert_search(info)
+        if not search:
+            return  # ユーザーがキャンセル
+        self._open_in_text_editor(panel.conn, found_path,
+                                  search=search, regex_mode=regex_mode)
+
+    def _pick_alert_search(self, info: dict) -> tuple[str, bool]:
+        """アラート抽出フィールドからダイアログ経由で Sora 用検索条件を組み立てる。
+        戻り値: (search_text, regex_mode)。キャンセル時は ('', False)。"""
+        dlg = AlertSearchFieldsDialog(info, self)
+        if dlg.exec() == QDialog.DialogCode.Accepted:
+            return dlg.build_regex()
+        return '', False
 
     def _open_multiple_for_alert(self, panel, paths: list[str], info: dict):
         """選択された複数ログを Sora Editor で開く (各タブ + 検索)"""
-        lot = info.get('lot') or ''
+        search, regex_mode = self._pick_alert_search(info)
+        if not search:
+            return
         for path in paths:
-            self._open_in_text_editor(panel.conn, path, search=lot)
+            self._open_in_text_editor(panel.conn, path,
+                                      search=search, regex_mode=regex_mode)
         self._status.setText(
-            f"📝 Sora Editor で {len(paths)} 件のログを開きました / lot={lot or '-'}"
+            f"📝 Sora Editor で {len(paths)} 件のログを開きました / 検索: {search}"
         )
 
     @staticmethod

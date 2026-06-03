@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.13"
+__version__ = "1.1.14"
 
 import sys
 import os
@@ -108,8 +108,8 @@ _THEME_PRESETS = {
         'control_bg':    '#dcdcdc',
         'control_hover': '#c8c8c8',
         'line_highlight':'#d6e6f5',   # 元 #eef2f8 (白に同化) → 青みのある淡色
-        'gutter_bg':     '#f0f0f0',
-        'gutter_fg':     '#888888',
+        'gutter_bg':     '#e0e0e0',   # 元 #f0f0f0 → 行番号と差を確保
+        'gutter_fg':     '#444444',   # 元 #888888 → 可読性向上
     },
     'Solarized Light': {
         'bg':            '#fdf6e3',
@@ -117,14 +117,14 @@ _THEME_PRESETS = {
         'editor_bg':     '#fdf6e3',
         'toolbar_bg':    '#e4dcc3',
         'text':          '#586e75',
-        'text_dim':      '#93a1a1',
+        'text_dim':      '#657b83',
         'selection':     '#cfd9c4',
-        'border':        '#b8b298',
+        'border':        '#a89a72',
         'control_bg':    '#e4dcc3',
         'control_hover': '#d4cba8',
         'line_highlight':'#d6cfb3',   # 元 #eee8d5 → 一段濃く
-        'gutter_bg':     '#eee8d5',
-        'gutter_fg':     '#93a1a1',
+        'gutter_bg':     '#dcd6c1',   # 元 #eee8d5 → 編集領域(#fdf6e3) との差を確保
+        'gutter_fg':     '#586e75',   # 元 #93a1a1 → 可読性向上 (text と同色)
     },
 }
 
@@ -556,18 +556,23 @@ class CodeEditor(QPlainTextEdit):
 
         # 現在のカーソル行 (1-based)
         current_lineno = self.textCursor().blockNumber() + 1
-        current_accent = QColor("#FFEB3B")   # 検索ハイライトと同じ黄色
+        # Light テーマでは黄色 #FFEB3B は薄い背景にほぼ同化するため、
+        # 視認性の高い濃いオレンジに切り替える。
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        current_accent = QColor("#E65100") if is_light else QColor("#FFEB3B")
 
         while block.isValid() and top <= event.rect().bottom():
             if block.isVisible() and bottom >= event.rect().top():
                 lineno = block_number + 1
                 is_current = (lineno == current_lineno)
 
-                # 現在行のガター背景を強調 (行番号列に薄い黄色帯)
+                # 現在行のガター背景を強調 (テーマに応じた淡いアクセント色帯)
                 if is_current:
+                    # 黄 (Dark) or 濃オレンジ (Light) の薄い帯
+                    accent_band = QColor(current_accent)
+                    accent_band.setAlpha(60)
                     painter.fillRect(
-                        num_x - 2, top, area_w - (num_x - 2), line_h,
-                        QColor(255, 235, 59, 50),   # 黄 alpha 50/255 ≒ うっすら
+                        num_x - 2, top, area_w - (num_x - 2), line_h, accent_band,
                     )
 
                 # 変更バー
@@ -601,9 +606,9 @@ class CodeEditor(QPlainTextEdit):
                     painter.drawPolygon(diamond)
                     painter.restore()
 
-                # 行番号 (現在行は黄色 + 太字で強調)
+                # 行番号 (現在行はテーマアクセント色 + 太字で強調)
                 if is_current:
-                    painter.setPen(QColor("#FFEB3B"))   # 検索ハイライトと同じ黄色
+                    painter.setPen(current_accent)
                     f = QFont(self.font()); f.setBold(True)
                     painter.setFont(f)
                 else:
@@ -1227,11 +1232,22 @@ class InlineSearchBar(QWidget):
         """検索バーのスタイルをテーマ + UIフォントサイズ連動で適用。"""
         fs = SETTINGS.get('ui_font_size', 10)
         t = _theme()
+        # Light 系テーマでは border 色 (#cccccc 等) が背景と同化しがちなので、
+        # より濃い text_dim を使って入力欄/ボタンの境界をはっきり見せる。
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        edge = t['text_dim'] if is_light else t['border']
+        # Light テーマでは編集エリア (白) と toolbar_bg (#e6e6e6) の差が小さく
+        # 「検索バーが見えない」ので、専用の青みがかった背景に置き換える。
+        bar_bg = '#d8e2f0' if is_light else t['toolbar_bg']
+        # objectName 経由でこの InlineSearchBar 自身にだけボーダーを適用
+        self.setObjectName('InlineSearchBar')
         self.setStyleSheet(f"""
-            QWidget   {{ background: {t['toolbar_bg']}; }}
+            QWidget   {{ background: {bar_bg}; }}
+            #InlineSearchBar {{ border-top:1px solid {edge};
+                               border-bottom:1px solid {edge}; }}
             QLabel    {{ color: {t['text']}; }}
             QComboBox {{ background:{t['panel_bg']}; color:{t['text']};
-                        border:1px solid {t['border']};
+                        border:1px solid {edge};
                         padding:2px 4px; border-radius:3px; font-size:{fs}px; }}
             QComboBox:focus {{ border:1px solid {t['selection']}; }}
             QComboBox QAbstractItemView {{ background:{t['panel_bg']}; color:{t['text']};
@@ -1240,13 +1256,13 @@ class InlineSearchBar(QWidget):
         # ボタン群をテーマ連動で再スタイル
         btn_style = (
             f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
-            f"              border:1px solid {t['border']};"
+            f"              border:1px solid {edge};"
             f"              padding:2px 4px; border-radius:3px; }}"
             f"QPushButton:hover {{ background:{t['control_hover']}; }}"
         )
         toggle_style = (
             f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
-            f"              border:1px solid {t['border']};"
+            f"              border:1px solid {edge};"
             f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
             f"QPushButton:hover {{ background:{t['control_hover']}; }}"
             f"QPushButton:checked {{ background:{t['selection']}; color:{t['text']};"
@@ -1254,7 +1270,7 @@ class InlineSearchBar(QWidget):
         )
         close_style = (
             f"QPushButton {{ background:{t['control_bg']}; color:{t['text']};"
-            f"              border:1px solid {t['border']};"
+            f"              border:1px solid {edge};"
             f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
             f"QPushButton:hover {{ background:#c0392b; color:#fff; border:1px solid #e05545; }}"
         )
@@ -5000,6 +5016,14 @@ class MainWindow(QMainWindow):
             tab = self.current_tab()
             if tab and hasattr(tab, 'search_bar'):
                 tab.search_bar.show_bar(initial_text=search)
+                # --regex 指定時は検索バーの正規表現トグルを ON
+                # (toggle 後に _update_highlights が自動再実行され、
+                #  regex モードで正しくハイライトされる)
+                if req.get('regex') and hasattr(tab.search_bar, 'regex_check'):
+                    tab.search_bar.regex_check.setChecked(True)
+                # 最初のマッチに自動ジャンプ (条件入りだけでカーソルが動かないと
+                # 「検索条件は入っているのにマッチが見えない」状態になるため)
+                QTimer.singleShot(0, tab.search_bar.find_next)
 
         if sql_extract and opened_any:
             QTimer.singleShot(0, self._show_sql_extract)
@@ -7647,11 +7671,13 @@ def _parse_cli_args(argv: list[str]) -> dict:
     """コマンドライン引数を共通フォーマット (dict) にパースする。
       file1 file2 ...   : 開くファイル
       --search KEYWORD  : 起動後に検索バーで自動検索
+      --regex           : --search の内容を正規表現として扱う (Aa/.*  の .* を ON)
       --profile NAME    : DB実行ダイアログで初期選択する接続プロファイル
       --sql-extract     : 起動直後に SQL抽出ダイアログを自動で開く
     """
     files: list[str] = []
     search_term = ''
+    use_regex = False
     profile_name = ''
     auto_sql_extract = False
     i = 0
@@ -7661,6 +7687,8 @@ def _parse_cli_args(argv: list[str]) -> dict:
             search_term = argv[i + 1]; i += 2
         elif a.startswith('--search='):
             search_term = a[len('--search='):]; i += 1
+        elif a == '--regex':
+            use_regex = True; i += 1
         elif a == '--profile' and i + 1 < len(argv):
             profile_name = argv[i + 1]; i += 2
         elif a.startswith('--profile='):
@@ -7673,7 +7701,7 @@ def _parse_cli_args(argv: list[str]) -> dict:
         else:
             i += 1
     return {
-        'files': files, 'search': search_term,
+        'files': files, 'search': search_term, 'regex': use_regex,
         'profile': profile_name, 'sql_extract': auto_sql_extract,
     }
 
