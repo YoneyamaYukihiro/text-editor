@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.15"
+__version__ = "1.1.16"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -2544,8 +2544,10 @@ class AlertSearchFieldsDialog(QDialog):
             if not value:
                 continue
             chk = QCheckBox(f"{label}: {value}")
-            # 従来挙動互換: 初期は lot のみ ON
-            chk.setChecked(info_key == 'lot')
+            # デフォルト ON: ロット + 日時 (どちらも値があれば)。
+            # AND 結合と組み合わせて「該当ロットの該当時刻周辺」を絞り込む
+            # 典型ケースをワンクリックで開けるようにする。
+            chk.setChecked(info_key in ('lot', 'timestamp'))
             lay.addWidget(chk)
             self._checks[info_key] = chk
             self._values[info_key] = value
@@ -2597,7 +2599,11 @@ class AlertSearchFieldsDialog(QDialog):
 
     def build_regex(self) -> tuple[str, bool]:
         """選択された項目から (regex, use_regex_flag) を返す。
-        - AND: (?=.*v1)(?=.*v2)... 形式 → 正規表現必須
+        - AND: ^(?=.*v1)(?=.*v2)...的に「全条件を含む行を丸ごとマッチ」させる
+          形式 → 正規表現必須。末尾の `.+` は zero-width マッチを避け、
+          Sora 側で ▼/▲ ボタンが「次の該当行」へ正しく進むためのもの
+          (これがないと lookahead のみで文字を消費せず、Qt の find が
+           1 文字ずつしか進まなくなる)
         - OR:  単一項目なら素のテキスト、複数なら v1|v2|... → 正規表現必須
         - 選択ゼロなら ('', False)
         """
@@ -2609,7 +2615,12 @@ class AlertSearchFieldsDialog(QDialog):
         if mode == 'and':
             if len(escaped) == 1:
                 return escaped[0], False  # 1 項目だけなら素のテキストで OK
-            return ''.join(f'(?=.*{e})' for e in escaped), True
+            # ^ アンカー + lookahead 群 + .+ で行頭からのみ評価し
+            # 「行内に全条件が揃う行を丸ごと消費」する。
+            # 旧 (アンカー無し): 各位置で lookahead 再走査 → O(N^2)/block で
+            # 大ファイル × 多条件で「応答なし」になる
+            # 新 (^ で 1 回のみ): O(N)/block 線形化
+            return '^' + ''.join(f'(?=.*{e})' for e in escaped) + '.+', True
         else:
             if len(escaped) == 1:
                 return escaped[0], False
@@ -4468,17 +4479,28 @@ class MainWindow(QMainWindow):
         try:
             if getattr(sys, 'frozen', False):
                 exe_dir = os.path.dirname(sys.executable)
-                editor_exe = os.path.join(exe_dir, "Sora Editor.exe")
-                if not os.path.isfile(editor_exe):
+                # onefile / onedir 両方のレイアウトをサポート:
+                #  - onefile: dist/Sora Editor.exe (同階層)
+                #  - onedir : dist/Sora Editor/Sora Editor.exe (兄弟フォルダ内)
+                parent = os.path.dirname(exe_dir)
+                candidates = [
+                    os.path.join(exe_dir, "Sora Editor.exe"),
+                    os.path.join(exe_dir, "Sora Editor", "Sora Editor.exe"),
+                    os.path.join(parent, "Sora Editor", "Sora Editor.exe"),
+                ]
+                editor_exe = next((p for p in candidates if os.path.isfile(p)), None)
+                if editor_exe is None:
                     QMessageBox.warning(
                         self, "テキストエディタが見つかりません",
-                        f"Sora Editor.exe が見つかりません:\n{exe_dir}\n\n"
-                        "EXE版を使う場合は両アプリを同じフォルダに置いてください。\n"
+                        "Sora Editor.exe が見つかりません。\n探した場所:\n  "
+                        + "\n  ".join(candidates) + "\n\n"
+                        "EXE版を使う場合は両アプリを同じフォルダ (または\n"
+                        "兄弟フォルダ) に置いてください。\n\n"
                         f"ファイル:\n{local_path}",
                     )
                     return False
                 cmd = [editor_exe, local_path]
-                cwd = exe_dir
+                cwd = os.path.dirname(editor_exe)
             else:
                 editor_script = os.path.join(
                     os.path.dirname(os.path.abspath(__file__)), 'text_editor.py'
@@ -5103,8 +5125,9 @@ class MainWindow(QMainWindow):
         fs_tb = SETTINGS.get('toolbar_font_size', 11)
         self.setStyleSheet(f"""
             QMainWindow,QWidget {{ background:{t['bg']}; color:{t['text']}; }}
-            QToolTip {{ background-color:#2b2b2b; color:#ffffff;
-                        border:1px solid #666; padding:3px 6px; }}
+            QToolTip {{ background-color:{t['panel_bg']}; color:{t['text']};
+                        border:1px solid {t['border']}; padding:3px 6px;
+                        opacity: 240; }}
             QToolBar  {{ background:{t['toolbar_bg']}; border:none; padding:2px 4px; spacing:3px; }}
             QToolBar QLabel {{ color:{t['text_dim']}; font-size:{max(fs_tb-1, 7)}px; }}
             QToolBar QPushButton {{ background:{t['control_bg']};color:{t['text']};border:none;
@@ -5181,6 +5204,20 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
     app.setApplicationName("Multi-Server Log Viewer")
+    # Qt 標準ダイアログ (QMessageBox の Yes/No/Ok/Cancel 等) を日本語化
+    try:
+        from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale
+        _qt_tr = QTranslator()
+        _candidates = [QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)]
+        if getattr(sys, 'frozen', False):
+            base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            _candidates.insert(0, os.path.join(base, 'PyQt6', 'Qt6', 'translations'))
+        for _p in _candidates:
+            if _qt_tr.load(QLocale("ja"), "qtbase", "_", _p):
+                app.installTranslator(_qt_tr)
+                break
+    except Exception:
+        pass
     try:
         from app_icons import ssh_log_viewer_icon
         app.setWindowIcon(ssh_log_viewer_icon())

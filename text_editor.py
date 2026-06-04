@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.15"
+__version__ = "1.1.16"
 
 import sys
 import os
@@ -508,31 +508,26 @@ class CodeEditor(QPlainTextEdit):
         menu.exec(event.globalPos())
 
     def paintEvent(self, event):
-        # 通常の描画 (テキスト + 検索ハイライト等) を全て済ませてから
-        # 現在行に薄い黄色のオーバーレイを乗せる。
-        # super() 完了後に上から塗ることで、検索の黄色マッチがオーバーレイの
-        # アルファ越しに透けて見えるため、行内の検索結果が消えない。
+        # テキスト描画完了後に「現在行」を強調する。
+        # 半透明背景で塗ると文字が脱色されるため、**上下ボーダー + 左端バー**
+        # の枠線スタイルにする。文字は一切被覆されず、行の境界だけ可視化。
         super().paintEvent(event)
-        if self.isReadOnly():
-            return
         try:
             cur_rect = self.cursorRect()
         except Exception:
             return
         from PyQt6.QtGui import QPainter as _QPainter
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        accent = QColor("#1976D2") if is_light else QColor("#4A90E2")
         painter = _QPainter(self.viewport())
-        # 半透明の黄色で行全幅を塗る
-        line_rect_color = QColor(255, 235, 59, 32)  # #FFEB3B alpha 32/255 (ごく薄い)
-        painter.fillRect(
-            0, cur_rect.top(),
-            self.viewport().width(), cur_rect.height(),
-            line_rect_color,
-        )
-        # 左端に薄い黄色アクセントライン (太め) で視認性アップ
-        painter.fillRect(
-            0, cur_rect.top(), 2, cur_rect.height(),
-            QColor(255, 235, 59, 180),
-        )
+        vp_w = self.viewport().width()
+        top = cur_rect.top()
+        bot = cur_rect.top() + cur_rect.height() - 1
+        # 上下に 1px の細いボーダー (= 行の境界をはっきりさせる)
+        painter.fillRect(0, top, vp_w, 1, accent)
+        painter.fillRect(0, bot, vp_w, 1, accent)
+        # 左端に 3px の太いアクセントバー (= ガター側にも視線誘導)
+        painter.fillRect(0, top, 3, cur_rect.height(), accent)
         painter.end()
 
     def line_number_area_paint_event(self, event):
@@ -629,12 +624,14 @@ class CodeEditor(QPlainTextEdit):
         self.highlight_current_line()
 
     def highlight_current_line(self):
-        # ExtraSelections は後に追加したものほど上に重なって描画される。
-        # 検索の黄色マッチを「行ハイライト」に隠されないよう、行系の
-        # FullWidthSelection を先に追加し、最後に検索ハイライトを乗せる。
+        # 現在行の full-width 背景は paintEvent() で描く (文字の前に背景を
+        # 入れて脱色させない)。ExtraSelections では change_map と
+        # 検索マッチのみを扱う。
+        # 行が変わったら viewport を再描画して現在行ハイライトを更新。
+        self.viewport().update()
         extra = []
 
-        # 1. 変更行の薄い背景着色 (added/modified/deleted)
+        # 2. 変更行の薄い背景着色 (added/modified/deleted)
         if self._change_map:
             doc = self.document()
             for lineno, kind in self._change_map.items():
@@ -652,12 +649,8 @@ class CodeEditor(QPlainTextEdit):
                 sel.cursor = cur
                 extra.append(sel)
 
-        # 2. 検索ハイライト
-        # 現在行ハイライト (FullWidthSelection 背景) は廃止した。
-        # Qt の FullWidthSelection は内部で別パスで描画されるため、
-        # 検索マッチの黄色背景を確実に覆ってしまい、検索結果が見えなくなる
-        # 不具合があった。代わりに左ガター側で「現在行アクセントバー」+
-        # 「行番号の色変え」で現在行を表現する (line_number_area_paint_event)。
+        # 3. 検索ハイライト (= 一番上)。FullWidthSelection より優先される
+        #    通常の選択範囲なので、現在行の薄い背景の上に黄色マッチが乗る。
         extra.extend(self._search_selections)
 
         self.setExtraSelections(extra)
@@ -1085,6 +1078,14 @@ class InlineSearchBar(QWidget):
     def __init__(self, editor: 'CodeEditor', parent=None):
         super().__init__(parent)
         self._editor = editor
+        # 「全文スキャンしてもマッチなし」と判明したパターンをキャッシュ。
+        # 大ファイルで連打したとき何度も全スキャンしないようにする。
+        # _on_input_changed (= 検索テキスト変化) でクリア。
+        self._no_match_text: str | None = None
+        # ▲▼ 連打対策: find 処理中は新クリックを無視 (single-flight)。
+        # 連打が main thread のイベントキューに積まれて「応答なし」を
+        # 起こすのを防ぐ。リリースは次イベントループで行う (deferred)。
+        self._busy_find = False
         self._build_ui()
         self._load_persistent_history()
         self.hide()
@@ -1295,6 +1296,8 @@ class InlineSearchBar(QWidget):
 
     def _on_input_changed(self, text):
         """入力中はタイマー再起動。ドキュメントサイズに応じて遅延を調整。"""
+        # 検索テキスト変化 → 「マッチなし」キャッシュを無効化
+        self._no_match_text = None
         if not text:
             self._debounce_timer.stop()
             self._editor.set_search_highlights([])
@@ -1325,6 +1328,10 @@ class InlineSearchBar(QWidget):
 
     def _push_history(self, combo: QComboBox, text: str):
         if not text:
+            return
+        # ▲▼ 連打時の最適化: 既に履歴トップなら何もしない (disk write 抑止、
+        # currentIndexChanged → _update_highlights のチェーンも回避)
+        if combo.count() > 0 and combo.itemText(0) == text:
             return
         idx = combo.findText(text)
         if idx >= 0:
@@ -1372,6 +1379,8 @@ class InlineSearchBar(QWidget):
             super().keyPressEvent(event)
 
     def _on_return(self):
+        # Enter 確定時のみ履歴に push (▲▼ ボタンクリックでは push しない)
+        self._push_history(self.search_input, self._search_text())
         mods = QApplication.keyboardModifiers()
         if mods & Qt.KeyboardModifier.ShiftModifier:
             self.find_prev()
@@ -1388,6 +1397,10 @@ class InlineSearchBar(QWidget):
 
     # 巨大ファイルでハイライト数を制限 (描画コスト抑止)
     _MAX_HIGHLIGHTS = 5000
+    # 全マッチハイライト処理自体を諦めるドキュメントサイズしきい値 (5MB)
+    # ▲▼ ナビゲーションは Qt 内蔵 find() で個別マッチに移動できるため、
+    # 全マッチハイライトをスキップしても検索自体は機能する。
+    _NO_HIGHLIGHT_DOC_CHARS = 5_000_000
 
     def _update_highlights(self):
         text = self._search_text()
@@ -1405,7 +1418,22 @@ class InlineSearchBar(QWidget):
             self.match_label.setStyleSheet("color:#FF7070; font-size:10px;")
             return
 
-        doc_text = self._editor.document().toPlainText()
+        doc = self._editor.document()
+        # 5MB 超は全マッチ走査 + ExtraSelection 生成が秒オーダーで重くなり、
+        # その間に ▲▼ も詰まるためハイライトはスキップして ▲▼ 検索のみ有効化
+        if doc.characterCount() > self._NO_HIGHLIGHT_DOC_CHARS:
+            self._editor.set_search_highlights([])
+            self.match_label.setText("着色省略 (大ファイル)")
+            self.match_label.setToolTip(
+                "大ファイル (5MB 超) のため全マッチの黄色着色を省略しています。\n"
+                "▲▼ ボタンで個別のマッチへ移動してください。"
+            )
+            self.match_label.setStyleSheet("color:#888; font-size:10px;")
+            return
+        # 通常モードに戻ったら tooltip もクリア
+        self.match_label.setToolTip("")
+
+        doc_text = doc.toPlainText()
 
         # ハイライトは MAX_HIGHLIGHTS まで、件数は最後までカウント
         # 鮮やかな黄背景 + 黒文字 + 太字 で視認性最大化 (テーマ問わず目立つ)
@@ -1451,10 +1479,20 @@ class InlineSearchBar(QWidget):
         text = self._search_text()
         if not text:
             return
+        # 大ファイルで「マッチなし」をキャッシュ済みなら、再 find せず即通知
+        # (前回 2 回の全文 find で確認済み = 改めて scan する意味がない)
+        if self._no_match_text == text:
+            self._show_banner(
+                f"⚠  「{text}」 にマッチする箇所が見つかりません",
+                bg="#E74C3C", fg="#ffffff",
+            )
+            self._push_status_msg(f"検索: 「{text}」 にマッチなし")
+            return
         flags = self._find_flags()
         if backward:
             flags |= QTextDocument.FindFlag.FindBackward
 
+        wrapped = False
         if self.regex_check.isChecked():
             pat = QRegularExpression(text)
             if not self.case_check.isChecked():
@@ -1464,22 +1502,190 @@ class InlineSearchBar(QWidget):
                 cur = self._editor.textCursor()
                 cur.movePosition(cur.MoveOperation.End if backward else cur.MoveOperation.Start)
                 self._editor.setTextCursor(cur)
-                self._editor.find(pat, flags)
+                wrapped = self._editor.find(pat, flags)
         else:
             found = self._editor.find(text, flags)
             if not found:
                 cur = self._editor.textCursor()
                 cur.movePosition(cur.MoveOperation.End if backward else cur.MoveOperation.Start)
                 self._editor.setTextCursor(cur)
-                self._editor.find(text, flags)
+                wrapped = self._editor.find(text, flags)
+        # マッチ後のカーソル後処理:
+        # 1) zero-width マッチ (lookahead only 等) は 1 文字ずつしか進まないため
+        #    現在行末尾までカーソルを進めて「次のマッチは別の行から」になる
+        # 2) 通常マッチで「行全体を消費する regex」 (`^(?=.*X).+` 等) では
+        #    カーソルが行全体を選択 → Qt の selection color が行全体を脱色する。
+        #    選択を解除 (selectionEnd に position をたためる) して、
+        #    テキスト本来の syntax 色を維持する。
+        if (found or wrapped):
+            cur = self._editor.textCursor()
+            if cur.position() == cur.anchor():
+                # zero-width: 行末/行頭へ動かす
+                if backward:
+                    cur.movePosition(cur.MoveOperation.StartOfBlock)
+                else:
+                    cur.movePosition(cur.MoveOperation.EndOfBlock)
+                self._editor.setTextCursor(cur)
+            else:
+                # 通常マッチ: 選択を解除して脱色を防ぐ。位置は match の終端
+                # (forward なら selectionEnd / backward なら selectionStart)
+                # に置き、次回 find の起点として正しく機能させる。
+                end_pos = cur.selectionStart() if backward else cur.selectionEnd()
+                cur.setPosition(end_pos)
+                self._editor.setTextCursor(cur)
+        # スクロール (= layout 計算) は main thread を解放するため deferred 実行。
+        # 連打 → 古いクリックの scroll は最新クリック後にまとめて適用される
+        # (どうせ最新のカーソル位置に飛ばすので問題なし)。
+        doc_size = self._editor.document().characterCount()
+        editor = self._editor
+        if doc_size < 1_000_000:
+            QTimer.singleShot(0, editor.centerCursor)
+        else:
+            QTimer.singleShot(0, editor.ensureCursorVisible)
+        # フィードバックを statusBar (= 主) + banner (= 補助) で出す:
+        # - 通常マッチ (found=True): 何も出さない
+        # - ラップ発生  (wrapped=True): 「上下端で折返し」 (橙)
+        # - 全くマッチなし (両方False): 「マッチなし」 (赤) + キャッシュ
+        if wrapped:
+            if backward:
+                msg = "⤴ ファイルの先頭に到達 — 末尾から検索を継続"
+            else:
+                msg = "⤵ ファイルの末尾に到達 — 先頭から検索を継続"
+            self._push_status_msg(msg, bg="#FFB454", fg="#1a1a1a")
+            self._show_banner(msg, bg="#FFB454", fg="#1a1a1a")
+            self._no_match_text = None   # 見つかってる = キャッシュ無効
+        elif not found:
+            # 全文中マッチゼロ → キャッシュして次回以降即終了
+            self._no_match_text = text
+            msg = f"⚠ 「{text}」 にマッチする箇所が見つかりません"
+            self._push_status_msg(msg, bg="#E74C3C", fg="#ffffff")
+            self._show_banner(msg, bg="#E74C3C", fg="#ffffff")
+        else:
+            # 通常ヒット → キャッシュは無効化 (テキスト変化時にも消すが念のため)
+            self._no_match_text = None
+
+    def _push_status_msg(self, msg: str, duration_ms: int = 3000,
+                         bg: str = "#FFB454", fg: str = "#1a1a1a"):
+        """メインウィンドウの statusBar に色付き通知を出す (常に最下部に
+        必ず表示される。banner overlay は z-order トラブル時に隠れることが
+        あるため、こちらを通知の主チャネルとする)。"""
+        try:
+            sb = self._editor.window().statusBar()
+            if sb is None:
+                return
+            sb.setStyleSheet(
+                f"QStatusBar {{ background:{bg}; color:{fg};"
+                f" font-weight:700; padding:3px 10px; font-size:12px; }}"
+            )
+            sb.showMessage(msg, duration_ms)
+            # スタイルだけは duration 後に剥がす (messageTimeout だけだと
+            # 背景色が残ったままになる)
+            QTimer.singleShot(duration_ms, lambda: sb.setStyleSheet(""))
+        except Exception:
+            pass
+
+    def _show_banner(self, msg: str, *,
+                     bg: str = "#FFB454",
+                     fg: str = "#1a1a1a",
+                     duration_ms: int = 2500):
+        """エディタ上部に大きめのオーバーレイ帯バナーを表示。
+        viewport の子にして paint cycle で隠れないようにする。"""
+        if not hasattr(self, '_banner'):
+            from PyQt6.QtCore import Qt as _Qt
+            # 親は viewport: 標準のテキスト paint と z-order で競合せず、
+            # raise_() で確実に最前面に出せる
+            self._banner = QLabel(self._editor.viewport())
+            self._banner.setAlignment(_Qt.AlignmentFlag.AlignCenter)
+            self._banner.setAttribute(_Qt.WidgetAttribute.WA_TransparentForMouseEvents, True)
+            self._banner.hide()
+            self._banner_timer = QTimer(self)
+            self._banner_timer.setSingleShot(True)
+            self._banner_timer.timeout.connect(self._banner.hide)
+            # エディタ viewport リサイズに追従して帯を再センタリング
+            self._editor.viewport().installEventFilter(self)
+
+        self._banner.setText("  " + msg + "  ")
+        self._banner.setStyleSheet(
+            f"background:{bg}; color:{fg};"
+            f" padding:10px 24px; font-size:13px; font-weight:700;"
+            f" border-radius:6px; border:1px solid rgba(0,0,0,0.25);"
+        )
+        self._reposition_banner()
+        self._banner.show()
+        self._banner.raise_()
+        # 即時 paint を強制 (連打 / 大ファイルでイベント詰まり時に効く)
+        self._banner.repaint()
+        self._banner_timer.start(duration_ms)
+
+    def _reposition_banner(self):
+        """帯を viewport の上端中央に配置。"""
+        if not hasattr(self, '_banner'):
+            return
+        self._banner.adjustSize()
+        w = self._banner.width()
+        vp = self._editor.viewport()
+        vp_w = vp.width() if vp.width() > 0 else self._editor.width()
+        x = max(0, (vp_w - w) // 2)
+        self._banner.move(x, 12)
+
+    def eventFilter(self, obj, event):
+        # viewport リサイズ時に帯のセンタリングを維持
+        if (hasattr(self, '_banner')
+                and obj is self._editor.viewport()):
+            try:
+                from PyQt6.QtCore import QEvent
+                if event.type() == QEvent.Type.Resize:
+                    self._reposition_banner()
+            except Exception:
+                pass
+        return super().eventFilter(obj, event)
+
+    def _flash_status(self, msg: str, color: str = "#FFB454", duration_ms: int = 2500):
+        """検索結果ラベルに一時メッセージを表示。
+        - color: メッセージの文字色 (上下端到達は橙 / マッチなしは赤)
+        - duration_ms: 表示時間 (デフォルト 2.5 秒)
+        終了後は元のテキスト/スタイルに戻す。"""
+        prev_text = self.match_label.text()
+        prev_style = self.match_label.styleSheet()
+        self.match_label.setText(msg)
+        self.match_label.setStyleSheet(
+            f"color:{color}; font-size:10px; font-weight:600;"
+        )
+
+        def _restore():
+            # 直前 text/style に戻す (フラッシュ中に他の更新が無ければ)
+            try:
+                self.match_label.setText(prev_text)
+                self.match_label.setStyleSheet(prev_style)
+            except Exception:
+                pass
+        QTimer.singleShot(duration_ms, _restore)
 
     def find_next(self):
-        self._push_history(self.search_input, self._search_text())
-        self._do_find(backward=False)
+        if self._busy_find:
+            return
+        self._busy_find = True
+        try:
+            # _push_history はボタンクリック毎に呼ぶ必要ない (履歴トップ
+            # に同じテキストなら no-op だが、disk I/O などのオーバーヘッド
+            # 抑制のため Enter 確定時にのみ push する設計に整理)。
+            self._do_find(backward=False)
+        finally:
+            # 次イベントループでフラグ解除 — その間に積まれた連打クリックは
+            # disabled 同等の扱いで取りこぼされ、UI が固まらない
+            QTimer.singleShot(0, self._release_busy_find)
 
     def find_prev(self):
-        self._push_history(self.search_input, self._search_text())
-        self._do_find(backward=True)
+        if self._busy_find:
+            return
+        self._busy_find = True
+        try:
+            self._do_find(backward=True)
+        finally:
+            QTimer.singleShot(0, self._release_busy_find)
+
+    def _release_busy_find(self):
+        self._busy_find = False
 
     # ---------------------------------------------------------------- 置換
 
@@ -2716,12 +2922,27 @@ class GrepWorker(QThread):
                 if not any(fnmatch.fnmatch(fname, g) for g in globs):
                     continue
                 fpath = os.path.join(root, fname)
+                # CP932/Shift_JIS なログ等にも対応するため、まずバイトで読み込み、
+                # UTF-8 → CP932 → 最終 fallback の順で decode する。
                 try:
-                    with open(fpath, 'r', encoding='utf-8', errors='replace') as f:
-                        for lineno, line in enumerate(f, 1):
-                            if pat.search(line):
-                                self.result_found.emit(fpath, lineno, line.rstrip())
-                                count += 1
+                    with open(fpath, 'rb') as bf:
+                        raw = bf.read()
+                except Exception:
+                    continue
+                text = None
+                for enc in ('utf-8-sig', 'utf-8', 'cp932', 'shift_jis', 'euc-jp'):
+                    try:
+                        text = raw.decode(enc)
+                        break
+                    except UnicodeDecodeError:
+                        continue
+                if text is None:
+                    text = raw.decode('utf-8', errors='replace')
+                try:
+                    for lineno, line in enumerate(text.splitlines(), 1):
+                        if pat.search(line):
+                            self.result_found.emit(fpath, lineno, line.rstrip())
+                            count += 1
                 except Exception:
                     pass
             if self._stop:
@@ -3208,7 +3429,19 @@ def detect_language(filename: str) -> str:
 class EditorTab(QWidget):
     content_changed = pyqtSignal()
 
-    def __init__(self, content='', filename='無題', file_path=None):
+    def __init__(self, content='', filename='無題', file_path=None,
+                 skip_initial_highlight=False,
+                 disable_diff=False,
+                 disable_undo=False):
+        """
+        skip_initial_highlight: True の場合、開いた直後の全行 rehighlight を
+            スキップする。大ファイル時の UI フリーズ抑止。編集後のブロックは
+            通常通り highlighter が反応するため、追記分は色が付く。
+        disable_diff: True の場合、編集毎の差分計算 (変更ガター用 _update_change_map)
+            を行わない。巨大ファイルでの unified_diff 重さ対策。
+        disable_undo: True の場合、QTextDocument の undo 履歴を無効化。
+            メモリ削減 (= スクロール時の重さも軽減) 。
+        """
         super().__init__()
         self.filename = filename
         self.file_path = file_path
@@ -3219,6 +3452,8 @@ class EditorTab(QWidget):
         layout.setContentsMargins(0, 0, 0, 0)
 
         self.editor = CodeEditor()
+        if disable_undo:
+            self.editor.document().setUndoRedoEnabled(False)
         self._apply_editor_style()
 
         # コンテンツを先にセットしてからハイライターを接続する。
@@ -3229,8 +3464,10 @@ class EditorTab(QWidget):
 
         lang = detect_language(filename)
         self.highlighter = SyntaxHighlighter(self.editor.document(), lang)
-        # document 接続直後に明示的に全行を再ハイライト
-        self.highlighter.rehighlight()
+        # document 接続直後の全行 rehighlight は、大ファイル時に
+        # UI スレッドを数秒間ブロックするため skip オプションで抑止可能。
+        if not skip_initial_highlight:
+            self.highlighter.rehighlight()
 
         self.search_bar = InlineSearchBar(self.editor)
 
@@ -3245,7 +3482,15 @@ class EditorTab(QWidget):
         self._diff_timer.timeout.connect(self._update_change_map)
 
         self.editor.document().modificationChanged.connect(self._on_modified)
-        self.editor.document().contentsChanged.connect(self._diff_timer.start)
+        # 巨大ファイル時は contentsChanged → diff 計算が重いので接続しない
+        if not disable_diff:
+            self.editor.document().contentsChanged.connect(self._diff_timer.start)
+        # 初期 modified を確実にクリア。setPlainText で True になっていても、
+        # ここで False を明示し、modificationChanged 経由で is_modified も
+        # False に同期する (これがないと「ファイルを開いただけ / 検索だけで
+        # 編集扱い」状態になり、終了時に未保存ダイアログが誤って出る)。
+        self.editor.document().setModified(False)
+        self.is_modified = False
 
     def reset_original(self):
         """保存後に基準行を更新してガターをクリアする"""
@@ -3260,6 +3505,10 @@ class EditorTab(QWidget):
                 color: {t['text']};
                 border: none;
                 selection-background-color: {t['selection']};
+                /* 選択時の文字色を明示 — 未指定だと Qt が白を使い、Light
+                   テーマで文字が脱色して読めなくなるため。
+                   テキストの通常色をそのまま保持する。 */
+                selection-color: {t['text']};
             }}
         """)
 
@@ -3284,6 +3533,19 @@ class EditorTab(QWidget):
         self.editor.line_number_area.update()
 
     def _on_modified(self, modified):
+        # syntax highlighter / format 変更や Qt 内部の都合で
+        # modificationChanged(True) が誤って発火するケースがある
+        # (アラート調査からファイルを開いた直後等)。
+        # True 遷移時に内容と _original_lines を実比較し、一致するなら
+        # 即 False に戻して ● マーク誤表示を防ぐ。
+        if modified:
+            try:
+                if self.editor.toPlainText().splitlines() == self._original_lines:
+                    # 再帰で _on_modified(False) が呼ばれ is_modified=False になる
+                    self.editor.document().setModified(False)
+                    return
+            except Exception:
+                pass
         self.is_modified = modified
         self.content_changed.emit()
 
@@ -4158,8 +4420,9 @@ class MainWindow(QMainWindow):
             }}
             QGroupBox {{ color: {t['text']}; border: 1px solid {t['border']};
                         margin-top: 6px; padding-top: 4px; }}
-            QToolTip {{ background-color: #2b2b2b; color: #ffffff;
-                       border: 1px solid #666; padding: 3px 6px; }}
+            QToolTip {{ background-color: {t['panel_bg']}; color: {t['text']};
+                       border: 1px solid {t['border']}; padding: 3px 6px;
+                       opacity: 240; }}
             QPlainTextEdit, QTextEdit {{
                 background: {t['editor_bg']}; color: {t['text']};
                 selection-background-color: {t['selection']};
@@ -4231,18 +4494,58 @@ class MainWindow(QMainWindow):
         for path in paths:
             self._load_file(path)
 
+    # 大ファイルしきい値
+    _LARGE_FILE_SIZE = 2_000_000    # 2MB: シンタックスハイライト初期 rehighlight をスキップ
+    _HUGE_FILE_SIZE  = 10_000_000   # 10MB: diff/undo も無効化
+
+    @staticmethod
+    def _read_text_auto_encoding(path: str) -> str:
+        """ファイルをエンコーディング自動判定で読み込む。
+        UTF-8 → UTF-8-SIG (BOM) → CP932 (Windows-31J, Shift_JIS) → EUC-JP の
+        順に strict で試し、最初に成功したエンコーディングで返す。
+        全部失敗したら最後の手段として UTF-8 errors='replace'。
+        Windows + Excel 由来の日本語 CSV は CP932 が多い。
+        """
+        with open(path, 'rb') as f:
+            raw = f.read()
+        for enc in ('utf-8-sig', 'utf-8', 'cp932', 'shift_jis', 'euc-jp'):
+            try:
+                return raw.decode(enc)
+            except UnicodeDecodeError:
+                continue
+        return raw.decode('utf-8', errors='replace')
+
     def _load_file(self, path):
         try:
-            with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
+            try:
+                size = os.path.getsize(path)
+            except Exception:
+                size = 0
+            content = self._read_text_auto_encoding(path)
             filename = os.path.basename(path)
-            tab = EditorTab(content, filename, path)
+            # 大ファイル時は UI フリーズ要因 (rehighlight / diff / undo) を抑制
+            skip_hl = size >= self._LARGE_FILE_SIZE
+            huge    = size >= self._HUGE_FILE_SIZE
+            tab = EditorTab(
+                content, filename, path,
+                skip_initial_highlight=skip_hl,
+                disable_diff=huge,
+                disable_undo=huge,
+            )
             self._connect_tab(tab)
             idx = self.tabs.addTab(tab, filename)
             self.tabs.setCurrentIndex(idx)
             tab.editor.document().setModified(False)
             self._restore_tab_bookmarks(tab)
             self._watch_path(path)
+            if skip_hl:
+                mb = size / (1024 * 1024)
+                msg = (
+                    f"大ファイル ({mb:.1f} MB) のためシンタックスハイライトを抑制しました。"
+                    if not huge else
+                    f"巨大ファイル ({mb:.1f} MB) — ハイライト/差分/undo を全て抑制しました。"
+                )
+                self.statusBar().showMessage(msg, 6000)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
 
@@ -4256,8 +4559,7 @@ class MainWindow(QMainWindow):
         """FTP でダウンロードしたファイルを一時ファイル経由で開く。
         同パスのタブが既に開いていたら、そのタブを最新内容に置換 (リロード)。"""
         try:
-            with open(local_path, 'r', encoding='utf-8', errors='replace') as f:
-                content = f.read()
+            content = self._read_text_auto_encoding(local_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
             return
@@ -4479,8 +4781,7 @@ class MainWindow(QMainWindow):
             if not isinstance(tab, EditorTab) or tab.file_path != path:
                 continue
             try:
-                with open(path, 'r', encoding='utf-8', errors='replace') as f:
-                    new_content = f.read()
+                new_content = self._read_text_auto_encoding(path)
             except Exception:
                 continue
             if new_content == tab.editor.toPlainText():
@@ -4565,9 +4866,24 @@ class MainWindow(QMainWindow):
         if self.save_all():
             self.close()
 
+    @staticmethod
+    def _tab_actually_modified(tab) -> bool:
+        """EditorTab の is_modified フラグだけでは syntax highlighter の format
+        変更等で誤検知される事があるため、現テキスト vs _original_lines を
+        実比較して True/False を返す。
+
+        '\\n'.join() と toPlainText() は末尾改行の扱いが微妙に違うため、
+        両方を splitlines() で行単位に正規化して比較する (改行差異を吸収)。"""
+        try:
+            current_lines = tab.editor.toPlainText().splitlines()
+            original_lines = getattr(tab, '_original_lines', [])
+            return current_lines != original_lines
+        except Exception:
+            return True  # 比較失敗時は安全側 (修正されている扱い)
+
     def _close_tab(self, idx):
         tab = self.tabs.widget(idx)
-        if isinstance(tab, EditorTab) and tab.is_modified:
+        if isinstance(tab, EditorTab) and tab.is_modified and self._tab_actually_modified(tab):
             ans = QMessageBox.question(
                 self, "確認",
                 f"「{tab.filename}」は変更されています。保存しますか？",
@@ -5150,8 +5466,7 @@ class MainWindow(QMainWindow):
             if tab.editor.document().isModified():
                 # 未保存編集ありの場合は触らない (ユーザー編集を失わない)
                 return
-            with open(filepath, 'r', encoding='utf-8', errors='replace') as f:
-                disk_content = f.read()
+            disk_content = self._read_text_auto_encoding(filepath)
         except Exception:
             return
         cur_content = tab.editor.toPlainText()
@@ -5300,19 +5615,32 @@ class MainWindow(QMainWindow):
         except Exception:
             pass
 
-        # 未保存タブの確認
+        # 未保存タブの確認 — Yes/No ではなく明示的に「終了」「キャンセル」
         for i in range(self.tabs.count()):
             tab = self.tabs.widget(i)
             if isinstance(tab, EditorTab) and tab.is_modified:
-                ans = QMessageBox.question(
-                    self, "終了確認",
-                    "保存されていない変更があります。終了しますか？",
-                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                )
-                if ans == QMessageBox.StandardButton.No:
-                    event.ignore()
-                    return
-                break
+                # is_modified が True でも、実際の内容が _original_lines と
+                # 一致するならハイライタの format 変更等による誤検知。
+                # 内容比較で false positive を弾く。
+                if self._tab_actually_modified(tab):
+                    msg = QMessageBox(self)
+                    msg.setIcon(QMessageBox.Icon.Question)
+                    msg.setWindowTitle("終了確認")
+                    msg.setText("保存されていない変更があります。終了しますか？")
+                    btn_quit   = msg.addButton("終了", QMessageBox.ButtonRole.AcceptRole)
+                    btn_cancel = msg.addButton("キャンセル", QMessageBox.ButtonRole.RejectRole)
+                    msg.setDefaultButton(btn_cancel)
+                    msg.exec()
+                    if msg.clickedButton() is btn_cancel:
+                        event.ignore()
+                        return
+                    break
+                # 誤検知のフラグはリセット
+                try:
+                    tab.editor.document().setModified(False)
+                    tab.is_modified = False
+                except Exception:
+                    pass
 
         # FTP 接続が残っていれば QUIT 送信 + キープアライブタイマー停止 +
         # last_dir 永続化 をまとめて処理 (_disconnect が全部やってくれる)
@@ -7740,6 +8068,21 @@ if __name__ == '__main__':
 
     app = QApplication(sys.argv)
     app.setApplicationName("Sora Editor")
+    # Qt 標準ダイアログ (QMessageBox の Yes/No/Ok/Cancel 等) を日本語化
+    try:
+        from PyQt6.QtCore import QTranslator, QLibraryInfo, QLocale
+        _qt_tr = QTranslator()
+        _candidates = [QLibraryInfo.path(QLibraryInfo.LibraryPath.TranslationsPath)]
+        # frozen (PyInstaller) では --add-data で同梱した場所もチェック
+        if getattr(sys, 'frozen', False):
+            base = getattr(sys, '_MEIPASS', os.path.dirname(sys.executable))
+            _candidates.insert(0, os.path.join(base, 'PyQt6', 'Qt6', 'translations'))
+        for _p in _candidates:
+            if _qt_tr.load(QLocale("ja"), "qtbase", "_", _p):
+                app.installTranslator(_qt_tr)
+                break
+    except Exception:
+        pass
     try:
         from app_icons import text_editor_icon
         app.setWindowIcon(text_editor_icon())
