@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.16"
+__version__ = "1.1.17"
 
 import sys
 import os
@@ -691,12 +691,16 @@ class SyntaxHighlighter(QSyntaxHighlighter):
         },
         'log': {
             # 行全体をレベルで色分け（最初にマッチしたものを適用）
+            # 背景色は使わない (= None): 行全体に bg を塗ると、後段の inline
+            # ルール (timestamp / thread name 等) が setFormat で前景色だけを
+            # 差し替える際に bg が剥がれ、ストライプ状の縞模様になる。
+            # ログレベルは前景色のみで識別する。
             'line_levels': [
-                (r'\b(?:ERROR|CRITICAL|FATAL|SEVERE)\b',  '#3D1515', '#FF7070'),
-                (r'\b(?:WARN(?:ING)?)\b',                 '#2D2512', '#E8B26A'),
-                (r'\b(?:INFO|INFORMATION)\b',             '#1A2D1A', '#6A9F6A'),
-                (r'\b(?:DEBUG)\b',                        None,      '#707070'),
-                (r'\b(?:TRACE|VERBOSE)\b',                None,      '#555555'),
+                (r'\b(?:ERROR|CRITICAL|FATAL|SEVERE)\b',  None, '#FF7070'),
+                (r'\b(?:WARN(?:ING)?)\b',                 None, '#E8B26A'),
+                (r'\b(?:INFO|INFORMATION)\b',             None, '#6A9F6A'),
+                (r'\b(?:DEBUG)\b',                        None, '#707070'),
+                (r'\b(?:TRACE|VERBOSE)\b',                None, '#555555'),
             ],
             # 行内の特定パターン
             'inline': [
@@ -2143,6 +2147,55 @@ class _FtpDownloadWorker(QThread):
             self.finished_err.emit(str(e))
 
 
+_FTP_MONTH_MAP = {
+    'Jan': 1, 'Feb': 2, 'Mar': 3, 'Apr': 4, 'May': 5, 'Jun': 6,
+    'Jul': 7, 'Aug': 8, 'Sep': 9, 'Oct': 10, 'Nov': 11, 'Dec': 12,
+}
+
+
+def _ftp_list_date_to_iso(date_parts) -> str:
+    """ftp LIST 出力の月日時刻 3 要素 (例: ['May','22','16:51'] や
+    ['May','22','2025']) を 'YYYY/MM/DD HH:MM' に変換する。
+    LIST には秒が含まれないので秒は表示しない。
+    形式が解析できない場合は元の連結文字列を返す。"""
+    if len(date_parts) < 3:
+        return ' '.join(date_parts)
+    mon_str, day_str, time_or_year = date_parts[0], date_parts[1], date_parts[2]
+    month = _FTP_MONTH_MAP.get(mon_str)
+    if month is None:
+        return ' '.join(date_parts)
+    try:
+        day = int(day_str)
+    except ValueError:
+        return ' '.join(date_parts)
+    import datetime as _dt
+    now = _dt.datetime.now()
+    if ':' in time_or_year:
+        # 時刻形式 → 年は省略されているので推測 (= 現在 / 1年前)
+        # ls の慣習: 過去 6 か月以内なら現在年、それ以上なら前年
+        try:
+            hh_str, mm_str = time_or_year.split(':')
+            hh, mm = int(hh_str), int(mm_str)
+        except ValueError:
+            return ' '.join(date_parts)
+        year = now.year
+        try:
+            candidate = _dt.datetime(year, month, day, hh, mm)
+            # 現在より未来になった (= 来年扱い) なら 1 年戻す
+            if candidate > now + _dt.timedelta(days=1):
+                year -= 1
+        except ValueError:
+            pass
+        return f"{year:04d}/{month:02d}/{day:02d} {hh:02d}:{mm:02d}"
+    else:
+        # 年指定形式 (時刻不明)
+        try:
+            year = int(time_or_year)
+        except ValueError:
+            return ' '.join(date_parts)
+        return f"{year:04d}/{month:02d}/{day:02d} 00:00"
+
+
 def _fmt_bytes(n: int) -> str:
     """バイト数を人間に読みやすい単位 (B/KB/MB/GB) で整形する。"""
     if n < 1024:
@@ -2195,20 +2248,16 @@ class _FTPSizeDelegate(QStyledItemDelegate):
         painter.save()
         selected = bool(opt.state & QStyle.StateFlag.State_Selected)
 
-        # 名前色 (選択中は強調色 / それ以外は項目指定色 → 既定色)
-        if selected:
-            name_color = opt.palette.color(
-                opt.palette.ColorGroup.Active,
-                opt.palette.ColorRole.HighlightedText)
+        # 名前色: 選択中もテーマの text 色を使う (HighlightedText = 白だと
+        # Light テーマの淡水色 selection 背景で文字が見えなくなるため)。
+        # Dark テーマでも text = 明色 / selection = 濃青 で読みやすい。
+        fg = index.data(Qt.ItemDataRole.ForegroundRole)
+        if fg is not None and hasattr(fg, 'color'):
+            name_color = fg.color()           # ディレクトリ等の指定色を尊重
+        elif fg is not None:
+            name_color = QColor(fg)
         else:
-            fg = index.data(Qt.ItemDataRole.ForegroundRole)
-            if fg is not None and hasattr(fg, 'color'):
-                name_color = fg.color()           # ディレクトリ等の指定色を尊重
-            elif fg is not None:
-                name_color = QColor(fg)
-            else:
-                name_color = opt.palette.color(
-                    opt.palette.ColorGroup.Active, opt.palette.ColorRole.Text)
+            name_color = QColor(_theme()['text'])
 
         left = text_rect.left() + 2
         right_pad = 6
@@ -2256,6 +2305,13 @@ class _FTPSizeDelegate(QStyledItemDelegate):
 class FTPPanel(QWidget):
     file_downloaded      = pyqtSignal(str, str)  # content, filename (互換用)
     file_downloaded_path = pyqtSignal(str, str)  # local_path, filename (新規)
+    # DL 開始直前に local_path を通知 → MainWindow が _self_write_paths に登録
+    # することで、DL 中の chunk 書込みで発火する fileChanged を無視させる。
+    # これが無いと:
+    # - DL 中の partial 書込みで _on_external_change が走り、未編集タブを
+    #   不完全な内容で auto-reload してしまう
+    # - DL 完了後の _open_ftp_file で setModified が伝わる前に dialog が出る
+    download_starting    = pyqtSignal(str)       # local_path
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -2348,7 +2404,7 @@ class FTPPanel(QWidget):
             self.status_label.setText(f"接続中: {display_name}")
             # 明るい緑にして視認性アップ (旧 #6A8759 は暗くて読みにくいため)
             self.status_label.setStyleSheet(
-                "color: #9ED969; padding: 2px; font-weight: 600;"
+                "background: #A5D6A7; color: #000000; padding: 2px;"
             )
             self.status_label.setToolTip(f"ホスト: {info['host']}  ユーザー: {info['user']}")
             self.connect_btn.setEnabled(False)
@@ -2509,7 +2565,9 @@ class FTPPanel(QWidget):
                         size_str = _fmt_bytes(int(parts[4]))
                     except (ValueError, IndexError):
                         size_str = ''
-                    date_str = ' '.join(parts[5:8])   # 例: "May 22 16:51"
+                    # LIST の "May 22 16:51" / "May 22 2025" を
+                    # "YYYY/MM/DD HH:MM:00" 形式に変換 (秒は LIST に無いので 00)
+                    date_str = _ftp_list_date_to_iso(parts[5:8])
                     # 2行目メタ: 「サイズ · 日時」(取得できた要素のみ連結)
                     meta = ' · '.join(s for s in (size_str, date_str) if s)
                     if meta:
@@ -2673,14 +2731,16 @@ class FTPPanel(QWidget):
         progress.setAutoClose(False)
         progress.setAutoReset(False)
         progress.setWindowModality(Qt.WindowModality.WindowModal)
+        t = _theme()
         progress.setStyleSheet(
-            "QProgressDialog { background:#2b2b2b; }"
-            "QLabel { color:#a9b7c6; }"
-            "QPushButton { background:#4a4a4a; color:#a9b7c6; border:none;"
-            "              padding:4px 12px; border-radius:2px; }"
-            "QPushButton:hover { background:#5a5a5a; }"
-            "QProgressBar { background:#1e1e1e; color:#fff; border:1px solid #555;"
-            "               border-radius:2px; text-align:center; }"
+            f"QProgressDialog {{ background:{t['bg']}; }}"
+            f"QLabel {{ color:{t['text']}; }}"
+            f"QPushButton {{ background:{t['control_bg']}; color:{t['text']}; border:none;"
+            f"              padding:4px 12px; border-radius:2px; }}"
+            f"QPushButton:hover {{ background:{t['control_hover']}; }}"
+            f"QProgressBar {{ background:{t['editor_bg']}; color:{t['text']};"
+            f"               border:1px solid {t['border']}; border-radius:2px;"
+            f"               text-align:center; }}"
             "QProgressBar::chunk { background:#4a8e4a; }"
         )
 
@@ -2737,6 +2797,8 @@ class FTPPanel(QWidget):
         worker.finished_err.connect(_on_err)
         progress.canceled.connect(worker.cancel)
 
+        # DL 中の fileChanged を抑止するため MainWindow に local_path を通達
+        self.download_starting.emit(local_path)
         worker.start()
         # done フラグが立つまで Qt イベントループを回す
         # (進捗ダイアログはモーダルなのでユーザーは他の FTP 操作を打てない)
@@ -2802,11 +2864,14 @@ class BookmarkPanel(QWidget):
         self.list_widget.itemDoubleClicked.connect(self._on_double_click)
         layout.addWidget(self.list_widget)
 
-        hint = QLabel("ダブルクリックでジャンプ  /  F2：登録/解除  /  F3：次へ  /  Shift+F3：前へ")
-        hint.setStyleSheet("color: #a0a6ad; font-size: 11px;")
-        hint.setWordWrap(True)   # 右サイドバーは幅が狭いので折り返す
-        layout.addWidget(hint)
+        self._hint_label = QLabel(
+            "ダブルクリックでジャンプ  /  F2：登録/解除  /  F3：次へ  /  Shift+F3：前へ"
+        )
+        self._hint_label.setWordWrap(True)   # 右サイドバーは幅が狭いので折り返す
+        layout.addWidget(self._hint_label)
         self.setLayout(layout)
+        # ヒント色をテーマに合わせる (Light テーマで薄い灰色だと読めないため)
+        self._apply_hint_color()
 
     def apply_theme(self):
         """閉じる(×)ボタンをテーマ連動で再スタイル (ホバーは赤=閉じる/削除色)。"""
@@ -2819,6 +2884,27 @@ class BookmarkPanel(QWidget):
             f"              padding:2px 4px; border-radius:3px; font-weight:600; }}"
             f"QPushButton:hover {{ background:#c0392b; color:#fff; border:1px solid #e05545; }}"
         )
+        # ヒント文字色もテーマ連動で更新 (Light モードで読みにくいため)
+        self._apply_hint_color()
+        # 既存のアイテム色も塗り直す
+        if hasattr(self, 'list_widget'):
+            self._refresh()
+
+    def _apply_hint_color(self):
+        if not hasattr(self, '_hint_label'):
+            return
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        c = '#555555' if is_light else '#a0a6ad'
+        self._hint_label.setStyleSheet(f"color: {c}; font-size: 11px;")
+
+    @staticmethod
+    def _bookmark_colors():
+        """Light モードでは濃い色、それ以外は明るい色を返す。
+        (header, normal, error, warn) のタプル。"""
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        if is_light:
+            return ('#1565C0', '#0D47A1', '#B71C1C', '#E65100')  # 濃青 / 濃青 / 濃赤 / 濃橙
+        return ('#6897BB', '#4A9EFF', '#FF7070', '#E8B26A')      # 明青 / 明青 / 明赤 / 明橙
 
     def keyPressEvent(self, event):
         # Esc キーで閉じる
@@ -2833,6 +2919,7 @@ class BookmarkPanel(QWidget):
 
     def _refresh(self):
         self.list_widget.clear()
+        header_c, normal_c, error_c, warn_c = self._bookmark_colors()
         for label, tab in self._tab_refs:
             editor = tab.editor
             linenos = sorted(editor._bookmarks)
@@ -2841,7 +2928,7 @@ class BookmarkPanel(QWidget):
             # このタブ (ファイル) のヘッダーを1回だけ挿入
             header_item = QListWidgetItem(f"📄 {label}")
             header_item.setFlags(Qt.ItemFlag.NoItemFlags)
-            header_item.setForeground(QColor("#6897BB"))
+            header_item.setForeground(QColor(header_c))
             self.list_widget.addItem(header_item)
 
             for lineno in linenos:
@@ -2855,13 +2942,13 @@ class BookmarkPanel(QWidget):
                 item.setData(Qt.ItemDataRole.UserRole, (tab, lineno))
                 # ホバーで全文を確認できるようツールチップに完全な行を入れる
                 item.setToolTip(f"{label}  行 {lineno}\n{full_text}")
-                # エラー行は赤っぽく
+                # エラー行は赤、警告行は橙、その他は青 (テーマで濃淡切替)
                 if re.search(r'\b(?:ERROR|CRITICAL|FATAL)\b', preview, re.IGNORECASE):
-                    item.setForeground(QColor("#FF7070"))
+                    item.setForeground(QColor(error_c))
                 elif re.search(r'\bWARN', preview, re.IGNORECASE):
-                    item.setForeground(QColor("#E8B26A"))
+                    item.setForeground(QColor(warn_c))
                 else:
-                    item.setForeground(QColor("#4A9EFF"))
+                    item.setForeground(QColor(normal_c))
                 self.list_widget.addItem(item)
 
         # ブックマークが1つも無い場合は最小限の表示のみ (操作説明は下部の凡例にある)
@@ -3446,7 +3533,6 @@ class EditorTab(QWidget):
         self.filename = filename
         self.file_path = file_path
         self.is_modified = False
-        self._original_lines: list[str] = content.splitlines()
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -3461,6 +3547,29 @@ class EditorTab(QWidget):
         # ハイライトが走り、ブロックコメント状態の引き継ぎが失敗する場合がある。
         if content:
             self.editor.setPlainText(content)
+        # 差分判定の基準行は **setPlainText の後** に editor.toPlainText() から
+        # 取得する。 Qt は改行 (\r\n→\n)、Unicode 行区切り (U+2028/2029)、
+        # 末尾改行、NULL 文字などを内部正規化するため、入力 content から
+        # 取得した splitlines と toPlainText 後の splitlines が
+        # 1 行ずれることがある。ずれると _on_modified の防御層で
+        # 「内容変わってない」判定が失敗し、 ● マーク誤検知 +
+        # change_map が「全行 added」と判定して画面緑塗りになる。
+        self._original_lines: list[str] = self.editor.toPlainText().splitlines()
+        # 実編集トラッキング: contentsChange は (pos, removed, added) を渡す。
+        # シンタックスハイライターの setFormat や Qt 内部の format dirty は
+        # contentsChange を発火させないので、added/removed のどちらかが
+        # 0 より大きい時のみ「ユーザが実際に編集した」と判定できる。
+        # この方式なら modificationChanged の誤発火に依存せず確実に ● を制御できる。
+        self._user_edited = False
+        # reload_from_disk が setPlainText で内容差し替え中は contentsChange も
+        # 発火するので、その間だけ trackerを無効化するためのガード。
+        self._suppress_edit_tracking = False
+        def _track_real_edit(_pos, removed, added):
+            if self._suppress_edit_tracking:
+                return
+            if removed > 0 or added > 0:
+                self._user_edited = True
+        self.editor.document().contentsChange.connect(_track_real_edit)
 
         lang = detect_language(filename)
         self.highlighter = SyntaxHighlighter(self.editor.document(), lang)
@@ -3496,6 +3605,26 @@ class EditorTab(QWidget):
         """保存後に基準行を更新してガターをクリアする"""
         self._original_lines = self.editor.toPlainText().splitlines()
         self.editor.set_change_map({})
+        # 保存 = 「これが新しいベースライン」なので実編集フラグもクリア。
+        # これ以降の編集だけが ● 対象になる。
+        self._user_edited = False
+
+    def reload_from_disk(self, new_content: str):
+        """ディスクから再読込した内容で中身を差し替える (リロード専用パス) 。
+        setPlainText は contentsChange + modificationChanged(True) を発火し、
+        _track_real_edit が _user_edited=True にしてしまうため、
+        差し替え中はガード変数 _suppress_edit_tracking を立てて吸収する。
+        その後 _user_edited / _original_lines / modified flag を一括クリアする。
+        """
+        self._suppress_edit_tracking = True
+        try:
+            self.editor.setPlainText(new_content)
+        finally:
+            self._suppress_edit_tracking = False
+        self._original_lines = self.editor.toPlainText().splitlines()
+        self._user_edited = False
+        self.editor.document().setModified(False)
+        self.is_modified = False
 
     def _apply_editor_style(self):
         t = _theme()
@@ -3533,20 +3662,14 @@ class EditorTab(QWidget):
         self.editor.line_number_area.update()
 
     def _on_modified(self, modified):
-        # syntax highlighter / format 変更や Qt 内部の都合で
-        # modificationChanged(True) が誤って発火するケースがある
-        # (アラート調査からファイルを開いた直後等)。
-        # True 遷移時に内容と _original_lines を実比較し、一致するなら
-        # 即 False に戻して ● マーク誤表示を防ぐ。
-        if modified:
-            try:
-                if self.editor.toPlainText().splitlines() == self._original_lines:
-                    # 再帰で _on_modified(False) が呼ばれ is_modified=False になる
-                    self.editor.document().setModified(False)
-                    return
-            except Exception:
-                pass
-        self.is_modified = modified
+        # modificationChanged は syntax highlighter / Qt 内部の format dirty 等で
+        # 誤発火するため信頼できない。実編集の有無は _user_edited
+        # (contentsChange で added/removed > 0 時のみ True) で判定する。
+        # 「Qt は True にしたが実編集はゼロ」のケースは即 False に戻す。
+        if modified and not self._user_edited:
+            self.editor.document().setModified(False)
+            return
+        self.is_modified = bool(modified and self._user_edited)
         self.content_changed.emit()
 
     def _update_change_map(self):
@@ -3954,6 +4077,7 @@ class MainWindow(QMainWindow):
         self.ftp_panel.setMaximumWidth(320)
         self.ftp_panel.file_downloaded.connect(self._open_ftp_content)
         self.ftp_panel.file_downloaded_path.connect(self._open_ftp_file)
+        self.ftp_panel.download_starting.connect(self._mark_ftp_self_write)
         self.ftp_panel.set_modification_checker(self._is_local_file_modified)
         self.ftp_panel.hide()
 
@@ -4391,14 +4515,14 @@ class MainWindow(QMainWindow):
                 font-size: {ui_fs}px;
             }}
             QListWidget::item {{ padding: 1px 2px; }}
-            QListWidget::item:selected {{ background: {t['selection']}; }}
+            QListWidget::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
             QListWidget::item:hover {{ background: {t['control_hover']}; }}
             QTreeWidget {{
                 background: {t['panel_bg']}; color: {t['text']}; border: none;
                 outline: none; font-size: {ui_fs}px;
             }}
             QTreeWidget::item {{ padding: 1px 0; }}
-            QTreeWidget::item:selected {{ background: {t['selection']}; }}
+            QTreeWidget::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
             QTreeWidget::item:hover {{ background: {t['control_hover']}; }}
             QHeaderView::section {{
                 background: {t['control_bg']}; color: {t['text']};
@@ -4559,6 +4683,10 @@ class MainWindow(QMainWindow):
         """FTP でダウンロードしたファイルを一時ファイル経由で開く。
         同パスのタブが既に開いていたら、そのタブを最新内容に置換 (リロード)。"""
         try:
+            size = os.path.getsize(local_path)
+        except Exception:
+            size = 0
+        try:
             content = self._read_text_auto_encoding(local_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
@@ -4574,12 +4702,14 @@ class MainWindow(QMainWindow):
 
         if existing_idx >= 0:
             # 既存タブをリロード (未保存編集はFTPPanel側で上書き確認済みなのでここでは破棄)
+            # reload_from_disk が setPlainText + _user_edited クリア + ● 解除を
+            # 一括処理する。大ファイル時は rehighlight() を **呼ばない**
+            # (= 遅延ハイライト任せ) でメインスレッドのブロックを避ける。
             tab = self.tabs.widget(existing_idx)
             cur_block = tab.editor.textCursor().blockNumber()
-            tab.editor.setPlainText(content)
-            tab._original_lines = content.splitlines()
-            tab.editor.document().setModified(False)
-            tab.highlighter.rehighlight()
+            tab.reload_from_disk(content)
+            if size < self._LARGE_FILE_SIZE:
+                tab.highlighter.rehighlight()
             # スクロール位置を元の行に近づける
             self._jump_to_line(tab.editor, cur_block + 1)
             self.tabs.setCurrentIndex(existing_idx)
@@ -4588,8 +4718,15 @@ class MainWindow(QMainWindow):
             )
             return
 
-        # 新規タブ
-        tab = EditorTab(content, filename, local_path)
+        # 新規タブ (大ファイル抑制を _load_file と一致させる)
+        skip_hl = size >= self._LARGE_FILE_SIZE
+        huge    = size >= self._HUGE_FILE_SIZE
+        tab = EditorTab(
+            content, filename, local_path,
+            skip_initial_highlight=skip_hl,
+            disable_diff=huge,
+            disable_undo=huge,
+        )
         self._connect_tab(tab)
         idx = self.tabs.addTab(tab, f"[FTP] {filename}")
         self.tabs.setCurrentIndex(idx)
@@ -4750,6 +4887,18 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
 
+    def _mark_ftp_self_write(self, local_path: str):
+        """FTPPanel が DL を開始する直前に呼ばれる。DL 中の chunk 書込みで
+        QFileSystemWatcher が発火する fileChanged を _on_external_change に
+        無視させるため、 local_path を _self_write_paths に登録する。
+        DL 完了後に _open_ftp_file が走るまで継続するよう、 5 秒のタイマで
+        クリアする (通常の保存より長め: 大ファイル DL を考慮)。"""
+        try:
+            self._self_write_paths.add(local_path)
+            self._self_write_clear_timer.start(5000)
+        except Exception:
+            pass
+
     # ---------------- 外部ファイル変更検知 (VS Code 風) ----------------
 
     def _watch_path(self, path: str):
@@ -4812,11 +4961,10 @@ class MainWindow(QMainWindow):
         self._watch_path(path)
 
     def _reload_tab_content(self, tab, new_content: str):
-        """タブの内容を新コンテンツに置き換え (カーソル位置をなるべく保持)"""
+        """タブの内容を新コンテンツに置き換え (カーソル位置をなるべく保持)。
+        ● マーク誤検知防止のため reload_from_disk を経由する。"""
         cur_block = tab.editor.textCursor().blockNumber()
-        tab.editor.setPlainText(new_content)
-        tab._original_lines = new_content.splitlines()
-        tab.editor.document().setModified(False)
+        tab.reload_from_disk(new_content)
         try:
             tab.highlighter.rehighlight()
         except Exception:
