@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.19"
+__version__ = "1.1.20"
 
 import sys
 import os
@@ -4098,9 +4098,10 @@ class EditorTab(QWidget):
         self.filename = filename
         self.file_path = file_path
         self.is_modified = False
-        # 検出されたエンコーディング (load 時に _load_file から設定。
-        # 新規/未読込タブは未確定 = 空文字)
-        self.encoding = ''
+        # 検出されたエンコーディング。 load 時に _load_file から上書きされる。
+        # 新規タブは _write_file が UTF-8 で保存するので UTF-8 をデフォルトに
+        # しておく (ステータスバーに '—' が出ないように)。
+        self.encoding = 'utf-8'
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -5564,10 +5565,46 @@ class MainWindow(QMainWindow):
         if path:
             self._write_file(tab, path)
 
+    # 保存可能なエンコーディング (検出時の名称 → Python codec 名)。
+    # 'UTF-8 (replace)' のようなフォールバックは UTF-8 として書き戻す。
+    _SAVE_ENC_MAP = {
+        'utf-8':            'utf-8',
+        'utf-8-sig':        'utf-8-sig',     # BOM 付きで書き戻す
+        'cp932':            'cp932',
+        'shift_jis':        'shift_jis',
+        'euc-jp':           'euc-jp',
+        'UTF-8 (replace)':  'utf-8',
+    }
+
     def _write_file(self, tab, path):
+        # タブが持つ検出済みエンコで書き戻す (UTF-8 強制を撤廃)。
+        # encoding に該当 codec が無ければ UTF-8 にフォールバック。
+        enc = self._SAVE_ENC_MAP.get(getattr(tab, 'encoding', '') or '', 'utf-8')
+        text = tab.editor.toPlainText()
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                f.write(tab.editor.toPlainText())
+            # CP932/Shift_JIS 等で表現できない文字を含む場合に備え、
+            # errors='strict' で書いてみて、 失敗したらユーザに確認。
+            try:
+                with open(path, 'w', encoding=enc) as f:
+                    f.write(text)
+            except UnicodeEncodeError as ue:
+                ans = QMessageBox.warning(
+                    self, "文字コードで保存できません",
+                    f"このファイルは現在 {enc} と判定されていますが、\n"
+                    f"内容に {enc} で表現できない文字が含まれています:\n"
+                    f"  位置: {ue.start} 付近\n\n"
+                    "UTF-8 で保存し直しますか?\n"
+                    "(キャンセルで保存を中止)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.Cancel,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
+                enc = 'utf-8'
+                with open(path, 'w', encoding=enc) as f:
+                    f.write(text)
+                tab.encoding = enc
+                self._update_encoding_label()
             tab.file_path = path
             tab.filename = os.path.basename(path)
             idx = self.tabs.indexOf(tab)
@@ -5576,7 +5613,8 @@ class MainWindow(QMainWindow):
             tab.reset_original()  # 保存後はガターをリセット
             # 保存でパスが付いた/変わったタブのブックマークを永続化
             self._persist_tab_bookmarks(tab)
-            self.statusBar().showMessage(f"保存しました: {path}", 3000)
+            self.statusBar().showMessage(
+                f"保存しました ({enc}): {path}", 3000)
             # 自分が書いたファイルの fileChanged を 1 秒間無視
             self._self_write_paths.add(path)
             self._self_write_clear_timer.start(1000)
@@ -6489,6 +6527,8 @@ class MainWindow(QMainWindow):
         """CsvTab → EditorTab に切替。 CsvTab の _raw_text を使うので、
         グリッド → エディタ → グリッドの往復で内容が保たれる
         (= EditorTab で編集 → グリッドへ戻る → エディタへ戻るで編集消失しない)。
+        ディスクに存在するファイルなら現テキスト vs ディスクを比較して、
+        差分があれば ● マークも復活させる (toggle 時に編集状態が消える問題対策)。
         ファイルがディスクに存在しない (= 新規 CsvTab) ケースもサポート。"""
         try:
             # CsvTab 内のテキスト (= 表示中の内容) をそのまま EditorTab へ渡す
@@ -6517,6 +6557,23 @@ class MainWindow(QMainWindow):
             idx = self.tabs.addTab(tab, filename)
             self.tabs.setCurrentIndex(idx)
             tab.editor.document().setModified(False)
+            # ディスクと比較して ● を再判定する。 ディスク上のテキストを
+            # _original_lines にして、 現テキストとの差分があれば編集扱い。
+            # この処理が無いとグリッド ⇄ エディタ往復で ● が消える。
+            if path and os.path.isfile(path):
+                try:
+                    disk_text = self._read_text_auto_encoding(path)
+                except Exception:
+                    disk_text = content
+                disk_lines = disk_text.splitlines()
+                tab._original_lines = disk_lines
+                cur_lines = content.splitlines()
+                if cur_lines != disk_lines:
+                    # 編集扱いに復元 (● を出す)
+                    tab._user_edited = True
+                    tab.is_modified = True
+                    tab.editor.document().setModified(True)
+                    tab.content_changed.emit()
             if path:
                 self._restore_tab_bookmarks(tab)
                 self._watch_path(path)
