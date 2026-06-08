@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.17"
+__version__ = "1.1.18"
 
 import sys
 import os
@@ -20,12 +20,12 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSpinBox, QTextBrowser, QFrame,
     QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QProgressDialog, QStyledItemDelegate, QStyle,
-    QStyleOptionViewItem, QSizePolicy,
+    QStyleOptionViewItem, QSizePolicy, QScrollArea,
 )
 from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal, QSize, QThread, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QTextCharFormat, QSyntaxHighlighter,
-    QKeySequence, QAction, QPainter, QTextFormat, QTextDocument,
+    QKeySequence, QAction, QPainter, QTextFormat, QTextDocument, QPixmap,
 )
 
 
@@ -175,6 +175,49 @@ def _save_bookmarks_store(store: dict):
             json.dump(store, f, ensure_ascii=False, indent=2)
     except Exception:
         pass
+
+
+# ---------------------------------------------------------------------------
+# 最近開いたファイル (絶対パス x N、開いた順) を JSON で永続化
+# ---------------------------------------------------------------------------
+_RECENT_FILES_PATH = os.path.join(os.path.expanduser('~'), '.text_editor_recent_files.json')
+_RECENT_FILES_MAX  = 15
+
+
+def _load_recent_files() -> list[str]:
+    try:
+        with open(_RECENT_FILES_PATH, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+            return [p for p in data if isinstance(p, str)] if isinstance(data, list) else []
+    except Exception:
+        return []
+
+
+def _save_recent_files(paths: list[str]):
+    try:
+        with open(_RECENT_FILES_PATH, 'w', encoding='utf-8') as f:
+            json.dump(paths[:_RECENT_FILES_MAX], f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
+def _push_recent_file(path: str) -> list[str]:
+    """履歴を更新 (path を先頭に、重複は除去、最大 _RECENT_FILES_MAX 件)。
+    保存も同時に行い、最新の履歴リストを返す。"""
+    if not path:
+        return _load_recent_files()
+    try:
+        path = os.path.abspath(path)
+    except Exception:
+        return _load_recent_files()
+    items = _load_recent_files()
+    # 大文字小文字を吸収しつつ既存エントリを除去 (Windows 想定)
+    norm = os.path.normcase(path)
+    items = [p for p in items if os.path.normcase(p) != norm]
+    items.insert(0, path)
+    items = items[:_RECENT_FILES_MAX]
+    _save_recent_files(items)
+    return items
 
 
 def _theme() -> dict:
@@ -506,6 +549,55 @@ class CodeEditor(QPlainTextEdit):
         a_src.triggered.connect(self.source_open_requested.emit)
 
         menu.exec(event.globalPos())
+
+    def inputMethodEvent(self, event):
+        # IME 変換中 (preedit) のテキスト色は IME 由来の QTextCharFormat で
+        # 塗られ、Light テーマでは前景・背景がコントラスト不足で文字が
+        # 脱色して読めなくなる。テーマの text/editor_bg を明示する
+        # TextFormat を生成し、IME の TextFormat 属性を全置換する
+        # (下線等の意味伝達は残すため underline は維持)。
+        try:
+            from PyQt6.QtGui import QInputMethodEvent, QTextCharFormat
+            t = _theme()
+            preedit = event.preeditString()
+            new_attrs = []
+            saw_text_format = False
+            for a in event.attributes():
+                if a.type == QInputMethodEvent.AttributeType.TextFormat:
+                    saw_text_format = True
+                    fmt = QTextCharFormat()
+                    fmt.setForeground(QColor(t['text']))
+                    fmt.setBackground(QColor(t['editor_bg']))
+                    # IME が下線を要求している場合は維持
+                    if isinstance(a.value, QTextCharFormat) and a.value.fontUnderline():
+                        fmt.setFontUnderline(True)
+                        fmt.setUnderlineColor(QColor(t['text']))
+                    new_attrs.append(QInputMethodEvent.Attribute(
+                        a.type, a.start, a.length, fmt,
+                    ))
+                else:
+                    new_attrs.append(a)
+            # TextFormat 属性が皆無で preedit がある場合は、preedit 全域に
+            # デフォルト fmt を被せて Qt の暗黙描画 (白) を回避する。
+            if not saw_text_format and preedit:
+                fmt = QTextCharFormat()
+                fmt.setForeground(QColor(t['text']))
+                fmt.setBackground(QColor(t['editor_bg']))
+                fmt.setFontUnderline(True)
+                fmt.setUnderlineColor(QColor(t['text']))
+                new_attrs.append(QInputMethodEvent.Attribute(
+                    QInputMethodEvent.AttributeType.TextFormat,
+                    0, len(preedit), fmt,
+                ))
+            patched = QInputMethodEvent(preedit, new_attrs)
+            patched.setCommitString(
+                event.commitString(),
+                event.replacementStart(),
+                event.replacementLength(),
+            )
+            super().inputMethodEvent(patched)
+        except Exception:
+            super().inputMethodEvent(event)
 
     def paintEvent(self, event):
         # テキスト描画完了後に「現在行」を強調する。
@@ -849,6 +941,47 @@ class SyntaxHighlighter(QSyntaxHighlighter):
             'strings': [r'@?"(?:[^"\\]|\\.)*"', r"'(?:[^'\\]|\\.)*'"],
             'comment': r'//[^\n]*',
             'block_comment': ('/*', '*/'),
+        },
+        'vb': {
+            # VB6 / VBA / VB.NET 共通の主要キーワード (大文字小文字は区別しない)。
+            'keywords': [
+                'AddHandler', 'AddressOf', 'Alias', 'And', 'AndAlso', 'As', 'Boolean',
+                'ByRef', 'ByVal', 'Call', 'Case', 'Catch', 'Class', 'Const', 'Continue',
+                'Declare', 'Default', 'Delegate', 'Dim', 'DirectCast', 'Do', 'Each',
+                'Else', 'ElseIf', 'End', 'EndIf', 'Enum', 'Erase', 'Error', 'Event',
+                'Exit', 'False', 'Finally', 'For', 'Friend', 'Function', 'Get',
+                'GetType', 'Global', 'GoSub', 'GoTo', 'Handles', 'If', 'Implements',
+                'Imports', 'In', 'Inherits', 'Interface', 'Is', 'IsNot', 'Let',
+                'Lib', 'Like', 'Loop', 'Me', 'Mod', 'Module', 'MustInherit',
+                'MustOverride', 'MyBase', 'MyClass', 'Namespace', 'Narrowing', 'New',
+                'Next', 'Not', 'Nothing', 'NotInheritable', 'NotOverridable',
+                'Of', 'On', 'Operator', 'Option', 'Optional', 'Or', 'OrElse',
+                'Overloads', 'Overridable', 'Overrides', 'ParamArray', 'Partial',
+                'Preserve', 'Private', 'Property', 'Protected', 'Public', 'RaiseEvent',
+                'ReadOnly', 'ReDim', 'REM', 'RemoveHandler', 'Resume', 'Return',
+                'Select', 'Set', 'Shadows', 'Shared', 'Static', 'Step', 'Stop',
+                'Sub', 'SyncLock', 'Then', 'Throw', 'To', 'True', 'Try', 'TypeOf',
+                'Until', 'Using', 'Wend', 'When', 'While', 'Widening', 'With',
+                'WithEvents', 'WriteOnly', 'Xor',
+            ],
+            'types': [
+                'Boolean', 'Byte', 'SByte', 'Char', 'Date', 'Decimal', 'Double',
+                'Integer', 'Long', 'Object', 'Short', 'Single', 'String', 'UInteger',
+                'ULong', 'UShort', 'Variant', 'Currency',
+            ],
+            'patterns': [
+                (r'^\s*#\s*\w+', '#9876AA'),                # #If / #Region 等のディレクティブ
+                (r'<[A-Za-z_]\w*(?:\([^)]*\))?>', '#BBB529'),  # 属性 <Serializable> 等
+                # Rem キーワードから始まる行コメントは行全体を comment 色で塗る
+                (r'(?i)^\s*Rem\b.*$', '#808080'),
+            ],
+            # シングルクォートは VB ではコメントなので、文字列は二重引用符のみ。
+            # VB の文字列内では "" が " のエスケープになるが、概ね "[^"]*" で
+            # 視認上は十分 (誤検出は許容)。
+            'strings': [r'"(?:[^"]|"")*"'],
+            # シングルクォート始まり → 行末までコメント
+            'comment': r"'[^\n]*",
+            'kw_case_insensitive': True,
         },
         'xml': {
             # タグ・属性ベース (キーワードは持たない)
@@ -3481,15 +3614,20 @@ LANG_MAP = {
     '.java': 'java',
     # C#
     '.cs': 'csharp',
+    # Visual Basic 系 (VB6/VBA/VB.NET 共通でだいたい同じ色付け)
+    '.vb': 'vb', '.bas': 'vb', '.cls': 'vb', '.frm': 'vb',
+    '.vbs': 'vb', '.vba': 'vb',
     # XML / HTML
     '.xml': 'xml', '.html': 'xml', '.htm': 'xml', '.xhtml': 'xml',
     '.xsl': 'xml', '.xslt': 'xml', '.xsd': 'xml', '.svg': 'xml',
     '.csproj': 'xml', '.pom': 'xml',
+    # VB プロジェクト系 (XML)
+    '.vbproj': 'xml',
 }
 
 # 表示用 (UI のコンボ等で使う)
 SUPPORTED_LANGUAGES = ['text', 'python', 'javascript', 'sql', 'log',
-                       'cpp', 'java', 'csharp', 'xml']
+                       'cpp', 'java', 'csharp', 'vb', 'xml']
 
 
 def detect_language(filename: str) -> str:
@@ -3511,6 +3649,126 @@ def detect_language(filename: str) -> str:
     if '.log.' in name or name.endswith('.log'):
         return 'log'
     return 'text'
+
+
+# ---------------------------------------------------------------------------
+# 画像タブ (PNG/JPG/GIF/BMP/SVG 等を QPixmap で表示)
+# ---------------------------------------------------------------------------
+# 画像として扱う拡張子。SVG は Qt の image plugin が処理 (= ラスタライズ表示)。
+_IMAGE_EXTS = {
+    '.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.ico',
+    '.tif', '.tiff', '.svg',
+}
+
+
+def _is_image_path(path: str) -> bool:
+    return os.path.splitext(path or '')[1].lower() in _IMAGE_EXTS
+
+
+class ImageTab(QWidget):
+    """画像ファイル表示用タブ。EditorTab と同じ filename / file_path 属性を持ち、
+    上位 (タブ一覧 / 履歴 / FTP 既存タブ検索) で同等に扱えるようにする。
+    編集機能は無いので is_modified は常に False。"""
+
+    def __init__(self, path: str, filename: str):
+        super().__init__()
+        self.filename = filename
+        self.file_path = path
+        self.is_modified = False                  # 画像は編集不可
+        self._pixmap = QPixmap(path) if path else QPixmap()
+        self._zoom = 1.0
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        # 操作バー (フィット / 原寸 / 拡大 / 縮小 / 情報)
+        bar = QHBoxLayout()
+        self.fit_btn      = QPushButton("フィット")
+        self.actual_btn   = QPushButton("原寸 100%")
+        self.zoom_out_btn = QPushButton("➖")
+        self.zoom_in_btn  = QPushButton("➕")
+        self.zoom_label   = QLabel("100%")
+        self.zoom_label.setMinimumWidth(48)
+        self.info_label   = QLabel()
+        for b in (self.fit_btn, self.actual_btn, self.zoom_out_btn,
+                  self.zoom_in_btn):
+            b.setAutoDefault(False)
+            b.setMaximumHeight(24)
+        bar.addWidget(self.fit_btn)
+        bar.addWidget(self.actual_btn)
+        bar.addWidget(self.zoom_out_btn)
+        bar.addWidget(self.zoom_label)
+        bar.addWidget(self.zoom_in_btn)
+        bar.addStretch()
+        bar.addWidget(self.info_label)
+        layout.addLayout(bar)
+
+        # 画像本体: QScrollArea + 中央配置の QLabel
+        self.scroll = QScrollArea()
+        self.scroll.setWidgetResizable(False)     # 倍率に応じて手動 resize
+        self.scroll.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.image_label = QLabel()
+        self.image_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.scroll.setWidget(self.image_label)
+        layout.addWidget(self.scroll, 1)
+        self.setLayout(layout)
+
+        self.fit_btn.clicked.connect(self.fit_to_view)
+        self.actual_btn.clicked.connect(self.actual_size)
+        self.zoom_in_btn.clicked.connect(lambda: self._zoom_relative(1.25))
+        self.zoom_out_btn.clicked.connect(lambda: self._zoom_relative(0.8))
+
+        if self._pixmap.isNull():
+            self.info_label.setText("画像を読み込めませんでした")
+            self.image_label.setText("(画像を表示できません)")
+            self.zoom_label.setText("--")
+        else:
+            self.actual_size()
+
+    def _apply_zoom(self):
+        if self._pixmap.isNull():
+            return
+        w = max(1, int(self._pixmap.width() * self._zoom))
+        h = max(1, int(self._pixmap.height() * self._zoom))
+        scaled = self._pixmap.scaled(
+            w, h,
+            Qt.AspectRatioMode.KeepAspectRatio,
+            Qt.TransformationMode.SmoothTransformation,
+        )
+        self.image_label.setPixmap(scaled)
+        self.image_label.resize(scaled.size())
+        self.zoom_label.setText(f"{int(self._zoom * 100)}%")
+        size = self._pixmap.size()
+        self.info_label.setText(f"{size.width()} × {size.height()} px")
+
+    def actual_size(self):
+        self._zoom = 1.0
+        self._apply_zoom()
+
+    def fit_to_view(self):
+        if self._pixmap.isNull():
+            return
+        vp = self.scroll.viewport().size()
+        if vp.width() <= 0 or vp.height() <= 0:
+            self._zoom = 1.0
+        else:
+            rw = vp.width()  / self._pixmap.width()
+            rh = vp.height() / self._pixmap.height()
+            self._zoom = max(min(rw, rh), 0.05)    # 縮小は許可、拡大上限は別途
+        self._apply_zoom()
+
+    def _zoom_relative(self, factor: float):
+        self._zoom = max(0.05, min(self._zoom * factor, 20.0))
+        self._apply_zoom()
+
+    def wheelEvent(self, event):
+        # Ctrl + ホイールでズーム (通常ホイールは縦スクロール)
+        if event.modifiers() & Qt.KeyboardModifier.ControlModifier:
+            self._zoom_relative(1.1 if event.angleDelta().y() > 0 else 0.9)
+            event.accept()
+        else:
+            super().wheelEvent(event)
 
 
 class EditorTab(QWidget):
@@ -4255,6 +4513,9 @@ class MainWindow(QMainWindow):
         fm = mb.addMenu("ファイル(&F)")
         self._add_action(fm, "新規(&N)", QKeySequence.StandardKey.New, self.new_file)
         self._add_action(fm, "開く(&O)...", QKeySequence.StandardKey.Open, self.open_file)
+        # 最近開いたファイル (動的に aboutToShow で再構築)
+        self._recent_menu = fm.addMenu("最近開いたファイル(&R)")
+        self._recent_menu.aboutToShow.connect(self._rebuild_recent_menu)
         fm.addSeparator()
         self._add_action(fm, "保存(&S)", QKeySequence.StandardKey.Save, self.save_file)
         self._add_action(fm, "名前を付けて保存(&A)...", QKeySequence("Ctrl+Shift+S"), self.save_file_as)
@@ -4463,6 +4724,54 @@ class MainWindow(QMainWindow):
         act.triggered.connect(slot)
         menu.addAction(act)
 
+    def _rebuild_recent_menu(self):
+        """「最近開いたファイル」サブメニューを最新の履歴で再構築。
+        メニュー展開時に毎回呼ばれるので、開きながら別タブで開いた履歴も反映できる。"""
+        menu = self._recent_menu
+        menu.clear()
+        items = _load_recent_files()
+        if not items:
+            act = QAction("(履歴なし)", self)
+            act.setEnabled(False)
+            menu.addAction(act)
+            return
+        for i, path in enumerate(items, 1):
+            # 表示は ファイル名 + フルパス (略式)。先頭 9 件にはアクセラレータ &1..&9。
+            base = os.path.basename(path) or path
+            prefix = f"&{i} " if i < 10 else "   "
+            label = f"{prefix}{base}    [{path}]"
+            act = QAction(label, self)
+            act.setToolTip(path)
+            act.triggered.connect(lambda _checked=False, p=path: self._open_recent(p))
+            menu.addAction(act)
+        menu.addSeparator()
+        clear_act = QAction("履歴をクリア(&C)", self)
+        clear_act.triggered.connect(self._clear_recent_files)
+        menu.addAction(clear_act)
+
+    def _open_recent(self, path: str):
+        """履歴項目クリック → 既存タブがあればアクティブ化、無ければ _load_file。
+        ファイルが存在しなければ警告 + 履歴から除去。"""
+        if not os.path.isfile(path):
+            QMessageBox.warning(self, "ファイルが見つかりません",
+                                f"履歴のファイルが存在しません:\n{path}\n履歴から除外します。")
+            items = [p for p in _load_recent_files()
+                     if os.path.normcase(p) != os.path.normcase(path)]
+            _save_recent_files(items)
+            return
+        # 既存タブ確認
+        target = os.path.normcase(os.path.abspath(path))
+        for i in range(self.tabs.count()):
+            t = self.tabs.widget(i)
+            if isinstance(t, EditorTab) and t.file_path:
+                if os.path.normcase(os.path.abspath(t.file_path)) == target:
+                    self.tabs.setCurrentIndex(i)
+                    return
+        self._load_file(path)
+
+    def _clear_recent_files(self):
+        _save_recent_files([])
+
     def _apply_theme(self):
         t = _theme()
         ui_fs = SETTINGS.get('ui_font_size', 10)
@@ -4613,7 +4922,8 @@ class MainWindow(QMainWindow):
             "すべてのファイル (*);;"
             "Pythonファイル (*.py *.pyw);;"
             "JavaScriptファイル (*.js *.ts *.jsx *.tsx);;"
-            "テキストファイル (*.txt *.md)",
+            "テキストファイル (*.txt *.md);;"
+            "画像ファイル (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.ico *.tif *.tiff)",
         )
         for path in paths:
             self._load_file(path)
@@ -4645,8 +4955,18 @@ class MainWindow(QMainWindow):
                 size = os.path.getsize(path)
             except Exception:
                 size = 0
-            content = self._read_text_auto_encoding(path)
             filename = os.path.basename(path)
+            # 画像ファイルは ImageTab で開く (EditorTab とは別系統)。
+            # _connect_tab / _restore_tab_bookmarks / _read_text_auto_encoding は
+            # 編集タブ専用なので呼ばない。 _watch_path と履歴登録だけ行う。
+            if _is_image_path(path):
+                tab = ImageTab(path, filename)
+                idx = self.tabs.addTab(tab, f"🖼 {filename}")
+                self.tabs.setCurrentIndex(idx)
+                self._watch_path(path)
+                _push_recent_file(path)
+                return
+            content = self._read_text_auto_encoding(path)
             # 大ファイル時は UI フリーズ要因 (rehighlight / diff / undo) を抑制
             skip_hl = size >= self._LARGE_FILE_SIZE
             huge    = size >= self._HUGE_FILE_SIZE
@@ -4662,6 +4982,7 @@ class MainWindow(QMainWindow):
             tab.editor.document().setModified(False)
             self._restore_tab_bookmarks(tab)
             self._watch_path(path)
+            _push_recent_file(path)
             if skip_hl:
                 mb = size / (1024 * 1024)
                 msg = (
@@ -4686,6 +5007,25 @@ class MainWindow(QMainWindow):
             size = os.path.getsize(local_path)
         except Exception:
             size = 0
+        # 画像ファイルはテキスト読み込みをスキップして ImageTab に直接渡す。
+        # 既存タブが画像タブなら一旦閉じて開き直すのが最も単純 (QPixmap 差替よりも
+        # コードパスが一本化できる)。
+        if _is_image_path(local_path):
+            for i in range(self.tabs.count()):
+                t = self.tabs.widget(i)
+                if hasattr(t, 'file_path') and t.file_path == local_path:
+                    self.tabs.removeTab(i)
+                    t.deleteLater()
+                    break
+            tab = ImageTab(local_path, filename)
+            idx = self.tabs.addTab(tab, f"🖼 [FTP] {filename}")
+            self.tabs.setCurrentIndex(idx)
+            self._watch_path(local_path)
+            _push_recent_file(local_path)
+            self.statusBar().showMessage(
+                f"[FTP] {filename} を画像として開きました", 3000
+            )
+            return
         try:
             content = self._read_text_auto_encoding(local_path)
         except Exception as e:
@@ -4733,6 +5073,7 @@ class MainWindow(QMainWindow):
         tab.editor.document().setModified(False)
         self._restore_tab_bookmarks(tab)
         self._watch_path(local_path)
+        _push_recent_file(local_path)
 
     def _is_local_file_modified(self, local_path: str) -> bool:
         """指定ローカルパスに紐づくタブで未保存編集があるか"""
