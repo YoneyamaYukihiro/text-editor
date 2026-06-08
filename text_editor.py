@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.18"
+__version__ = "1.1.19"
 
 import sys
 import os
@@ -20,12 +20,13 @@ from PyQt6.QtWidgets import (
     QTreeWidget, QTreeWidgetItem, QSpinBox, QTextBrowser, QFrame,
     QStackedWidget, QTableWidget, QTableWidgetItem, QHeaderView,
     QAbstractItemView, QProgressDialog, QStyledItemDelegate, QStyle,
-    QStyleOptionViewItem, QSizePolicy, QScrollArea,
+    QStyleOptionViewItem, QSizePolicy, QScrollArea, QTableView, QMenu,
 )
 from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal, QSize, QThread, QTimer, QFileSystemWatcher
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QTextCharFormat, QSyntaxHighlighter,
     QKeySequence, QAction, QPainter, QTextFormat, QTextDocument, QPixmap,
+    QStandardItemModel, QStandardItem,
 )
 
 
@@ -3771,6 +3772,312 @@ class ImageTab(QWidget):
             super().wheelEvent(event)
 
 
+# ---------------------------------------------------------------------------
+# CSV/TSV をグリッド表示するタブ (閲覧専用、QTableView + QStandardItemModel)
+# ---------------------------------------------------------------------------
+_CSV_EXTS = {'.csv', '.tsv'}
+
+
+def _is_csv_path(path: str) -> bool:
+    return os.path.splitext(path or '')[1].lower() in _CSV_EXTS
+
+
+class CsvTab(QWidget):
+    """CSV/TSV をグリッド表示するタブ (閲覧専用)。
+    EditorTab と同じ filename / file_path / is_modified / encoding 属性を持つ。
+    編集・保存は実装せず、編集したい場合は「テキストとして開く」ボタンで
+    EditorTab に切替える (MainWindow が処理)。
+    """
+    # 「テキストとして開き直して」と MainWindow に依頼するシグナル。
+    open_as_text_requested = pyqtSignal(str)   # file_path
+
+    def __init__(self, path: str, filename: str,
+                 text_content: str, encoding: str):
+        super().__init__()
+        self.filename = filename
+        self.file_path = path
+        self.is_modified = False
+        self.encoding = encoding
+        self._raw_text = text_content
+        # 区切り文字を最初の数行で自動判定 (Sniffer)。失敗時は拡張子で決める。
+        self._delimiter = self._sniff_delimiter(text_content, path)
+        # ヘッダ行数 (0 = ヘッダなし / 1 = 通常 / 2+ = 多段ヘッダを '/' 連結)
+        self._header_rows = 1
+
+        layout = QVBoxLayout()
+        layout.setContentsMargins(2, 2, 2, 2)
+        layout.setSpacing(2)
+
+        # 操作バー
+        bar = QHBoxLayout()
+        self.delim_combo = QComboBox()
+        self.delim_combo.addItems(['カンマ ,', 'タブ \\t', 'セミコロン ;', 'パイプ |'])
+        self.delim_combo.setToolTip("区切り文字 (自動判定済み。手動切替可)")
+        # QSpinBox は up/down ボタンが描画されない/押せない既知環境 (Qt6 +
+        # 一部の Windows テーマ) があるので QComboBox にする。 選択肢が
+        # 0..5 と固定数のため combo の方が確実。
+        self.header_combo = QComboBox()
+        self.header_combo.addItems(['0 (なし)', '1', '2', '3', '4', '5'])
+        self.header_combo.setCurrentIndex(1)
+        self.header_combo.setToolTip(
+            "先頭から何行をヘッダ行として扱うか。\n"
+            "0=ヘッダなし / 1=通常 / 2以上=多段ヘッダ ('/' で連結)"
+        )
+        self.header_combo.setFixedWidth(90)
+        self.info_label = QLabel()
+        self.info_label.setTextFormat(Qt.TextFormat.RichText)
+        self.text_btn = QPushButton("📝 テキストとして開く")
+        self.text_btn.setAutoDefault(False)
+        self.text_btn.setToolTip("グリッドを閉じて EditorTab で開き直す")
+        for w in (self.delim_combo, self.header_combo, self.text_btn):
+            w.setMaximumHeight(26)
+        bar.addWidget(QLabel("区切り:"))
+        bar.addWidget(self.delim_combo)
+        bar.addWidget(QLabel("ヘッダ行数:"))
+        bar.addWidget(self.header_combo)
+        bar.addStretch()
+        bar.addWidget(self.info_label)
+        bar.addWidget(self.text_btn)
+        layout.addLayout(bar)
+
+        # テーブル本体
+        self.table = QTableView()
+        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
+        self.table.setSelectionMode(QAbstractItemView.SelectionMode.ExtendedSelection)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSortingEnabled(False)
+        self.table.setContextMenuPolicy(Qt.ContextMenuPolicy.CustomContextMenu)
+        self.table.customContextMenuRequested.connect(self._on_context_menu)
+        # ヘッダはユーザーがリサイズできるが初回はサイズフィット
+        self.table.horizontalHeader().setSectionResizeMode(
+            QHeaderView.ResizeMode.Interactive)
+        self.table.verticalHeader().setDefaultSectionSize(
+            self.fontMetrics().height() + 4)
+        layout.addWidget(self.table, 1)
+        self.setLayout(layout)
+
+        # 初期表示 + 自動判定された区切り文字を combo に反映
+        self._sync_delim_combo()
+        self._rebuild_model()
+
+        self.delim_combo.currentIndexChanged.connect(self._on_delim_changed)
+        self.header_combo.currentIndexChanged.connect(self._on_header_rows_changed)
+        self.text_btn.clicked.connect(
+            lambda: self.open_as_text_requested.emit(self.file_path or ''))
+
+    # ---- 区切り文字判定/同期 ----
+    _DELIM_BY_INDEX = [',', '\t', ';', '|']
+
+    @staticmethod
+    def _sniff_delimiter(text: str, path: str) -> str:
+        # 拡張子優先 (.tsv なら問答無用でタブ)
+        ext = os.path.splitext(path or '')[1].lower()
+        if ext == '.tsv':
+            return '\t'
+        # CRLF を LF に正規化してから判定 (Sniffer が \r を含む列頭で
+        # 誤判定するのを防ぐ)
+        sample = text[:8192].replace('\r\n', '\n').replace('\r', '\n')
+        allowed = {',', '\t', ';', '|'}
+        # まず先頭 1〜数行のヒューリスティック (各候補の出現数の最多)。
+        # Sniffer よりこちらの方が日本語 CSV では当たることが多い。
+        head_lines = [ln for ln in sample.split('\n')[:5] if ln]
+        head = head_lines[0] if head_lines else ''
+        counts = {d: head.count(d) for d in allowed}
+        best_d, best_n = max(counts.items(), key=lambda kv: kv[1])
+        if best_n > 0:
+            return best_d
+        # それでも 0 件なら csv.Sniffer に最後のチャンスを与える
+        import csv as _csv
+        try:
+            dialect = _csv.Sniffer().sniff(sample, delimiters=',\t;|')
+            if dialect.delimiter in allowed:
+                return dialect.delimiter
+        except Exception:
+            pass
+        return ','
+
+    def _sync_delim_combo(self):
+        try:
+            i = self._DELIM_BY_INDEX.index(self._delimiter)
+        except ValueError:
+            i = 0
+        self.delim_combo.blockSignals(True)
+        self.delim_combo.setCurrentIndex(i)
+        self.delim_combo.blockSignals(False)
+
+    def _on_delim_changed(self, idx: int):
+        if 0 <= idx < len(self._DELIM_BY_INDEX):
+            self._delimiter = self._DELIM_BY_INDEX[idx]
+            self._rebuild_model()
+
+    def _on_header_rows_changed(self, n: int):
+        self._header_rows = max(0, int(n))
+        self._rebuild_model()
+
+    # ---- モデル構築 ----
+    def _rebuild_model(self):
+        import csv as _csv
+        # 改行を LF に正規化 + 行リストに分割してから csv.reader へ。
+        # StringIO に CRLF をそのまま渡すと csv.reader が \r を末尾要素に
+        # 含めて、結果として「1 セルに全部入る」見た目になることがある。
+        text = self._raw_text.replace('\r\n', '\n').replace('\r', '\n')
+        # splitlines は U+2028/2029 等も切るので line ending を完全吸収する
+        lines = text.split('\n')
+        # 末尾の空行 (= 末尾改行) は除外
+        while lines and lines[-1] == '':
+            lines.pop()
+        try:
+            reader = _csv.reader(lines, delimiter=self._delimiter)
+            rows = list(reader)
+        except Exception:
+            rows = [[self._raw_text]]
+        if not rows:
+            rows = [['']]
+        # 元の列数 (パディング前) を記録しておき、 後段で不一致行を検出する
+        orig_counts = [len(r) for r in rows]
+        # 列数の最大に揃える (短い行は空文字で右パディング)
+        ncols = max(orig_counts) if orig_counts else 1
+        rows = [r + [''] * (ncols - len(r)) for r in rows]
+
+        # ヘッダ行数 N に応じて: rows[0..N) を列見出しに使い、 N>=2 は
+        # 縦に並べて '/' 連結 (多段ヘッダ CSV 対応)。 N=0 は自動列名。
+        n_header = min(self._header_rows, max(0, len(rows) - 1))
+        if n_header >= 1:
+            header_block = rows[:n_header]
+            data_rows = rows[n_header:]
+            data_orig_counts = orig_counts[n_header:]
+            headers = []
+            for c in range(ncols):
+                parts = []
+                for hr in header_block:
+                    val = str(hr[c]).strip() if c < len(hr) else ''
+                    if val and val not in parts:
+                        parts.append(val)
+                headers.append(' / '.join(parts) if parts else f"列{c+1}")
+            # 期待列数 = ヘッダ 1 行目の元の列数 (パディング前)
+            expected_cols = orig_counts[0]
+        else:
+            headers = [f"列{i+1}" for i in range(ncols)]
+            data_rows = rows
+            data_orig_counts = orig_counts
+            # ヘッダ無し時は data 行で最も出現頻度が高い列数を期待値とする
+            from collections import Counter as _Counter
+            if data_orig_counts:
+                expected_cols, _ = _Counter(data_orig_counts).most_common(1)[0]
+            else:
+                expected_cols = ncols
+
+        # 不一致行 (パディング前の原列数が期待値と異なる) のインデックス
+        mismatch_idx = {i for i, n in enumerate(data_orig_counts)
+                        if n != expected_cols}
+
+        model = QStandardItemModel(len(data_rows), ncols, self)
+        model.setHorizontalHeaderLabels([str(h) for h in headers])
+        # 縦ヘッダ (行番号) は 1-based に
+        for r, row in enumerate(data_rows):
+            for c, val in enumerate(row):
+                item = QStandardItem(str(val))
+                item.setEditable(False)
+                model.setItem(r, c, item)
+            # 不一致行の行ヘッダを赤くして、 ツールチップに何列だったか表示
+            if r in mismatch_idx:
+                cnt = data_orig_counts[r]
+                model.setHeaderData(
+                    r, Qt.Orientation.Vertical,
+                    QColor('#E53935'),
+                    Qt.ItemDataRole.ForegroundRole,
+                )
+                # ヘッダラベル末尾に ⚠ を付けて視認性を上げる
+                model.setHeaderData(
+                    r, Qt.Orientation.Vertical,
+                    f"{r + 1} ⚠",
+                    Qt.ItemDataRole.DisplayRole,
+                )
+                model.setHeaderData(
+                    r, Qt.Orientation.Vertical,
+                    f"列数不一致: {cnt} 列 (期待 {expected_cols} 列)",
+                    Qt.ItemDataRole.ToolTipRole,
+                )
+        self.table.setModel(model)
+        # 初回 / リビルド時に列幅をフィット (Interactive モードでは
+        # 一度 resize すれば以後はユーザー操作で変更可能)
+        self.table.resizeColumnsToContents()
+        # 極端に広い列は読みにくいので上限を設ける
+        for c in range(ncols):
+            if self.table.columnWidth(c) > 400:
+                self.table.setColumnWidth(c, 400)
+
+        # 警告メッセージ部分は色分けして目立たせる
+        n_bad = len(mismatch_idx)
+        if n_bad:
+            warn = (
+                f"<span style='color:#E53935; font-weight:700;'>"
+                f"⚠ {n_bad} 行が列数不一致 (期待 {expected_cols} 列)</span>"
+            )
+        else:
+            warn = ''
+        self.info_label.setText(
+            f"{len(data_rows)} 行 × {ncols} 列    "
+            f"[区切: {self._delimiter_label()} / ヘッダ {n_header} 行]"
+            + (f"    {warn}" if warn else '')
+        )
+
+    def _delimiter_label(self) -> str:
+        return {',': 'カンマ', '\t': 'タブ', ';': 'セミコロン', '|': 'パイプ'}.get(
+            self._delimiter, repr(self._delimiter))
+
+    # ---- 右クリックメニュー (コピー) ----
+    def _on_context_menu(self, pos):
+        menu = QMenu(self)
+        act_cell = QAction("セルをコピー(&C)", self)
+        act_cell.triggered.connect(self._copy_selection_cells)
+        menu.addAction(act_cell)
+        act_row  = QAction("選択行を TSV でコピー(&R)", self)
+        act_row.triggered.connect(self._copy_selection_rows)
+        menu.addAction(act_row)
+        menu.addSeparator()
+        act_all  = QAction("全行を TSV でコピー(&A)", self)
+        act_all.triggered.connect(self._copy_all_tsv)
+        menu.addAction(act_all)
+        menu.exec(self.table.viewport().mapToGlobal(pos))
+
+    def _copy_selection_cells(self):
+        sel = self.table.selectionModel()
+        if sel is None:
+            return
+        cells = [idx.data() or '' for idx in sel.selectedIndexes()]
+        QApplication.clipboard().setText('\n'.join(cells))
+
+    def _copy_selection_rows(self):
+        sel = self.table.selectionModel()
+        if sel is None:
+            return
+        rows = sorted({idx.row() for idx in sel.selectedRows() or sel.selectedIndexes()})
+        if not rows:
+            return
+        m = self.table.model()
+        lines = []
+        for r in rows:
+            lines.append('\t'.join(
+                str(m.index(r, c).data() or '') for c in range(m.columnCount())
+            ))
+        QApplication.clipboard().setText('\n'.join(lines))
+
+    def _copy_all_tsv(self):
+        m = self.table.model()
+        if m is None:
+            return
+        lines = []
+        headers = [m.headerData(c, Qt.Orientation.Horizontal) for c in range(m.columnCount())]
+        lines.append('\t'.join(str(h or '') for h in headers))
+        for r in range(m.rowCount()):
+            lines.append('\t'.join(
+                str(m.index(r, c).data() or '') for c in range(m.columnCount())
+            ))
+        QApplication.clipboard().setText('\n'.join(lines))
+
+
 class EditorTab(QWidget):
     content_changed = pyqtSignal()
 
@@ -3791,6 +4098,9 @@ class EditorTab(QWidget):
         self.filename = filename
         self.file_path = file_path
         self.is_modified = False
+        # 検出されたエンコーディング (load 時に _load_file から設定。
+        # 新規/未読込タブは未確定 = 空文字)
+        self.encoding = ''
 
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
@@ -4384,6 +4694,9 @@ class MainWindow(QMainWindow):
         self._setup_toolbar()
 
         self.pos_label = QLabel("行: 1  列: 1")
+        # 検出エンコーディング表示 (load 時に _update_encoding_label で更新)
+        self.enc_label = QLabel("文字: —")
+        self.enc_label.setToolTip("現在のタブで検出された文字コード")
         # 言語切替コンボ (ステータスバーで現在の言語を確認・変更)
         self.lang_combo = QComboBox()
         self.lang_combo.addItems(SUPPORTED_LANGUAGES)
@@ -4392,6 +4705,7 @@ class MainWindow(QMainWindow):
         self.lang_combo.currentTextChanged.connect(self._on_language_changed)
         sb = QStatusBar()
         sb.addPermanentWidget(self.pos_label)
+        sb.addPermanentWidget(self.enc_label)
         sb.addPermanentWidget(QLabel("言語:"))
         sb.addPermanentWidget(self.lang_combo)
         self.setStatusBar(sb)
@@ -4574,6 +4888,14 @@ class MainWindow(QMainWindow):
         act.setShortcut(QKeySequence("Ctrl+T"))
         act.triggered.connect(self._toggle_ftp)
         vm.addAction(act)
+        vm.addSeparator()
+        # CSV のテキスト編集 ⇔ グリッド表示 トグル (現在のタブが CSV/TSV
+        # ファイルの時だけ aboutToShow で有効化される)
+        self._toggle_csv_view_action = QAction("📊 CSV グリッド表示に切替(&G)", self)
+        self._toggle_csv_view_action.setShortcut(QKeySequence("F6"))
+        self._toggle_csv_view_action.triggered.connect(self._toggle_csv_view)
+        vm.addAction(self._toggle_csv_view_action)
+        vm.aboutToShow.connect(self._sync_csv_view_action)
         # Grep パネルは編集メニュー側 (検索系) に既に登録済みのため
         # 表示メニューには置かない。チェック式と相性が悪く、検索バーとの
         # 排他切替で状態が同期しなくなる問題を防ぐ。
@@ -4833,6 +5155,15 @@ class MainWindow(QMainWindow):
             QTreeWidget::item {{ padding: 1px 0; }}
             QTreeWidget::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
             QTreeWidget::item:hover {{ background: {t['control_hover']}; }}
+            QTableView {{
+                background: {t['editor_bg']}; color: {t['text']};
+                gridline-color: {t['border']};
+                alternate-background-color: {t['panel_bg']};
+                selection-background-color: {t['selection']};
+                selection-color: {t['text']};
+                border: 1px solid {t['border']};
+            }}
+            QTableView::item:selected {{ background: {t['selection']}; color: {t['text']}; }}
             QHeaderView::section {{
                 background: {t['control_bg']}; color: {t['text']};
                 border: none; padding: 2px 4px;
@@ -4923,6 +5254,7 @@ class MainWindow(QMainWindow):
             "Pythonファイル (*.py *.pyw);;"
             "JavaScriptファイル (*.js *.ts *.jsx *.tsx);;"
             "テキストファイル (*.txt *.md);;"
+            "CSV/TSV (*.csv *.tsv);;"
             "画像ファイル (*.png *.jpg *.jpeg *.gif *.bmp *.webp *.svg *.ico *.tif *.tiff)",
         )
         for path in paths:
@@ -4933,21 +5265,27 @@ class MainWindow(QMainWindow):
     _HUGE_FILE_SIZE  = 10_000_000   # 10MB: diff/undo も無効化
 
     @staticmethod
-    def _read_text_auto_encoding(path: str) -> str:
-        """ファイルをエンコーディング自動判定で読み込む。
+    def _detect_text_encoding(path: str) -> tuple[str, str]:
+        """ファイルをエンコーディング自動判定で読み込み (内容, 検出エンコ名) を返す。
         UTF-8 → UTF-8-SIG (BOM) → CP932 (Windows-31J, Shift_JIS) → EUC-JP の
         順に strict で試し、最初に成功したエンコーディングで返す。
-        全部失敗したら最後の手段として UTF-8 errors='replace'。
+        全部失敗したら最後の手段として UTF-8 errors='replace' (エンコ名は
+        'UTF-8 (replace)' とする)。
         Windows + Excel 由来の日本語 CSV は CP932 が多い。
         """
         with open(path, 'rb') as f:
             raw = f.read()
         for enc in ('utf-8-sig', 'utf-8', 'cp932', 'shift_jis', 'euc-jp'):
             try:
-                return raw.decode(enc)
+                return raw.decode(enc), enc
             except UnicodeDecodeError:
                 continue
-        return raw.decode('utf-8', errors='replace')
+        return raw.decode('utf-8', errors='replace'), 'UTF-8 (replace)'
+
+    @classmethod
+    def _read_text_auto_encoding(cls, path: str) -> str:
+        """互換: 内容のみを返す。"""
+        return cls._detect_text_encoding(path)[0]
 
     def _load_file(self, path):
         try:
@@ -4966,7 +5304,19 @@ class MainWindow(QMainWindow):
                 self._watch_path(path)
                 _push_recent_file(path)
                 return
-            content = self._read_text_auto_encoding(path)
+            content, enc = self._detect_text_encoding(path)
+            # CSV/TSV はグリッド表示 (CsvTab) で開く。
+            # 「テキストとして開き直す」は CsvTab のシグナル経由。
+            if _is_csv_path(path):
+                tab = CsvTab(path, filename, content, enc)
+                tab.open_as_text_requested.connect(
+                    lambda p, _t=tab: self._reopen_csv_as_text(_t, p))
+                idx = self.tabs.addTab(tab, f"📊 {filename}")
+                self.tabs.setCurrentIndex(idx)
+                self._watch_path(path)
+                _push_recent_file(path)
+                self._update_encoding_label()
+                return
             # 大ファイル時は UI フリーズ要因 (rehighlight / diff / undo) を抑制
             skip_hl = size >= self._LARGE_FILE_SIZE
             huge    = size >= self._HUGE_FILE_SIZE
@@ -4976,6 +5326,7 @@ class MainWindow(QMainWindow):
                 disable_diff=huge,
                 disable_undo=huge,
             )
+            tab.encoding = enc
             self._connect_tab(tab)
             idx = self.tabs.addTab(tab, filename)
             self.tabs.setCurrentIndex(idx)
@@ -4983,6 +5334,7 @@ class MainWindow(QMainWindow):
             self._restore_tab_bookmarks(tab)
             self._watch_path(path)
             _push_recent_file(path)
+            self._update_encoding_label()
             if skip_hl:
                 mb = size / (1024 * 1024)
                 msg = (
@@ -5027,7 +5379,7 @@ class MainWindow(QMainWindow):
             )
             return
         try:
-            content = self._read_text_auto_encoding(local_path)
+            content, enc = self._detect_text_encoding(local_path)
         except Exception as e:
             QMessageBox.critical(self, "エラー", f"ファイルを開けませんでした:\n{e}")
             return
@@ -5048,11 +5400,13 @@ class MainWindow(QMainWindow):
             tab = self.tabs.widget(existing_idx)
             cur_block = tab.editor.textCursor().blockNumber()
             tab.reload_from_disk(content)
+            tab.encoding = enc
             if size < self._LARGE_FILE_SIZE:
                 tab.highlighter.rehighlight()
             # スクロール位置を元の行に近づける
             self._jump_to_line(tab.editor, cur_block + 1)
             self.tabs.setCurrentIndex(existing_idx)
+            self._update_encoding_label()
             self.statusBar().showMessage(
                 f"[FTP] {filename} をリロードしました", 3000
             )
@@ -5067,6 +5421,7 @@ class MainWindow(QMainWindow):
             disable_diff=huge,
             disable_undo=huge,
         )
+        tab.encoding = enc
         self._connect_tab(tab)
         idx = self.tabs.addTab(tab, f"[FTP] {filename}")
         self.tabs.setCurrentIndex(idx)
@@ -5074,6 +5429,7 @@ class MainWindow(QMainWindow):
         self._restore_tab_bookmarks(tab)
         self._watch_path(local_path)
         _push_recent_file(local_path)
+        self._update_encoding_label()
 
     def _is_local_file_modified(self, local_path: str) -> bool:
         """指定ローカルパスに紐づくタブで未保存編集があるか"""
@@ -6069,9 +6425,123 @@ class MainWindow(QMainWindow):
     def _on_tab_changed(self, _):
         self._update_cursor()
         self._sync_language_combo()
+        self._update_encoding_label()
         # 検索バーは各タブが個別に持つので、タブ切替時にトグル状態を同期
         if hasattr(self, '_sync_toolbar_states'):
             self._sync_toolbar_states()
+
+    def _sync_csv_view_action(self):
+        """表示メニュー展開時、 現在のタブの種類に応じて切替アクションのラベルと
+        有効/無効を設定する。"""
+        if not hasattr(self, '_toggle_csv_view_action'):
+            return
+        w = self.tabs.currentWidget()
+        if isinstance(w, CsvTab):
+            self._toggle_csv_view_action.setText("📝 テキスト編集に切替(&G)")
+            self._toggle_csv_view_action.setEnabled(True)
+        elif isinstance(w, EditorTab) and w.file_path and _is_csv_path(w.file_path):
+            self._toggle_csv_view_action.setText("📊 CSV グリッド表示に切替(&G)")
+            self._toggle_csv_view_action.setEnabled(True)
+        else:
+            self._toggle_csv_view_action.setText("📊 CSV グリッド表示に切替(&G)")
+            self._toggle_csv_view_action.setEnabled(False)
+
+    def _toggle_csv_view(self):
+        """現在のタブが CSV ファイルなら EditorTab ⇄ CsvTab を切替える。
+        編集中の未保存テキストはメモリ上で受け渡し (ディスクには書き込まない)。
+        """
+        w = self.tabs.currentWidget()
+        if isinstance(w, CsvTab):
+            # グリッド → テキスト編集 (既存の経路を再利用)
+            self._reopen_csv_as_text(w, w.file_path or '')
+            return
+        if isinstance(w, EditorTab) and w.file_path and _is_csv_path(w.file_path):
+            # エディタ → グリッド: 現在のテキスト内容で CsvTab を生成
+            current_text = w.editor.toPlainText()
+            enc = getattr(w, 'encoding', '') or 'utf-8'
+            path = w.file_path
+            filename = w.filename or os.path.basename(path)
+            # 既存の EditorTab を閉じる前に未保存編集があれば確認
+            if w.is_modified and self._tab_actually_modified(w):
+                ans = QMessageBox.question(
+                    self, "未保存の変更",
+                    "未保存の編集があります。\n"
+                    "グリッドに切替えると編集はファイルに保存されないまま\n"
+                    "メモリ上でグリッド表示にだけ反映されます。\n"
+                    "切替えますか？ (キャンセルで EditorTab に留まる)",
+                    QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                    QMessageBox.StandardButton.Yes,
+                )
+                if ans != QMessageBox.StandardButton.Yes:
+                    return
+            idx = self.tabs.indexOf(w)
+            if idx >= 0:
+                self.tabs.removeTab(idx)
+                w.deleteLater()
+            tab = CsvTab(path, filename, current_text, enc)
+            tab.open_as_text_requested.connect(
+                lambda p, _t=tab: self._reopen_csv_as_text(_t, p))
+            new_idx = self.tabs.addTab(tab, f"📊 {filename}")
+            self.tabs.setCurrentIndex(new_idx)
+            self._update_encoding_label()
+
+    def _reopen_csv_as_text(self, csv_tab, path: str):
+        """CsvTab → EditorTab に切替。 CsvTab の _raw_text を使うので、
+        グリッド → エディタ → グリッドの往復で内容が保たれる
+        (= EditorTab で編集 → グリッドへ戻る → エディタへ戻るで編集消失しない)。
+        ファイルがディスクに存在しない (= 新規 CsvTab) ケースもサポート。"""
+        try:
+            # CsvTab 内のテキスト (= 表示中の内容) をそのまま EditorTab へ渡す
+            content = getattr(csv_tab, '_raw_text', '') or ''
+            enc = getattr(csv_tab, 'encoding', '') or 'utf-8'
+            filename = getattr(csv_tab, 'filename', '') or (
+                os.path.basename(path) if path else '無題.csv')
+            # 既存 CsvTab を閉じる
+            for i in range(self.tabs.count()):
+                if self.tabs.widget(i) is csv_tab:
+                    self.tabs.removeTab(i)
+                    csv_tab.deleteLater()
+                    break
+            # 大ファイル抑制は _raw_text 長で代用
+            size = len(content.encode('utf-8', errors='replace'))
+            skip_hl = size >= self._LARGE_FILE_SIZE
+            huge    = size >= self._HUGE_FILE_SIZE
+            tab = EditorTab(
+                content, filename, path if path else None,
+                skip_initial_highlight=skip_hl,
+                disable_diff=huge,
+                disable_undo=huge,
+            )
+            tab.encoding = enc
+            self._connect_tab(tab)
+            idx = self.tabs.addTab(tab, filename)
+            self.tabs.setCurrentIndex(idx)
+            tab.editor.document().setModified(False)
+            if path:
+                self._restore_tab_bookmarks(tab)
+                self._watch_path(path)
+            self._update_encoding_label()
+        except Exception as e:
+            QMessageBox.critical(self, "エラー",
+                                 f"テキストとして開けませんでした:\n{e}")
+
+    def _update_encoding_label(self):
+        """現在のタブの検出エンコーディングをステータスバーに反映。
+        未確定 / 画像タブ / 無題タブは '—' を表示。"""
+        if not hasattr(self, 'enc_label'):
+            return
+        tab = self.current_tab()
+        enc = getattr(tab, 'encoding', '') if tab else ''
+        # 表示は短く: utf-8-sig → UTF-8 BOM, utf-8 → UTF-8, cp932 → CP932
+        labels = {
+            'utf-8':     'UTF-8',
+            'utf-8-sig': 'UTF-8 BOM',
+            'cp932':     'CP932',
+            'shift_jis': 'Shift_JIS',
+            'euc-jp':    'EUC-JP',
+        }
+        text = labels.get(enc, enc) if enc else '—'
+        self.enc_label.setText(f"文字: {text}")
 
     def _sync_language_combo(self):
         """現在のタブの言語をステータスバーのコンボに反映 (シグナル抑止)"""
