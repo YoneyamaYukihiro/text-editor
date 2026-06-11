@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.20"
+__version__ = "1.1.21"
 
 import sys
 import os
@@ -135,6 +135,13 @@ _DEFAULT_SETTINGS = {
     'theme':            'Dark',
     # ログ→ソースジャンプ用に登録するソースルートDIRの一覧 (再帰検索の起点)
     'source_dirs':      [],
+    # FTP ファイル一覧の時刻表示方式:
+    #   'local' (推奨) : サーバー出力 (LIST / MLSD) を UTC とみなして
+    #                    OS のローカル TZ へ変換 (FFFTP の TZ=GMT 設定 +
+    #                    UTC→JST 変換と同じ挙動。 大半のサーバーが UTC 報告)
+    #   'raw'          : LIST / MLSD 値を加工せず生表示
+    #                    (サーバーが既にローカル TZ で報告している環境向け)
+    'ftp_time_mode':    'local',
 }
 
 
@@ -2287,10 +2294,12 @@ _FTP_MONTH_MAP = {
 }
 
 
-def _ftp_list_date_to_iso(date_parts) -> str:
+def _ftp_list_date_to_iso(date_parts, convert_to_local: bool = False) -> str:
     """ftp LIST 出力の月日時刻 3 要素 (例: ['May','22','16:51'] や
     ['May','22','2025']) を 'YYYY/MM/DD HH:MM' に変換する。
     LIST には秒が含まれないので秒は表示しない。
+    convert_to_local=True なら、 LIST 値を UTC とみなして OS のローカル TZ に
+    変換する (大半の Unix FTP は LIST を UTC で返す)。
     形式が解析できない場合は元の連結文字列を返す。"""
     if len(date_parts) < 3:
         return ' '.join(date_parts)
@@ -2303,6 +2312,8 @@ def _ftp_list_date_to_iso(date_parts) -> str:
     except ValueError:
         return ' '.join(date_parts)
     import datetime as _dt
+    import calendar as _cal
+    import time as _time
     now = _dt.datetime.now()
     if ':' in time_or_year:
         # 時刻形式 → 年は省略されているので推測 (= 現在 / 1年前)
@@ -2320,14 +2331,46 @@ def _ftp_list_date_to_iso(date_parts) -> str:
                 year -= 1
         except ValueError:
             pass
+        if convert_to_local:
+            try:
+                naive_utc = _dt.datetime(year, month, day, hh, mm)
+                utc_seconds = _cal.timegm(naive_utc.timetuple())
+                local = _time.localtime(utc_seconds)
+                return _time.strftime('%Y/%m/%d %H:%M', local)
+            except Exception:
+                pass
         return f"{year:04d}/{month:02d}/{day:02d} {hh:02d}:{mm:02d}"
     else:
-        # 年指定形式 (時刻不明)
+        # 年指定形式 (時刻不明)。 時刻が無いので TZ 変換は意味がない。
         try:
             year = int(time_or_year)
         except ValueError:
             return ' '.join(date_parts)
         return f"{year:04d}/{month:02d}/{day:02d} 00:00"
+
+
+def _ftp_mlsd_modify_to_local(modify: str, convert_to_local: bool = True) -> str:
+    """MLSD の modify (RFC 3659: 'YYYYMMDDHHMMSS[.fff]' UTC) を
+    'YYYY/MM/DD HH:MM' にフォーマット。 convert_to_local=True なら
+    UTC とみなして OS のローカル TZ に変換、 False なら数値部だけを
+    そのまま整形 (= サーバー値生表示)。 パース失敗時は元文字列を返す。
+    PyInstaller 等で `datetime.astimezone()` がローカル TZ を引けない
+    (UTC のままになる) ケースがあるため、 calendar.timegm + time.localtime
+    で OS のローカル TZ を経由して変換する。"""
+    if not modify:
+        return ''
+    import calendar as _cal
+    import datetime as _dt
+    import time as _time
+    try:
+        dt_utc_naive = _dt.datetime.strptime(modify[:14], '%Y%m%d%H%M%S')
+        if convert_to_local:
+            utc_seconds = _cal.timegm(dt_utc_naive.timetuple())
+            local_struct = _time.localtime(utc_seconds)
+            return _time.strftime('%Y/%m/%d %H:%M', local_struct)
+        return dt_utc_naive.strftime('%Y/%m/%d %H:%M')
+    except Exception:
+        return modify
 
 
 def _fmt_bytes(n: int) -> str:
@@ -2677,39 +2720,84 @@ class FTPPanel(QWidget):
                 item.setForeground(QColor("#6897BB"))
                 self.file_list.addItem(item)
 
-            lines = []
-            self.ftp.retrlines('LIST', lines.append)
-            for line in lines:
-                parts = line.split()
-                if len(parts) < 9:
-                    continue
-                is_dir = parts[0].startswith('d')
-                name = ' '.join(parts[8:])
-                if is_dir:
-                    item = QListWidgetItem(f"📁 {name}")
-                    item.setData(Qt.ItemDataRole.UserRole, ('dir', name))
-                    item.setForeground(QColor("#6897BB"))
-                    item.setToolTip(name)
-                else:
-                    item = QListWidgetItem(f"📄 {name}")
-                    item.setData(Qt.ItemDataRole.UserRole, ('file', name))
-                    # LIST (ls -l 形式): 5列目=バイト数, 6-8列目=月 日 時刻/年
-                    size_str = ''
-                    try:
-                        size_str = _fmt_bytes(int(parts[4]))
-                    except (ValueError, IndexError):
-                        size_str = ''
-                    # LIST の "May 22 16:51" / "May 22 2025" を
-                    # "YYYY/MM/DD HH:MM:00" 形式に変換 (秒は LIST に無いので 00)
-                    date_str = _ftp_list_date_to_iso(parts[5:8])
-                    # 2行目メタ: 「サイズ · 日時」(取得できた要素のみ連結)
-                    meta = ' · '.join(s for s in (size_str, date_str) if s)
-                    if meta:
-                        item.setData(Qt.ItemDataRole.UserRole + 1, meta)
-                        item.setToolTip(f"{name}\n{meta}")
-                    else:
+            # 時刻表示モード:
+            #  - 'local' (デフォルト): サーバー値 (LIST/MLSD) を UTC とみなして
+            #             OS のローカル TZ に変換。 FFFTP の TZ=GMT 設定と同じ。
+            #  - 'raw'   : サーバー値をそのまま表示 (既にローカル TZ で報告する
+            #             サーバー向け)
+            time_mode = SETTINGS.get('ftp_time_mode', 'local')
+            convert_to_local = (time_mode == 'local')
+            # MLSD は raw でも local でも試す価値あり (取れたら時刻精度が秒単位)。
+            try:
+                mlsd_entries = list(self.ftp.mlsd())
+            except Exception:
+                mlsd_entries = None
+
+            if mlsd_entries is not None:
+                for name, facts in mlsd_entries:
+                    if name in ('.', '..'):
+                        continue
+                    typ = facts.get('type', '')
+                    is_dir = typ in ('dir', 'cdir', 'pdir')
+                    if is_dir:
+                        item = QListWidgetItem(f"📁 {name}")
+                        item.setData(Qt.ItemDataRole.UserRole, ('dir', name))
+                        item.setForeground(QColor("#6897BB"))
                         item.setToolTip(name)
-                self.file_list.addItem(item)
+                    else:
+                        item = QListWidgetItem(f"📄 {name}")
+                        item.setData(Qt.ItemDataRole.UserRole, ('file', name))
+                        size_str = ''
+                        try:
+                            size_str = _fmt_bytes(int(facts.get('size', '0')))
+                        except (ValueError, TypeError):
+                            size_str = ''
+                        date_str = _ftp_mlsd_modify_to_local(
+                            facts.get('modify', ''),
+                            convert_to_local=convert_to_local,
+                        )
+                        meta = ' · '.join(s for s in (size_str, date_str) if s)
+                        if meta:
+                            item.setData(Qt.ItemDataRole.UserRole + 1, meta)
+                            item.setToolTip(f"{name}\n{meta}")
+                        else:
+                            item.setToolTip(name)
+                    self.file_list.addItem(item)
+            else:
+                lines = []
+                self.ftp.retrlines('LIST', lines.append)
+                for line in lines:
+                    parts = line.split()
+                    if len(parts) < 9:
+                        continue
+                    is_dir = parts[0].startswith('d')
+                    name = ' '.join(parts[8:])
+                    if is_dir:
+                        item = QListWidgetItem(f"📁 {name}")
+                        item.setData(Qt.ItemDataRole.UserRole, ('dir', name))
+                        item.setForeground(QColor("#6897BB"))
+                        item.setToolTip(name)
+                    else:
+                        item = QListWidgetItem(f"📄 {name}")
+                        item.setData(Qt.ItemDataRole.UserRole, ('file', name))
+                        # LIST (ls -l 形式): 5列目=バイト数, 6-8列目=月 日 時刻/年
+                        size_str = ''
+                        try:
+                            size_str = _fmt_bytes(int(parts[4]))
+                        except (ValueError, IndexError):
+                            size_str = ''
+                        # LIST の "May 22 16:51" / "May 22 2025" を
+                        # "YYYY/MM/DD HH:MM" 形式に変換 (秒は LIST に無い)。
+                        # 'local' モードなら LIST 値を UTC とみなして変換
+                        date_str = _ftp_list_date_to_iso(
+                            parts[5:8], convert_to_local=convert_to_local)
+                        meta = ' · '.join(s for s in (size_str, date_str) if s)
+                        if meta:
+                            item.setData(Qt.ItemDataRole.UserRole + 1, meta)
+                            item.setToolTip(f"{name}\n{meta}")
+                        else:
+                            item.setToolTip(name)
+                    self.file_list.addItem(item)
         except Exception as e:
             QMessageBox.warning(self, "エラー", str(e))
 
@@ -4459,6 +4547,26 @@ class SettingsDialog(QDialog):
             self.theme_combo.setCurrentIndex(i)
         theme_row.addWidget(self.theme_combo, 1)
         v.addLayout(theme_row)
+
+        v.addWidget(self._section_label("FTP ファイル一覧の時刻表示"))
+        ftp_tz_row = QHBoxLayout()
+        ftp_tz_row.addWidget(QLabel("方式:"))
+        self.ftp_tz_combo = QComboBox()
+        self.ftp_tz_combo.addItem("ローカル時刻に変換 (推奨 / FFFTP 互換)", 'local')
+        self.ftp_tz_combo.addItem("サーバー値のまま表示", 'raw')
+        cur_mode = SETTINGS.get('ftp_time_mode', 'local')
+        for ix in range(self.ftp_tz_combo.count()):
+            if self.ftp_tz_combo.itemData(ix) == cur_mode:
+                self.ftp_tz_combo.setCurrentIndex(ix)
+                break
+        self.ftp_tz_combo.setToolTip(
+            "ローカル時刻に変換 (推奨): LIST/MLSD のサーバー値を UTC と\n"
+            "みなして OS の TZ に変換。 FFFTP の TZ=GMT 設定と同じ。\n\n"
+            "サーバー値のまま表示: 変換せず生表示。 サーバーが既にローカル\n"
+            "TZ で時刻を報告する環境向け。"
+        )
+        ftp_tz_row.addWidget(self.ftp_tz_combo, 1)
+        v.addLayout(ftp_tz_row)
         v.addStretch()
         # このタブ (フォント・テーマ) のみをデフォルトに戻すボタン
         reset_row = QHBoxLayout()
@@ -4595,6 +4703,10 @@ class SettingsDialog(QDialog):
         for k, sp in self._spinners.items():
             SETTINGS[k] = sp.value()
         SETTINGS['theme'] = self.theme_combo.currentText()
+        if hasattr(self, 'ftp_tz_combo'):
+            mode = self.ftp_tz_combo.currentData()
+            if mode in ('raw', 'local'):
+                SETTINGS['ftp_time_mode'] = mode
         SETTINGS['source_dirs'] = [
             self.source_list.item(i).text()
             for i in range(self.source_list.count())
@@ -4884,11 +4996,11 @@ class MainWindow(QMainWindow):
 
         # 表示メニュー
         vm = mb.addMenu("表示(&V)")
-        act = QAction("FTPパネル(&T)", self)
-        act.setCheckable(True)
-        act.setShortcut(QKeySequence("Ctrl+T"))
-        act.triggered.connect(self._toggle_ftp)
-        vm.addAction(act)
+        self._ftp_menu_action = QAction("FTPパネル(&T)", self)
+        self._ftp_menu_action.setCheckable(True)
+        self._ftp_menu_action.setShortcut(QKeySequence("Ctrl+T"))
+        self._ftp_menu_action.triggered.connect(self._toggle_ftp)
+        vm.addAction(self._ftp_menu_action)
         vm.addSeparator()
         # CSV のテキスト編集 ⇔ グリッド表示 トグル (現在のタブが CSV/TSV
         # ファイルの時だけ aboutToShow で有効化される)
@@ -6420,11 +6532,16 @@ class MainWindow(QMainWindow):
         else:
             self.ftp_panel.show()
             self._ensure_ftp_width()
-        # ツールバーのチェック状態を実状態に同期
-        if hasattr(self, '_ftp_toolbar_action'):
-            self._ftp_toolbar_action.blockSignals(True)
-            self._ftp_toolbar_action.setChecked(self.ftp_panel.isVisible())
-            self._ftp_toolbar_action.blockSignals(False)
+        # ツールバー + メニュー両方のチェック状態を実状態に同期 (片方だけだと
+        # ツールバーアイコンで開いた後にメニューを開くとチェックが外れていて
+        # 操作がズレる)
+        visible = self.ftp_panel.isVisible()
+        for attr in ('_ftp_toolbar_action', '_ftp_menu_action'):
+            a = getattr(self, attr, None)
+            if a is not None:
+                a.blockSignals(True)
+                a.setChecked(visible)
+                a.blockSignals(False)
 
     def _ensure_ftp_width(self, target: int = 260):
         """左サイドバー(FTP)表示時に幅を確保する。
@@ -6470,7 +6587,13 @@ class MainWindow(QMainWindow):
 
     def _sync_csv_view_action(self):
         """表示メニュー展開時、 現在のタブの種類に応じて切替アクションのラベルと
-        有効/無効を設定する。"""
+        有効/無効を設定する。 ついでに FTPパネル の checked 状態も同期。"""
+        # FTP メニューチェックを実状態に同期 (ツールバーアイコンで開閉した時の
+        # 状態ズレ防止)
+        if hasattr(self, '_ftp_menu_action') and hasattr(self, 'ftp_panel'):
+            self._ftp_menu_action.blockSignals(True)
+            self._ftp_menu_action.setChecked(self.ftp_panel.isVisible())
+            self._ftp_menu_action.blockSignals(False)
         if not hasattr(self, '_toggle_csv_view_action'):
             return
         w = self.tabs.currentWidget()
