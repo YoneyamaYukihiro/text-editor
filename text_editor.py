@@ -8840,6 +8840,20 @@ class SqlExtractDialog(QDialog):
         )
         db_exec_btn.clicked.connect(self._open_db_execute)
         preview_header.addWidget(db_exec_btn)
+
+        # 📤 SoraDB (別プロセス) でSQL実行: 長時間クエリ中も Sora が固まらない、
+        # 並列に複数 SQL を確認したい場合に有効
+        soradb_btn = QPushButton("📤 SoraDB で実行")
+        soradb_btn.setToolTip(
+            "現在プレビュー中のSQLを別アプリ Sora DB で実行します\n"
+            "(別プロセスのため、 Sora は固まらず、 複数 SQL を並列に確認可)"
+        )
+        soradb_btn.setStyleSheet(
+            "QPushButton { background:#3a4a6e; color:#e0e6f0; padding:2px 10px; }"
+            "QPushButton:hover { background:#4a5a8e; }"
+        )
+        soradb_btn.clicked.connect(self._open_in_sora_db)
+        preview_header.addWidget(soradb_btn)
         rl.addLayout(preview_header)
 
         self.preview = QPlainTextEdit()
@@ -9128,6 +9142,62 @@ class SqlExtractDialog(QDialog):
         self._db_dialog = dlg
         dlg.destroyed.connect(lambda _=None: setattr(self, '_db_dialog', None))
         dlg.show()
+
+    def _open_in_sora_db(self):
+        """現在プレビュー中の SQL を別プロセスの Sora DB に渡して起動する。
+        Sora DB は --profile / --query 引数で初期 SQL とプロファイルを受け取る。
+        EXE 配布時は兄弟フォルダ / 同階層の 'Sora DB' を探索、
+        開発時は同フォルダの sora_db.py を sys.executable で起動する。"""
+        sql = self.preview.toPlainText().strip()
+        if not sql:
+            QMessageBox.information(self, "SQL未選択",
+                "実行するSQLが選択されていません。")
+            return
+        # 親 (MainWindow) から起動元プロファイル名を取得
+        default_profile = ''
+        parent = self.parent()
+        if parent is not None and hasattr(parent, '_origin_profile'):
+            default_profile = getattr(parent, '_origin_profile', '') or ''
+
+        import subprocess as _sp
+        try:
+            if getattr(sys, 'frozen', False):
+                exe_dir = os.path.dirname(sys.executable)
+                parent_dir = os.path.dirname(exe_dir)
+                candidates = [
+                    os.path.join(exe_dir, "Sora DB.exe"),
+                    os.path.join(exe_dir, "Sora DB", "Sora DB.exe"),
+                    os.path.join(parent_dir, "Sora DB", "Sora DB.exe"),
+                ]
+                soradb_exe = next((p for p in candidates if os.path.isfile(p)), None)
+                if soradb_exe is None:
+                    QMessageBox.warning(
+                        self, "Sora DB が見つかりません",
+                        "Sora DB.exe が見つかりません。\n探した場所:\n  "
+                        + "\n  ".join(candidates) + "\n\n"
+                        "EXE版を使う場合は同じフォルダ (または兄弟フォルダ) に\n"
+                        "Sora DB を配置してください。",
+                    )
+                    return
+                cmd = [soradb_exe]
+                cwd = os.path.dirname(soradb_exe)
+            else:
+                soradb_script = os.path.join(
+                    os.path.dirname(os.path.abspath(__file__)), 'sora_db.py'
+                )
+                if not os.path.isfile(soradb_script):
+                    QMessageBox.warning(self, "Sora DB が見つかりません",
+                                        f"開発スクリプトが無い: {soradb_script}")
+                    return
+                cmd = [sys.executable, soradb_script]
+                cwd = os.path.dirname(soradb_script)
+            cmd += ['--query', sql]
+            if default_profile:
+                cmd += ['--profile', default_profile]
+            _sp.Popen(cmd, cwd=cwd)
+        except Exception as e:
+            QMessageBox.critical(self, "起動エラー",
+                                 f"Sora DB の起動に失敗しました:\n{type(e).__name__}: {e}")
 
 
 # ---------------------------------------------------------------------------
