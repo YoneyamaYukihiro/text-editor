@@ -364,9 +364,25 @@ class MainWindow(QMainWindow):
         self.save_cmd_btn.setAutoDefault(False)
         self.save_cmd_btn.clicked.connect(self._on_save_cmd)
         cs_btn_row.addWidget(self.save_cmd_btn)
+        self.autosave_label = QLabel(
+            " ※ 編集中は 500ms 後に自動でこのプロファイルへ保存されます"
+        )
+        self.autosave_label.setStyleSheet("color:#888; font-size:11px;")
+        cs_btn_row.addWidget(self.autosave_label)
         cs_btn_row.addStretch()
         cs_l.addLayout(cs_btn_row)
         root.addWidget(self.cmd_section, 0)
+
+        # 自動保存タイマー (textChanged 後 500ms で _on_save_cmd を発火)
+        from PyQt6.QtCore import QTimer
+        self._cmd_save_timer = QTimer(self)
+        self._cmd_save_timer.setSingleShot(True)
+        self._cmd_save_timer.setInterval(500)
+        self._cmd_save_timer.timeout.connect(self._autosave_cmd)
+        self.cmd_edit.textChanged.connect(self._cmd_save_timer.start)
+        # プロファイル切替直後の textChanged (= setPlainText 由来) は
+        # 自動保存しない (= "ロード=書き込み" の自己ループ防止)
+        self._loading_cmd = False
 
         # 中央: 上=クエリエディタ / 下=結果
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -455,13 +471,31 @@ class MainWindow(QMainWindow):
         未設定なら空欄のまま (= プリセット選択を促す)。"""
         prof = self._profiles.get(name, {})
         cmd = prof.get('db_exec_cmd', '') or ''
+        # ロード中は自動保存を抑止 (= 設定を空でクリアしてしまうのを防ぐ)
+        self._loading_cmd = True
+        self._cmd_save_timer.stop()
         self.cmd_edit.setPlainText(cmd)
+        self._loading_cmd = False
         host = prof.get('host', '')
         user = prof.get('user', '')
         if host:
             self.status_label.setText(f"接続先: {user}@{host}")
         else:
             self.status_label.setText("プロファイル未選択")
+
+    def _autosave_cmd(self):
+        """textChanged → 500ms デバウンス → 現プロファイルへ保存。"""
+        if self._loading_cmd:
+            return
+        name = self.profile_combo.currentText()
+        if not name or name not in self._profiles:
+            return
+        new_cmd = self.cmd_edit.toPlainText()
+        if self._profiles[name].get('db_exec_cmd', '') == new_cmd:
+            return  # 変化なし
+        self._profiles[name]['db_exec_cmd'] = new_cmd
+        _save_db_profiles(self._profiles)
+        self.status_label.setText(f"自動保存: {name}")
 
     def _toggle_cmd_section(self):
         visible = self.cmd_toggle_btn.isChecked()
