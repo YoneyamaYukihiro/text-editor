@@ -14,13 +14,15 @@ import json
 import argparse
 
 from PyQt6.QtCore import Qt, pyqtSignal, QThread, QSize
+import re
 from PyQt6.QtWidgets import (
     QApplication, QMainWindow, QWidget, QVBoxLayout, QHBoxLayout, QSplitter,
     QPlainTextEdit, QPushButton, QLabel, QComboBox, QStatusBar, QStackedWidget,
-    QTableView, QHeaderView, QAbstractItemView, QMessageBox, QFileDialog,
+    QTableWidget, QTableWidgetItem, QHeaderView, QAbstractItemView,
+    QSpinBox, QMessageBox, QFileDialog,
 )
 from PyQt6.QtGui import (
-    QFont, QAction, QKeySequence, QStandardItemModel, QStandardItem,
+    QFont, QAction, QKeySequence, QColor,
 )
 
 
@@ -48,6 +50,91 @@ _DB_CMD_PRESETS = {
     "SQLite":         'sqlite3 /path/to/db.sqlite "{SQL}"',
     "SQL Server (sqlcmd)": 'sqlcmd -S localhost -U USER -P PASS -d DBNAME -Q "{SQL}"',
 }
+
+
+def _clean_sqlplus_output(text: str) -> str:
+    """SQL*Plus 出力からクエリ結果だけを抽出する (text_editor 側と同実装)。
+    - 起動バナー (SQL*Plus Release / Copyright / Connected to: 等) を除去
+    - 行頭 `SQL>` プロンプトと multi-line 継続プロンプトを除去
+    - `Disconnected from Oracle ...` 以降の終了メッセージを除去
+    - sqlplus 系出力でなければ無加工で返す
+    """
+    if not text:
+        return text
+    is_sqlplus = ('SQL*Plus' in text) or ('SQL>' in text)
+    if not is_sqlplus:
+        return text
+    lines = text.splitlines()
+    result: list[str] = []
+    in_query = False
+    prompt_re = re.compile(r'^(?:SQL>\s*|\s*\d+\s+)+')
+    trailing_prompt_re = re.compile(r'\s*SQL>\s*$')
+    disconnect_strip_re = re.compile(
+        r'\s*SQL>\s*Disconnected from.*$|\s*Disconnected from.*$'
+    )
+    for line in lines:
+        if 'Disconnected from' in line:
+            stripped = prompt_re.sub('', line)
+            stripped = disconnect_strip_re.sub('', stripped)
+            if stripped.strip():
+                if in_query or 'SQL>' in line:
+                    result.append(stripped.rstrip())
+            break
+        if not in_query:
+            if 'SQL>' in line:
+                in_query = True
+                cleaned = prompt_re.sub('', line)
+                cleaned = trailing_prompt_re.sub('', cleaned)
+                if cleaned.strip():
+                    result.append(cleaned.rstrip())
+            continue
+        cleaned = prompt_re.sub('', line)
+        cleaned = trailing_prompt_re.sub('', cleaned)
+        result.append(cleaned.rstrip())
+    while result and not result[0].strip():
+        result.pop(0)
+    while result and not result[-1].strip():
+        result.pop()
+    return '\n'.join(result)
+
+
+def _parse_csv_lines(text: str) -> list[list[str]]:
+    """テキストから CSV (または空白2個以上で分割した固定幅) を行列にパース。"""
+    import csv as _csv
+    from io import StringIO
+    if not text or not text.strip():
+        return []
+    lines = text.splitlines()
+    first_data_idx = 0
+    for i, line in enumerate(lines):
+        s = line.strip()
+        if not s:
+            continue
+        if s.startswith('--'):
+            continue
+        if s.startswith('(') and s.endswith(')'):
+            continue
+        first_data_idx = i
+        break
+    clean_text = '\n'.join(lines[first_data_idx:])
+    if not clean_text.strip():
+        return []
+    if clean_text.count(',') >= 1:
+        try:
+            reader = _csv.reader(StringIO(clean_text))
+            rows = [row for row in reader if row]
+            max_cols = max((len(r) for r in rows), default=0)
+            if max_cols >= 2:
+                return rows
+        except Exception:
+            pass
+    rows: list[list[str]] = []
+    for line in clean_text.splitlines():
+        if not line.strip():
+            continue
+        cells = re.split(r' {2,}|\t+', line.strip())
+        rows.append(cells)
+    return rows
 
 
 def _load_db_profiles() -> dict:
@@ -173,119 +260,369 @@ class _SshExecWorker(QThread):
 
 
 # ---------------------------------------------------------------------------
-# 結果表示パネル: テキスト / グリッドの 2 モード
+# 結果表示パネル — Sora 本体の DBExecuteDialog と機能等価:
+#   - 4 表示モード: 全件(横・グリッド) / 全件(縦・転置) / 1件詳細(縦) / テキスト
+#   - レコードナビ (1件詳細モードで <<, <, [N], >, >>)
+#   - SQL*Plus 出力の自動クレンジング (_clean_sqlplus_output)
+#   - CSV パース (_parse_csv_lines) と 0 件メッセージ
 # ---------------------------------------------------------------------------
 class _ResultPanel(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self._last_output_text: str = ''
+        self._parsed_rows: list[list[str]] = []
+        self._current_record: int = 0
+
         layout = QVBoxLayout()
         layout.setContentsMargins(0, 0, 0, 0)
         layout.setSpacing(2)
 
-        # 切替バー
-        bar = QHBoxLayout()
-        self.mode_combo = QComboBox()
-        self.mode_combo.addItems(["📊 グリッド", "📝 テキスト"])
-        self.mode_combo.setFixedWidth(120)
-        self.mode_combo.currentIndexChanged.connect(self._on_mode_changed)
+        # 上部ヘッダ: 表示モード + レコードナビ + コピー/保存 + 件数
+        header = QHBoxLayout()
+        result_lbl = QLabel("実行結果:")
+        result_lbl.setStyleSheet("font-weight:600;")
+        header.addWidget(result_lbl)
+        header.addStretch()
+
+        # レコードナビゲーション (1件詳細モードのみ可視)
+        self.rec_first_btn = QPushButton("<<")
+        self.rec_prev_btn  = QPushButton("<")
+        self.rec_index_spin = QSpinBox()
+        self.rec_index_spin.setMinimum(1)
+        self.rec_index_spin.setMaximum(1)
+        self.rec_index_spin.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
+        self.rec_index_spin.setFixedWidth(70)
+        self.rec_index_spin.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        self.rec_total_lbl = QLabel("/ 1")
+        self.rec_next_btn  = QPushButton(">")
+        self.rec_last_btn  = QPushButton(">>")
+        for b in (self.rec_first_btn, self.rec_prev_btn,
+                  self.rec_next_btn, self.rec_last_btn):
+            b.setMinimumWidth(34)
+            b.setAutoDefault(False)
+        self.rec_first_btn.clicked.connect(lambda: self._goto_record(0))
+        self.rec_prev_btn.clicked.connect(
+            lambda: self._goto_record(self._current_record - 1))
+        self.rec_next_btn.clicked.connect(
+            lambda: self._goto_record(self._current_record + 1))
+        self.rec_last_btn.clicked.connect(
+            lambda: self._goto_record(self._record_count() - 1))
+        self.rec_index_spin.editingFinished.connect(
+            lambda: self._goto_record(self.rec_index_spin.value() - 1))
+        for w in (self.rec_first_btn, self.rec_prev_btn, self.rec_index_spin,
+                  self.rec_total_lbl, self.rec_next_btn, self.rec_last_btn):
+            w.setVisible(False)
+            header.addWidget(w)
+
+        header.addSpacing(8)
+        header.addWidget(QLabel("表示形式:"))
+        self.view_mode_combo = QComboBox()
+        self.view_mode_combo.addItem("📊 全件 (横・グリッド)", "grid")
+        self.view_mode_combo.addItem("📋 全件 (縦・転置)", "vertical_all")
+        self.view_mode_combo.addItem("🔍 1件詳細 (縦)", "vertical")
+        self.view_mode_combo.addItem("テキスト", "text")
+        self.view_mode_combo.setToolTip(
+            "全件(横): 通常のグリッド表示。1行=1レコード、横スクロール\n"
+            "全件(縦・転置): 列名を左ヘッダー、各レコードを横方向の列\n"
+            "1件詳細(縦): 選択した1レコードのみを項目|値で縦表示 (◁▷で巡回)\n"
+            "テキスト: 生の出力をそのまま表示"
+        )
+        self.view_mode_combo.currentIndexChanged.connect(self._on_view_mode_changed)
+        header.addWidget(self.view_mode_combo)
+
+        header.addSpacing(8)
+        self.copy_btn = QPushButton("📋 結果コピー")
+        self.copy_btn.setAutoDefault(False)
+        self.copy_btn.clicked.connect(self._on_copy)
+        header.addWidget(self.copy_btn)
         self.export_btn = QPushButton("💾 CSV 保存")
         self.export_btn.setAutoDefault(False)
         self.export_btn.clicked.connect(self._on_export)
-        self.summary_label = QLabel("結果なし")
-        bar.addWidget(QLabel("表示:"))
-        bar.addWidget(self.mode_combo)
-        bar.addWidget(self.export_btn)
-        bar.addStretch()
-        bar.addWidget(self.summary_label)
-        layout.addLayout(bar)
+        header.addWidget(self.export_btn)
 
-        self.stack = QStackedWidget()
-        # 0: グリッド
-        self.table = QTableView()
-        self.table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectionBehavior.SelectItems)
-        self.table.setAlternatingRowColors(True)
-        self.table.horizontalHeader().setSectionResizeMode(
+        self.summary_label = QLabel("")
+        self.summary_label.setStyleSheet("color:#888; font-size:11px;")
+        header.addWidget(self.summary_label)
+        layout.addLayout(header)
+
+        # スタック: 0=テキスト / 1=テーブル (Sora と同順)
+        self.result_stack = QStackedWidget()
+        self.result_view = QPlainTextEdit()
+        self.result_view.setFont(QFont("Consolas", 10))
+        self.result_view.setReadOnly(True)
+        self.result_stack.addWidget(self.result_view)
+
+        self.result_table = QTableWidget()
+        self.result_table.setAlternatingRowColors(True)
+        self.result_table.setSortingEnabled(False)
+        self.result_table.setEditTriggers(QAbstractItemView.EditTrigger.NoEditTriggers)
+        self.result_table.setSelectionBehavior(
+            QAbstractItemView.SelectionBehavior.SelectRows)
+        self.result_table.horizontalHeader().setSectionResizeMode(
             QHeaderView.ResizeMode.Interactive)
-        self.stack.addWidget(self.table)
-        # 1: テキスト
-        self.text_view = QPlainTextEdit()
-        self.text_view.setFont(QFont("Consolas", 11))
-        self.text_view.setReadOnly(True)
-        self.stack.addWidget(self.text_view)
-        layout.addWidget(self.stack, 1)
+        self.result_table.horizontalHeader().setStretchLastSection(True)
+        self.result_table.verticalHeader().setVisible(True)
+        self.result_stack.addWidget(self.result_table)
+        # 起動時はグリッド表示
+        self.result_stack.setCurrentIndex(1)
+
+        layout.addWidget(self.result_stack, 1)
         self.setLayout(layout)
 
-        self._last_rows: list[list[str]] = []
-        self._last_headers: list[str] = []
-
-    def _on_mode_changed(self, idx: int):
-        self.stack.setCurrentIndex(idx)
-
+    # ---- 入口 ----
     def show_text(self, text: str):
-        self.text_view.setPlainText(text)
-        # CSV パースを試みて成功すればグリッドにも反映
-        rows, headers = self._parse_csv(text)
-        self._populate_grid(headers, rows)
-        self.summary_label.setText(
-            f"{len(rows)} 行" if rows else "結果なし"
-        )
+        """SSH 実行結果のテキストを受けて表示更新。
+        SQL*Plus 出力なら自動でバナー/プロンプトを除去する。"""
+        cleaned = _clean_sqlplus_output(text)
+        self._last_output_text = cleaned
+        self.result_view.setPlainText(cleaned)
+        mode = self.view_mode_combo.currentData()
+        if mode == "grid":
+            self._render_grid(cleaned)
+        elif mode == "vertical_all":
+            self._render_vertical_all(cleaned)
+        elif mode == "vertical":
+            self._render_vertical(cleaned)
+        # サマリ更新
+        rows = _parse_csv_lines(cleaned) if cleaned.strip() else []
+        ncount = max(0, len(rows) - 1) if rows else 0
+        self.summary_label.setText(f"{ncount} 件")
 
     def show_error(self, msg: str):
-        self.text_view.setPlainText(msg)
-        self._populate_grid([], [])
+        self._last_output_text = msg
+        self.result_view.setPlainText(msg)
+        # エラーはテキストモードへ強制切替
+        idx = self.view_mode_combo.findData("text")
+        if idx >= 0:
+            self.view_mode_combo.blockSignals(True)
+            self.view_mode_combo.setCurrentIndex(idx)
+            self.view_mode_combo.blockSignals(False)
+            self._on_view_mode_changed(idx)
         self.summary_label.setText("エラー")
-        self.stack.setCurrentIndex(1)   # エラーはテキストモードへ強制切替
 
-    def _parse_csv(self, text: str) -> tuple[list[list[str]], list[str]]:
-        # SQL*Plus markup csv 出力等を想定して csv.reader で行解析。
-        # 失敗 / 1 列だけ等は ([], []) を返す。
-        if not text.strip():
-            return [], []
-        import csv as _csv
-        import io as _io
-        try:
-            lines = text.splitlines()
-            reader = _csv.reader(lines)
-            rows = [r for r in reader if r and any(c.strip() for c in r)]
-        except Exception:
-            return [], []
-        if len(rows) < 1:
-            return [], []
-        ncols = max((len(r) for r in rows), default=1)
-        rows = [r + [''] * (ncols - len(r)) for r in rows]
-        # 1 行目をヘッダにする (Oracle markup csv で先頭が列名)
-        headers = rows[0] if rows else [f"列{i+1}" for i in range(ncols)]
-        data = rows[1:] if len(rows) > 1 else []
-        return data, headers
+    # ---- モード切替 ----
+    def _on_view_mode_changed(self, _idx: int):
+        mode = self.view_mode_combo.currentData()
+        nav_visible = (mode == "vertical")
+        for w in (self.rec_first_btn, self.rec_prev_btn, self.rec_index_spin,
+                  self.rec_total_lbl, self.rec_next_btn, self.rec_last_btn):
+            w.setVisible(nav_visible)
+        text = self._last_output_text
+        if mode == "grid":
+            self._render_grid(text)
+            self.result_stack.setCurrentIndex(1)
+        elif mode == "vertical_all":
+            self._render_vertical_all(text)
+            self.result_stack.setCurrentIndex(1)
+        elif mode == "vertical":
+            self._render_vertical(text)
+            self.result_stack.setCurrentIndex(1)
+        else:
+            self.result_stack.setCurrentIndex(0)
 
-    def _populate_grid(self, headers: list[str], rows: list[list[str]]):
-        self._last_headers = headers
-        self._last_rows = rows
-        if not headers and not rows:
-            self.table.setModel(QStandardItemModel(0, 0, self))
+    # ---- レンダ: 横グリッド ----
+    def _render_grid(self, text: str):
+        self.result_table.setSortingEnabled(False)
+        self.result_table.clear()
+
+        def show_msg(msg: str):
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["メッセージ"])
+            self.result_table.setRowCount(1)
+            item = QTableWidgetItem(msg)
+            item.setForeground(QColor("#e0a96b"))
+            f = item.font(); f.setBold(True); item.setFont(f)
+            self.result_table.setItem(0, 0, item)
+            self.result_table.resizeColumnsToContents()
+
+        if not text or not text.strip():
+            show_msg("⚠ 0 件 / 該当データなし (SQLは正常完了)")
             return
-        ncols = len(headers) or (len(rows[0]) if rows else 1)
-        model = QStandardItemModel(len(rows), ncols, self)
-        model.setHorizontalHeaderLabels([str(h) for h in headers])
-        for r, row in enumerate(rows):
+        rows = _parse_csv_lines(text)
+        self._parsed_rows = rows
+        if not rows:
+            show_msg("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            return
+        if len(rows) == 1:
+            ncols = len(rows[0])
+            self.result_table.setColumnCount(ncols)
+            self.result_table.setHorizontalHeaderLabels(
+                [h.strip() or f"col{i+1}" for i, h in enumerate(rows[0])]
+            )
+            self.result_table.setRowCount(1)
+            ph = QTableWidgetItem("⚠ 0 件 / 該当データなし")
+            ph.setForeground(QColor("#e0a96b"))
+            f = ph.font(); f.setBold(True); ph.setFont(f)
+            self.result_table.setItem(0, 0, ph)
+            if ncols > 1:
+                self.result_table.setSpan(0, 0, 1, ncols)
+            self.result_table.resizeColumnsToContents()
+            return
+        ncols = max(len(r) for r in rows)
+        header = rows[0] + [''] * (ncols - len(rows[0]))
+        body = rows[1:]
+        self.result_table.setColumnCount(ncols)
+        self.result_table.setHorizontalHeaderLabels(
+            [h.strip() or f"col{i+1}" for i, h in enumerate(header)]
+        )
+        self.result_table.setRowCount(len(body))
+        for r, row in enumerate(body):
             for c in range(ncols):
                 val = row[c] if c < len(row) else ''
-                it = QStandardItem(str(val))
-                it.setEditable(False)
-                model.setItem(r, c, it)
-        self.table.setModel(model)
-        self.table.resizeColumnsToContents()
+                self.result_table.setItem(r, c, QTableWidgetItem(val))
+        self.result_table.resizeColumnsToContents()
         for c in range(ncols):
-            if self.table.columnWidth(c) > 400:
-                self.table.setColumnWidth(c, 400)
+            if self.result_table.columnWidth(c) > 400:
+                self.result_table.setColumnWidth(c, 400)
+        self.result_table.setSortingEnabled(True)
+
+    # ---- レンダ: 全件 縦転置 ----
+    def _render_vertical_all(self, text: str):
+        self.result_table.setSortingEnabled(False)
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        rows = _parse_csv_lines(text) if text and text.strip() else []
+        self._parsed_rows = rows
+        if not rows:
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["メッセージ"])
+            self.result_table.setRowCount(1)
+            it = QTableWidgetItem("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            it.setForeground(QColor("#e0a96b"))
+            f = it.font(); f.setBold(True); it.setFont(f)
+            self.result_table.setItem(0, 0, it)
+            self.result_table.resizeColumnsToContents()
+            return
+        header = rows[0]
+        body = rows[1:]
+        n_fields = len(header)
+        n_records = len(body)
+        if n_records == 0:
+            self.result_table.setRowCount(n_fields)
+            self.result_table.setColumnCount(1)
+            self.result_table.setVerticalHeaderLabels(
+                [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+            )
+            self.result_table.setHorizontalHeaderLabels(["値"])
+            for i in range(n_fields):
+                ph = QTableWidgetItem("⚠ 0 件")
+                ph.setForeground(QColor("#e0a96b"))
+                self.result_table.setItem(i, 0, ph)
+            self.result_table.resizeColumnsToContents()
+            return
+        self.result_table.setRowCount(n_fields)
+        self.result_table.setColumnCount(n_records)
+        self.result_table.setVerticalHeaderLabels(
+            [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+        )
+        self.result_table.setHorizontalHeaderLabels(
+            [f"#{i+1}" for i in range(n_records)]
+        )
+        for col_idx, record in enumerate(body):
+            for row_idx in range(n_fields):
+                val = record[row_idx] if row_idx < len(record) else ''
+                self.result_table.setItem(row_idx, col_idx, QTableWidgetItem(val))
+        self.result_table.resizeColumnsToContents()
+        for c in range(n_records):
+            if self.result_table.columnWidth(c) > 400:
+                self.result_table.setColumnWidth(c, 400)
+
+    # ---- レンダ: 1件詳細 縦 ----
+    def _render_vertical(self, text: str):
+        rows = _parse_csv_lines(text) if text and text.strip() else []
+        self._parsed_rows = rows
+        total = self._record_count()
+        if self._current_record >= total:
+            self._current_record = max(0, total - 1)
+        self._render_vertical_current()
+        self._update_record_nav()
+
+    def _record_count(self) -> int:
+        if not self._parsed_rows or len(self._parsed_rows) < 2:
+            return 0
+        return len(self._parsed_rows) - 1
+
+    def _update_record_nav(self):
+        total = self._record_count()
+        self.rec_index_spin.blockSignals(True)
+        self.rec_index_spin.setMinimum(1)
+        self.rec_index_spin.setMaximum(max(1, total))
+        self.rec_index_spin.setValue(self._current_record + 1 if total > 0 else 1)
+        self.rec_index_spin.blockSignals(False)
+        self.rec_total_lbl.setText(f"/ {total}")
+        self.rec_first_btn.setEnabled(self._current_record > 0)
+        self.rec_prev_btn.setEnabled(self._current_record > 0)
+        self.rec_next_btn.setEnabled(self._current_record < total - 1)
+        self.rec_last_btn.setEnabled(self._current_record < total - 1)
+
+    def _goto_record(self, idx: int):
+        total = self._record_count()
+        if total <= 0:
+            return
+        idx = max(0, min(idx, total - 1))
+        self._current_record = idx
+        self._render_vertical_current()
+        self._update_record_nav()
+
+    def _render_vertical_current(self):
+        self.result_table.setSortingEnabled(False)
+        self.result_table.clear()
+        self.result_table.setRowCount(0)
+        self.result_table.setColumnCount(0)
+        rows = self._parsed_rows
+        if not rows or len(rows) < 1:
+            self.result_table.setColumnCount(1)
+            self.result_table.setHorizontalHeaderLabels(["#1"])
+            self.result_table.setRowCount(1)
+            it = QTableWidgetItem("⚠ 0 件 / 該当データなし (SQLは正常完了)")
+            it.setForeground(QColor("#e0a96b"))
+            f = it.font(); f.setBold(True); it.setFont(f)
+            self.result_table.setItem(0, 0, it)
+            self.result_table.resizeColumnsToContents()
+            return
+        header = rows[0]
+        body = rows[1:]
+        n_fields = len(header)
+        if not body:
+            self.result_table.setRowCount(n_fields)
+            self.result_table.setColumnCount(1)
+            self.result_table.setVerticalHeaderLabels(
+                [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+            )
+            self.result_table.setHorizontalHeaderLabels(["#1"])
+            for i in range(n_fields):
+                ph = QTableWidgetItem("⚠ 0 件")
+                ph.setForeground(QColor("#e0a96b"))
+                self.result_table.setItem(i, 0, ph)
+            self.result_table.resizeColumnsToContents()
+            return
+        idx = max(0, min(self._current_record, len(body) - 1))
+        record = body[idx]
+        self.result_table.setRowCount(n_fields)
+        self.result_table.setColumnCount(1)
+        self.result_table.setVerticalHeaderLabels(
+            [(h or '').strip() or f"col{i+1}" for i, h in enumerate(header)]
+        )
+        self.result_table.setHorizontalHeaderLabels([f"#{idx + 1}"])
+        for i in range(n_fields):
+            val = record[i] if i < len(record) else ''
+            self.result_table.setItem(i, 0, QTableWidgetItem(val))
+        self.result_table.resizeColumnsToContents()
+        if self.result_table.columnWidth(0) > 600:
+            self.result_table.setColumnWidth(0, 600)
+
+    # ---- コピー / CSV 保存 ----
+    def _on_copy(self):
+        QApplication.clipboard().setText(self._last_output_text or '')
 
     def _on_export(self):
-        if not self._last_headers and not self._last_rows:
+        if not self._parsed_rows:
             QMessageBox.information(self, "保存", "保存できる結果がありません。")
             return
         path, _ = QFileDialog.getSaveFileName(
-            self, "CSV 保存", "result.csv", "CSV (*.csv);;TSV (*.tsv);;すべて (*)"
+            self, "CSV 保存", "result.csv",
+            "CSV (*.csv);;TSV (*.tsv);;すべて (*)"
         )
         if not path:
             return
@@ -294,8 +631,7 @@ class _ResultPanel(QWidget):
         try:
             with open(path, 'w', newline='', encoding='utf-8-sig') as f:
                 w = _csv.writer(f, delimiter=delim)
-                w.writerow(self._last_headers)
-                for row in self._last_rows:
+                for row in self._parsed_rows:
                     w.writerow(row)
         except Exception as e:
             QMessageBox.critical(self, "保存エラー", str(e))
