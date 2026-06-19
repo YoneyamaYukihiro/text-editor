@@ -109,6 +109,7 @@ class _SshExecWorker(QThread):
         password = self._profile.get('password', '')
         key_path = self._profile.get('key_path', '')
         client = None
+        script_path = None
         try:
             client = paramiko.SSHClient()
             client.set_missing_host_key_policy(paramiko.AutoAddPolicy())
@@ -120,8 +121,31 @@ class _SshExecWorker(QThread):
                 client.connect(host, port=port, username=user,
                                password=password, timeout=15,
                                look_for_keys=False, allow_agent=False)
+            # SFTP でリモート /tmp にスクリプトを書き込み、 bash --login で実行。
+            # exec_command の -c 経由でヒアドキュメントを送ると改行が
+            # 失われて <<'EOF' ... EOF の終端が認識されないため。
+            import time as _time
+            script_path = (
+                f"/tmp/sora_db_exec_{int(_time.time() * 1000)}_{os.getpid()}.sh"
+            )
+            script_content = (
+                "#!/bin/bash --login\n"
+                "set -o pipefail\n"
+                + self._command
+                + ("\n" if not self._command.endswith("\n") else "")
+            )
+            sftp = client.open_sftp()
+            try:
+                with sftp.open(script_path, "w") as f:
+                    f.write(script_content)
+                sftp.chmod(script_path, 0o700)
+            finally:
+                try:
+                    sftp.close()
+                except Exception:
+                    pass
             stdin_ch, stdout, stderr = client.exec_command(
-                f"bash --login -c {repr(self._command)}",
+                f"bash --login {script_path}",
                 timeout=180, get_pty=False,
             )
             out = stdout.read().decode('utf-8', errors='replace')
@@ -131,6 +155,16 @@ class _SshExecWorker(QThread):
         except Exception as e:
             self.finished_err.emit(f"{type(e).__name__}: {e}")
         finally:
+            # スクリプトを削除 (失敗しても無視)
+            if script_path and client is not None:
+                try:
+                    sftp = client.open_sftp()
+                    try:
+                        sftp.remove(script_path)
+                    finally:
+                        sftp.close()
+                except Exception:
+                    pass
             try:
                 if client is not None:
                     client.close()
