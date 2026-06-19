@@ -58,6 +58,14 @@ def _load_db_profiles() -> dict:
         return {}
 
 
+def _save_db_profiles(profiles: dict):
+    try:
+        with open(_DB_PROFILES_PATH, 'w', encoding='utf-8') as f:
+            json.dump(profiles, f, ensure_ascii=False, indent=2)
+    except Exception:
+        pass
+
+
 def _load_history() -> list[str]:
     try:
         with open(_SORA_DB_HISTORY_PATH, 'r', encoding='utf-8') as f:
@@ -268,16 +276,20 @@ class MainWindow(QMainWindow):
         self.setWindowTitle(f"Sora DB  v{__version__}")
         self.resize(1100, 720)
         self._profiles = _load_db_profiles()
-        self._cmd_template = next(iter(_DB_CMD_PRESETS.values()))
         self._worker: _SshExecWorker | None = None
 
         self._build_ui()
         self._build_menu()
 
+        # 初期プロファイル選択 → _on_profile_changed が cmd_edit を更新
         if initial_profile:
             i = self.profile_combo.findText(initial_profile)
             if i >= 0:
                 self.profile_combo.setCurrentIndex(i)
+        else:
+            # 先頭プロファイルでも cmd_edit を初期化させる
+            if self.profile_combo.count() > 0:
+                self._on_profile_changed(self.profile_combo.currentText())
         if initial_query:
             self.query_edit.setPlainText(initial_query)
 
@@ -293,6 +305,7 @@ class MainWindow(QMainWindow):
         self.profile_combo = QComboBox()
         self.profile_combo.setMinimumWidth(260)
         self._refresh_profile_combo()
+        self.profile_combo.currentTextChanged.connect(self._on_profile_changed)
         top.addWidget(self.profile_combo)
 
         top.addSpacing(12)
@@ -304,6 +317,16 @@ class MainWindow(QMainWindow):
         self.preset_combo.currentIndexChanged.connect(self._on_preset_changed)
         self.preset_combo.setFixedWidth(180)
         top.addWidget(self.preset_combo)
+
+        # コマンド設定欄の折りたたみトグル
+        self.cmd_toggle_btn = QPushButton("▼ DB実行コマンド設定")
+        self.cmd_toggle_btn.setCheckable(True)
+        self.cmd_toggle_btn.setChecked(True)
+        self.cmd_toggle_btn.setToolTip(
+            "DB実行コマンドテンプレート (USER/PASS/SID を実値に書き換えて使用)"
+        )
+        self.cmd_toggle_btn.clicked.connect(self._toggle_cmd_section)
+        top.addWidget(self.cmd_toggle_btn)
 
         top.addStretch()
         self.run_btn = QPushButton("▶ 実行 (Ctrl+Enter)")
@@ -317,6 +340,33 @@ class MainWindow(QMainWindow):
         )
         top.addWidget(self.run_btn)
         root.addLayout(top, 0)
+
+        # DB実行コマンドテンプレート (折りたたみ可能、 プロファイル毎に保存)
+        self.cmd_section = QWidget()
+        cs_l = QVBoxLayout(self.cmd_section)
+        cs_l.setContentsMargins(0, 0, 0, 0)
+        cs_l.setSpacing(2)
+        cs_l.addWidget(QLabel(
+            "DB実行コマンド (USER/PASS/SID は実値に置換、 {SQL} が SQL に展開):"
+        ))
+        self.cmd_edit = QPlainTextEdit()
+        self.cmd_edit.setFont(QFont("Consolas", 10))
+        self.cmd_edit.setMaximumHeight(120)
+        self.cmd_edit.setPlaceholderText(
+            "例:  sqlplus -S scott/tiger@xe <<'EOF'\n"
+            "set markup csv on quote on\n"
+            "set feedback off pagesize 0\n"
+            "{SQL};\nexit\nEOF"
+        )
+        cs_l.addWidget(self.cmd_edit)
+        cs_btn_row = QHBoxLayout()
+        self.save_cmd_btn = QPushButton("💾 このプロファイルに保存")
+        self.save_cmd_btn.setAutoDefault(False)
+        self.save_cmd_btn.clicked.connect(self._on_save_cmd)
+        cs_btn_row.addWidget(self.save_cmd_btn)
+        cs_btn_row.addStretch()
+        cs_l.addLayout(cs_btn_row)
+        root.addWidget(self.cmd_section, 0)
 
         # 中央: 上=クエリエディタ / 下=結果
         splitter = QSplitter(Qt.Orientation.Vertical)
@@ -385,8 +435,50 @@ class MainWindow(QMainWindow):
         if idx <= 0:
             return
         name = self.preset_combo.itemText(idx)
-        self._cmd_template = _DB_CMD_PRESETS.get(name, self._cmd_template)
-        self.status_label.setText(f"DBプリセット: {name}")
+        tmpl = _DB_CMD_PRESETS.get(name, '')
+        if tmpl:
+            self.cmd_edit.setPlainText(tmpl)
+            self.status_label.setText(
+                f"プリセット適用: {name} — USER/PASS/SID を実値に書き換えてください"
+            )
+            # 折りたたまれていたら展開
+            if not self.cmd_toggle_btn.isChecked():
+                self.cmd_toggle_btn.setChecked(True)
+                self._toggle_cmd_section()
+        # 次回も同じプリセットを選べるよう先頭に戻す
+        self.preset_combo.blockSignals(True)
+        self.preset_combo.setCurrentIndex(0)
+        self.preset_combo.blockSignals(False)
+
+    def _on_profile_changed(self, name: str):
+        """プロファイル変更 → 保存済み db_exec_cmd を cmd_edit に展開。
+        未設定なら空欄のまま (= プリセット選択を促す)。"""
+        prof = self._profiles.get(name, {})
+        cmd = prof.get('db_exec_cmd', '') or ''
+        self.cmd_edit.setPlainText(cmd)
+        host = prof.get('host', '')
+        user = prof.get('user', '')
+        if host:
+            self.status_label.setText(f"接続先: {user}@{host}")
+        else:
+            self.status_label.setText("プロファイル未選択")
+
+    def _toggle_cmd_section(self):
+        visible = self.cmd_toggle_btn.isChecked()
+        self.cmd_section.setVisible(visible)
+        self.cmd_toggle_btn.setText(
+            "▼ DB実行コマンド設定" if visible else "▶ DB実行コマンド設定"
+        )
+
+    def _on_save_cmd(self):
+        name = self.profile_combo.currentText()
+        if not name or name not in self._profiles:
+            QMessageBox.warning(self, "プロファイル未選択",
+                                "保存先のプロファイルが選択されていません。")
+            return
+        self._profiles[name]['db_exec_cmd'] = self.cmd_edit.toPlainText()
+        _save_db_profiles(self._profiles)
+        self.status_label.setText(f"DB実行コマンドを保存: {name}")
 
     def _on_open_sql(self):
         path, _ = QFileDialog.getOpenFileName(
@@ -429,8 +521,21 @@ class MainWindow(QMainWindow):
                                 "接続プロファイルが見つかりません。\n"
                                 "Multi-Server Log Viewer で登録してください。")
             return
-        # コマンド生成 (テンプレ → {SQL} 置換)
-        cmd = self._cmd_template.replace('{SQL}', sql.replace('"', '\\"'))
+        cmd_template = self.cmd_edit.toPlainText().strip()
+        if not cmd_template:
+            QMessageBox.warning(self, "DB実行コマンド未設定",
+                                "DB実行コマンドが空です。\n"
+                                "DBプリセット (Oracle (sqlplus) 等) を選んで\n"
+                                "USER/PASS/SID を実値に書き換えてください。")
+            return
+        if '{SQL}' not in cmd_template:
+            QMessageBox.warning(self, "{SQL} プレースホルダなし",
+                                "テンプレートに {SQL} プレースホルダが含まれていません。")
+            return
+        # SQL を実行コマンドに埋め込む。 sqlplus はヒアドキュメント内に
+        # そのまま入れるのでエスケープ不要 (シェル -c 経由でも repr()
+        # しているため安全)
+        cmd = cmd_template.replace('{SQL}', sql)
         self.run_btn.setEnabled(False)
         self.status_label.setText(f"実行中: {prof_name} ...")
         self._worker = _SshExecWorker(prof, cmd, self)
