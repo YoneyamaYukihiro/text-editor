@@ -12,7 +12,7 @@
     sora_db.exe [--profile NAME] [--query "SELECT ..."]
 他アプリ (Sora / LogViewer) から SQL を直接渡して起動できる。
 """
-__version__ = "0.2.0"
+__version__ = "0.3.0"
 
 import sys
 import argparse
@@ -20,11 +20,12 @@ import os
 
 from PyQt6.QtCore import Qt
 from PyQt6.QtGui import QKeySequence, QAction
-from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox
+from PyQt6.QtWidgets import QApplication, QMainWindow, QMessageBox, QDialog
 
-# text_editor は同ディレクトリにある同名モジュール。 PyInstaller 配布時も
-# `Sora DB.spec` の Analysis に追加すれば同梱される。
-from text_editor import DBExecuteDialog
+# text_editor / ssh_log_viewer は同ディレクトリにある同名モジュール。
+# PyInstaller 配布時も `Sora DB.spec` の Analysis に追加されれば自動同梱。
+from text_editor import DBExecuteDialog, _load_db_profiles
+from ssh_log_viewer import SSHConnectDialog, ProfileManagerDialog
 
 
 class _SoraDbWindow(QMainWindow):
@@ -46,13 +47,65 @@ class _SoraDbWindow(QMainWindow):
         self._dlg.setWindowFlags(Qt.WindowType.Widget)
         self.setCentralWidget(self._dlg)
 
-        # メニュー (ファイル / 実行 を最小限)
+        # メニュー
         mb = self.menuBar()
         fm = mb.addMenu("ファイル(&F)")
         a_quit = QAction("終了(&Q)", self)
         a_quit.setShortcut(QKeySequence("Ctrl+Q"))
         a_quit.triggered.connect(self.close)
         fm.addAction(a_quit)
+
+        sm = mb.addMenu("設定(&S)")
+        a_conn = QAction("接続プロファイル管理(&P)...", self)
+        a_conn.setShortcut(QKeySequence("Ctrl+,"))
+        a_conn.setToolTip(
+            "接続プロファイルを追加/編集/並び替え/削除します。\n"
+            "ここで作成したプロファイルは LogViewer / Sora と共有されます。"
+        )
+        a_conn.triggered.connect(self._open_profile_manager)
+        sm.addAction(a_conn)
+        a_conn_new = QAction("新規接続プロファイルを追加(&N)...", self)
+        a_conn_new.triggered.connect(self._open_profile_new)
+        sm.addAction(a_conn_new)
+
+    def _open_profile_manager(self):
+        """LogViewer の ProfileManagerDialog を流用してプロファイルを管理 (名前
+        変更/並び替え/削除)。 閉じた後に DBExecuteDialog のコンボを更新。"""
+        try:
+            dlg = ProfileManagerDialog(self)
+        except Exception as e:
+            QMessageBox.critical(self, "プロファイル管理エラー",
+                                 f"{type(e).__name__}: {e}")
+            return
+        dlg.exec()
+        self._reload_profiles_into_dialog()
+
+    def _open_profile_new(self):
+        """LogViewer の SSHConnectDialog を「保存目的のみ」 で開く。
+        接続テスト + プロファイルとして保存できる。 connect() は走らない。"""
+        try:
+            dlg = SSHConnectDialog(self)
+        except Exception as e:
+            QMessageBox.critical(self, "接続ダイアログエラー",
+                                 f"{type(e).__name__}: {e}")
+            return
+        # ダイアログ単体で動かす (= 接続せずに「保存」 だけ使う目的)。
+        # SSHConnectDialog の「保存」 ボタンが ~/.ssh_log_viewer_profiles.json
+        # に書き込みするので、 ここでは exec() の戻り値に関わらず再ロードする。
+        dlg.exec()
+        self._reload_profiles_into_dialog()
+
+    def _reload_profiles_into_dialog(self):
+        """DBExecuteDialog 内の _profiles と profile_combo を最新ファイル内容で
+        更新 (新規追加/削除/改名を即座に反映)。"""
+        try:
+            self._dlg._profiles = _load_db_profiles()
+            self._dlg._refresh_profile_combo()
+        except Exception as e:
+            # 失敗してもアプリは止めない (ステータスバー表示でも十分)
+            self.statusBar().showMessage(
+                f"プロファイル再ロード失敗: {e}", 5000
+            )
 
     def closeEvent(self, event):
         # DBExecuteDialog 内のワーカースレッド等の後始末は元クラス側で処理される
