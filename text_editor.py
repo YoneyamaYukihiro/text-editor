@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.21"
+__version__ = "1.1.22"
 
 import sys
 import os
@@ -28,6 +28,7 @@ from PyQt6.QtGui import (
     QKeySequence, QAction, QPainter, QTextFormat, QTextDocument, QPixmap,
     QStandardItemModel, QStandardItem,
 )
+from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 
 
 # ---------------------------------------------------------------------------
@@ -4949,8 +4950,12 @@ class MainWindow(QMainWindow):
         self._add_action(fm, "全て保存(&L)", QKeySequence("Ctrl+Alt+S"), self.save_all)
         self._add_action(fm, "全て保存して終了(&X)", QKeySequence("Ctrl+Alt+Q"), self.save_all_and_exit)
         fm.addSeparator()
+        self._add_action(fm, "印刷(&I)...", QKeySequence("Ctrl+P"), self.print_current)
+        self._add_action(fm, "印刷プレビュー(&V)...",
+                         QKeySequence("Ctrl+Shift+P"), self.print_preview_current)
+        fm.addSeparator()
         # 設定 (Export/Import は設定ダイアログ内に統合)
-        self._add_action(fm, "⚙ 設定(&P)...", QKeySequence("Ctrl+,"), self._open_settings)
+        self._add_action(fm, "⚙ 設定(&E)...", QKeySequence("Ctrl+,"), self._open_settings)
         fm.addSeparator()
         self._add_action(fm, "終了(&Q)", QKeySequence("Ctrl+Q"), self.close)
 
@@ -5372,6 +5377,57 @@ class MainWindow(QMainWindow):
         )
         for path in paths:
             self._load_file(path)
+
+    # ------------------------------------------------ 印刷 (Ctrl+P / Ctrl+Shift+P)
+    def _current_printable_document(self):
+        """印刷対象の QTextDocument と表示用のタイトルを返す。
+        現状は EditorTab (テキスト) のみ対応。 ImageTab / CsvTab では None。"""
+        tab = self.current_tab()
+        if tab is None:
+            QMessageBox.information(
+                self, "印刷対象なし",
+                "印刷できるテキストタブが選択されていません。\n"
+                "画像タブ / CSV グリッドタブは現在未対応です。"
+            )
+            return None, None
+        doc = tab.editor.document()
+        title = tab.filename or "無題"
+        return doc, title
+
+    def _configure_printer(self, printer, title: str):
+        """印刷ジョブに共通設定を適用 (プリンタ名/ドキュメント名)。"""
+        printer.setDocName(title)
+
+    def print_current(self):
+        """現在のタブを印刷ダイアログ経由で印刷する。"""
+        doc, title = self._current_printable_document()
+        if doc is None:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        self._configure_printer(printer, title)
+        dlg = QPrintDialog(printer, self)
+        dlg.setWindowTitle(f"印刷: {title}")
+        if dlg.exec() != QPrintDialog.DialogCode.Accepted:
+            return
+        try:
+            doc.print(printer)
+        except Exception as e:
+            QMessageBox.critical(self, "印刷エラー",
+                                 f"{type(e).__name__}: {e}")
+
+    def print_preview_current(self):
+        """印刷プレビューダイアログを開く。"""
+        doc, title = self._current_printable_document()
+        if doc is None:
+            return
+        printer = QPrinter(QPrinter.PrinterMode.HighResolution)
+        self._configure_printer(printer, title)
+        preview = QPrintPreviewDialog(printer, self)
+        preview.setWindowTitle(f"印刷プレビュー: {title}")
+        preview.resize(900, 700)
+        # paintRequested のたびに現ドキュメントを再描画するようバインド
+        preview.paintRequested.connect(lambda p: doc.print(p))
+        preview.exec()
 
     # 大ファイルしきい値
     _LARGE_FILE_SIZE = 2_000_000    # 2MB: シンタックスハイライト初期 rehighlight をスキップ
