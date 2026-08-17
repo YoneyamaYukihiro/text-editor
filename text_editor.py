@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.22"
+__version__ = "1.1.23"
 
 import sys
 import os
@@ -26,7 +26,7 @@ from PyQt6.QtCore import Qt, QRegularExpression, pyqtSignal, QSize, QThread, QTi
 from PyQt6.QtGui import (
     QFont, QFontMetrics, QColor, QTextCharFormat, QSyntaxHighlighter,
     QKeySequence, QAction, QPainter, QTextFormat, QTextDocument, QPixmap,
-    QStandardItemModel, QStandardItem,
+    QStandardItemModel, QStandardItem, QTextCursor,
 )
 from PyQt6.QtPrintSupport import QPrinter, QPrintDialog, QPrintPreviewDialog
 
@@ -614,7 +614,11 @@ class CodeEditor(QPlainTextEdit):
         # の枠線スタイルにする。文字は一切被覆されず、行の境界だけ可視化。
         super().paintEvent(event)
         try:
-            cur_rect = self.cursorRect()
+            # cursorRect() はカーソルが乗っている「表示行 (視覚行)」だけの矩形を
+            # 返すため、折り返しで複数行にまたがる論理行では最初の視覚行しか
+            # 強調されない。ブロック全体 (折り返し後の全視覚行) の矩形を使う。
+            cursor_block = self.textCursor().block()
+            block_rect = self.blockBoundingGeometry(cursor_block).translated(self.contentOffset())
         except Exception:
             return
         from PyQt6.QtGui import QPainter as _QPainter
@@ -622,13 +626,13 @@ class CodeEditor(QPlainTextEdit):
         accent = QColor("#1976D2") if is_light else QColor("#4A90E2")
         painter = _QPainter(self.viewport())
         vp_w = self.viewport().width()
-        top = cur_rect.top()
-        bot = cur_rect.top() + cur_rect.height() - 1
+        top = round(block_rect.top())
+        bot = round(block_rect.top() + block_rect.height()) - 1
         # 上下に 1px の細いボーダー (= 行の境界をはっきりさせる)
         painter.fillRect(0, top, vp_w, 1, accent)
         painter.fillRect(0, bot, vp_w, 1, accent)
         # 左端に 3px の太いアクセントバー (= ガター側にも視線誘導)
-        painter.fillRect(0, top, 3, cur_rect.height(), accent)
+        painter.fillRect(0, top, 3, bot - top + 1, accent)
         painter.end()
 
     def line_number_area_paint_event(self, event):
@@ -742,11 +746,20 @@ class CodeEditor(QPlainTextEdit):
                 block = doc.findBlockByNumber(lineno - 1)
                 if not block.isValid():
                     continue
+                if not block.text():
+                    # 文字が無い行を塗ると、あたかもスペースが入っているかの
+                    # ように見えてしまうため、空行は着色しない (10 行目の見た目)。
+                    continue
                 sel = QTextEdit.ExtraSelection()
                 sel.format.setBackground(color)
                 sel.format.setProperty(QTextFormat.Property.FullWidthSelection, True)
                 cur = self.textCursor()
+                # FullWidthSelection はカーソル位置が乗っている視覚行にしか
+                # 適用されないため、折り返し行では選択範囲を持たない (collapsed)
+                # カーソルだと最初の視覚行しか着色されない。ブロック全体
+                # (末尾の改行を除く) を選択状態にして全視覚行をカバーする。
                 cur.setPosition(block.position())
+                cur.setPosition(block.position() + max(block.length() - 1, 0), QTextCursor.MoveMode.KeepAnchor)
                 sel.cursor = cur
                 extra.append(sel)
 
