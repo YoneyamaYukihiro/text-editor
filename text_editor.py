@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.23"
+__version__ = "1.1.24"
 
 import sys
 import os
@@ -143,6 +143,8 @@ _DEFAULT_SETTINGS = {
     #   'raw'          : LIST / MLSD 値を加工せず生表示
     #                    (サーバーが既にローカル TZ で報告している環境向け)
     'ftp_time_mode':    'local',
+    # FTP アイドルタイムアウト対策の NOOP 送信間隔 (秒)
+    'ftp_keepalive_sec': 60,
 }
 
 
@@ -2495,7 +2497,8 @@ class _FTPSizeDelegate(QStyledItemDelegate):
 
 class FTPPanel(QWidget):
     file_downloaded      = pyqtSignal(str, str)  # content, filename (互換用)
-    file_downloaded_path = pyqtSignal(str, str)  # local_path, filename (新規)
+    # local_path, filename, remote_path (絶対パス), mtime (MDTM 生値 / 非対応サーバーは空文字)
+    file_downloaded_path = pyqtSignal(str, str, str, str)
     # DL 開始直前に local_path を通知 → MainWindow が _self_write_paths に登録
     # することで、DL 中の chunk 書込みで発火する fileChanged を無視させる。
     # これが無いと:
@@ -2515,10 +2518,18 @@ class FTPPanel(QWidget):
         # ローカルパスを渡して「未保存編集あり」かを返すコールバック (MainWindow が注入)
         self._is_modified_cb = lambda _local_path: False
 
-        # キープアライブタイマー: 60秒毎に NOOP を送ってアイドルタイムアウトを防ぐ
+        # キープアライブタイマー: 設定した間隔毎に NOOP を送ってアイドルタイムアウトを防ぐ
         self._keepalive_timer = QTimer(self)
-        self._keepalive_timer.setInterval(60_000)
+        self._keepalive_timer.setInterval(
+            int(SETTINGS.get('ftp_keepalive_sec', 60)) * 1000
+        )
         self._keepalive_timer.timeout.connect(self._send_keepalive)
+
+    def apply_settings(self):
+        """設定ダイアログでの変更 (キープアライブ間隔) を反映。実行中タイマーにも即時反映。"""
+        self._keepalive_timer.setInterval(
+            int(SETTINGS.get('ftp_keepalive_sec', 60)) * 1000
+        )
 
     def set_modification_checker(self, fn):
         """MainWindow から呼ぶ: 引数local_path → bool (未保存編集あり) を返す関数 + UI を構築"""
@@ -2539,8 +2550,15 @@ class FTPPanel(QWidget):
         btns.addWidget(self.disconnect_btn)
         layout.addLayout(btns)
 
+        path_row = QHBoxLayout()
         self.path_label = QLabel("/")
-        layout.addWidget(self.path_label)
+        path_row.addWidget(self.path_label, 1)
+        self.refresh_btn = QPushButton("⟳")
+        self.refresh_btn.setFixedWidth(28)
+        self.refresh_btn.setToolTip("現在のフォルダを再取得")
+        self.refresh_btn.setEnabled(False)
+        path_row.addWidget(self.refresh_btn)
+        layout.addLayout(path_row)
         self.apply_theme()
 
         self.file_list = QListWidget()
@@ -2564,9 +2582,28 @@ class FTPPanel(QWidget):
 
         self.connect_btn.clicked.connect(self._connect)
         self.disconnect_btn.clicked.connect(self._disconnect)
+        self.refresh_btn.clicked.connect(self._refresh_list)
         self.file_list.itemDoubleClicked.connect(self._on_double_click)
         self.file_list.itemSelectionChanged.connect(self._on_selection)
         self.open_btn.clicked.connect(self._open_selected)
+
+    def _refresh_list(self):
+        """「⟳」ボタン: 現在のフォルダを再取得して一覧を最新化する。"""
+        if self.ftp is None:
+            return
+        self._list(self.current_path)
+
+    def _get_mtime(self, name_or_path: str) -> str:
+        """MDTM でサーバー側の更新日時を取得。非対応サーバー/エラー時は空文字。
+        戻り値は 'YYYYMMDDHHMMSS[.sss]' の生値 (比較にのみ使うので変換不要)。"""
+        if self.ftp is None:
+            return ''
+        try:
+            resp = self.ftp.sendcmd(f'MDTM {name_or_path}')
+            code, _, value = resp.partition(' ')
+            return value.strip() if code == '213' else ''
+        except Exception:
+            return ''
 
     def apply_theme(self):
         """パス欄・状態ラベルをテーマ連動で再スタイル。"""
@@ -2600,6 +2637,7 @@ class FTPPanel(QWidget):
             self.status_label.setToolTip(f"ホスト: {info['host']}  ユーザー: {info['user']}")
             self.connect_btn.setEnabled(False)
             self.disconnect_btn.setEnabled(True)
+            self.refresh_btn.setEnabled(True)
 
             # 接続中プロファイル名 + 再接続用に接続情報を保持
             self._active_profile_name = info.get('profile_name', '')
@@ -2640,6 +2678,7 @@ class FTPPanel(QWidget):
         self.status_label.setStyleSheet("color: #808080; padding: 2px;")
         self.connect_btn.setEnabled(True)
         self.disconnect_btn.setEnabled(False)
+        self.refresh_btn.setEnabled(False)
         self.file_list.clear()
         self.open_btn.setEnabled(False)
 
@@ -2683,6 +2722,7 @@ class FTPPanel(QWidget):
             self.status_label.setStyleSheet("color: #FF8080; padding: 2px;")
             self.connect_btn.setEnabled(True)
             self.disconnect_btn.setEnabled(False)
+            self.refresh_btn.setEnabled(False)
             return False
 
     def _ensure_alive(self) -> bool:
@@ -2892,6 +2932,8 @@ class FTPPanel(QWidget):
     _SIZE_HARD = 100 * 1024 * 1024     # 100 MB
 
     def _download(self, name):
+        """name はカレントディレクトリ内の相対名、または絶対パス
+        (「FTP更新確認」からの再取得時) のどちらでも良い。"""
         if not self.ftp:
             return
         # 通信前に接続生存を確認、死んでいたら自動再接続
@@ -3051,7 +3093,11 @@ class FTPPanel(QWidget):
         worker.wait()
 
         if result['ok']:
-            self.file_downloaded_path.emit(local_path, name)
+            # name は基本カレントディレクトリ内の相対名だが、FTP更新確認からの
+            # 再取得時は絶対パスがそのまま渡ってくるので、その場合はそのまま使う。
+            remote_path = name if name.startswith('/') else self.current_path.rstrip('/') + '/' + name
+            mtime = self._get_mtime(name)
+            self.file_downloaded_path.emit(local_path, name, remote_path, mtime)
         else:
             if result['err'] and 'キャンセル' not in result['err']:
                 QMessageBox.warning(self, "ダウンロードエラー", result['err'])
@@ -4200,6 +4246,12 @@ class EditorTab(QWidget):
         self.filename = filename
         self.file_path = file_path
         self.is_modified = False
+        # FTP 経由で開いたタブか (タブタイトルの "[FTP] " プレフィックス維持用)
+        self.is_ftp = False
+        # サーバー側更新チェック用 (取得元の絶対パス / ホスト / MDTM 取得時刻)
+        self.ftp_remote_path = ''
+        self.ftp_host = ''
+        self.ftp_mtime = ''
         # 検出されたエンコーディング。 load 時に _load_file から上書きされる。
         # 新規タブは _write_file が UTF-8 で保存するので UTF-8 をデフォルトに
         # しておく (ステータスバーに '—' が出ないように)。
@@ -4562,9 +4614,21 @@ class SettingsDialog(QDialog):
         theme_row.addWidget(self.theme_combo, 1)
         v.addLayout(theme_row)
 
-        v.addWidget(self._section_label("FTP ファイル一覧の時刻表示"))
+        v.addWidget(self._section_label("FTP 設定"))
+        ftp_ka_row = QHBoxLayout()
+        ftp_ka_row.addWidget(QLabel("キープアライブ間隔:"))
+        container, ka_sp = self._make_spinner('ftp_keepalive_sec', 10, 600, suffix=" 秒")
+        ka_sp.setToolTip(
+            "接続中に NOOP コマンドを送ってアイドルタイムアウト切断を防ぐ間隔。\n"
+            "サーバー側のタイムアウトより短い値にしてください (既定 60秒)。"
+        )
+        self._spinners['ftp_keepalive_sec'] = ka_sp
+        ftp_ka_row.addWidget(container)
+        ftp_ka_row.addStretch()
+        v.addLayout(ftp_ka_row)
+
         ftp_tz_row = QHBoxLayout()
-        ftp_tz_row.addWidget(QLabel("方式:"))
+        ftp_tz_row.addWidget(QLabel("時刻表示:"))
         self.ftp_tz_combo = QComboBox()
         self.ftp_tz_combo.addItem("ローカル時刻に変換 (推奨 / FFFTP 互換)", 'local')
         self.ftp_tz_combo.addItem("サーバー値のまま表示", 'raw')
@@ -4647,7 +4711,7 @@ class SettingsDialog(QDialog):
         return lbl
 
     @staticmethod
-    def _make_spinner(key: str, lo: int, hi: int):
+    def _make_spinner(key: str, lo: int, hi: int, suffix: str = " px"):
         t = _theme()
         container = QWidget()
         h = QHBoxLayout(container)
@@ -4657,7 +4721,7 @@ class SettingsDialog(QDialog):
         sp = QSpinBox()
         sp.setRange(lo, hi)
         sp.setValue(int(SETTINGS.get(key, _DEFAULT_SETTINGS[key])))
-        sp.setSuffix(" px")
+        sp.setSuffix(suffix)
         sp.setButtonSymbols(QSpinBox.ButtonSymbols.NoButtons)
         sp.setAlignment(Qt.AlignmentFlag.AlignCenter)
         sp.setStyleSheet(
@@ -4730,6 +4794,138 @@ class SettingsDialog(QDialog):
         except Exception as e:
             QMessageBox.warning(self, "保存エラー", str(e))
         super().accept()
+
+
+# ---------------------------------------------------------------------------
+# ヘルプ (使い方・仕様)
+# ---------------------------------------------------------------------------
+
+class HelpDialog(QDialog):
+    """「使い方・仕様」ヘルプ。静的 HTML を QTextBrowser に表示するだけの
+    シンプルなダイアログ。 記載内容は実装済みの機能・数値に限定する
+    (未実装の機能や将来構想は書かない)。"""
+
+    _HELP_HTML = """
+    <h2>Sora Editor の使い方・仕様</h2>
+
+    <h3>ファイル操作</h3>
+    <ul>
+        <li>新規(Ctrl+N) / 開く(Ctrl+O) / 保存(Ctrl+S) / 名前を付けて保存(Ctrl+Shift+S)</li>
+        <li>全て保存(Ctrl+Alt+S) / 全て保存して終了(Ctrl+Alt+Q)</li>
+        <li>印刷(Ctrl+P) / 印刷プレビュー(Ctrl+Shift+P) — 現在のタブがテキストの時のみ対応
+            (画像 / CSVグリッド表示中は対象外)</li>
+        <li>最近開いたファイル: 直近 15 件まで保持</li>
+    </ul>
+    <p><b>仕様: 文字コードの自動判定と保存</b><br>
+    開く時は UTF-8-SIG → UTF-8 → CP932 (Shift_JIS 系) → EUC-JP の順に判定し、
+    最初に成功したエンコーディングを採用します (全滅時は UTF-8 の
+    置換モードで開く)。保存は検出したエンコーディングのまま書き戻します。
+    編集で元のエンコーディングに無い文字を追加すると、保存時に
+    「UTF-8 で保存し直すか」を確認するダイアログが出ます。</p>
+    <p><b>仕様: 大容量ファイルの自動抑制</b><br>
+    2MB 以上のファイルはシンタックスハイライトの初回一括ハイライトを
+    スキップします (編集した箇所は通常どおり色が付きます)。
+    10MB 以上はさらに差分計算 (変更ガター) と Undo 履歴も無効化します。</p>
+
+    <h3>検索・編集</h3>
+    <ul>
+        <li>検索(Ctrl+F) / 検索・置換(Ctrl+H) / 選択語を検索(Ctrl+F3)</li>
+        <li>ファイル内 Grep 検索(Ctrl+Shift+F) — 開いているフォルダ配下を横断検索</li>
+        <li>行へジャンプ(Ctrl+G)</li>
+        <li>次/前の変更箇所(Alt+↓ / Alt+↑) — 保存前の未保存編集を緑/オレンジ/赤のガターで表示</li>
+    </ul>
+
+    <h3>ブックマーク</h3>
+    <ul>
+        <li>登録/解除(F2) / 次(F3) / 前(Shift+F3) / 一覧(Ctrl+B)</li>
+        <li>次のエラー行(Ctrl+E) / 前のエラー行(Ctrl+Shift+E) — ログ中の
+            エラーらしき行を自動検出してジャンプ</li>
+    </ul>
+
+    <h3>シンタックスハイライト / 表示切替</h3>
+    <ul>
+        <li>対応言語: text, python, javascript, sql, log, cpp, java, csharp, vb, xml
+            (拡張子から自動判定、手動切替も可)</li>
+        <li>CSV / TSV: 開くと自動でグリッド表示 (閲覧専用)。
+            F6 でテキスト編集⇔グリッド表示を切替可能</li>
+        <li>画像ビューア対応拡張子: png, jpg, jpeg, gif, bmp, webp, ico, tif, tiff, svg</li>
+    </ul>
+
+    <h3>SQL 抽出・整形</h3>
+    <ul>
+        <li>ログから SQL 抽出・整形(Ctrl+Shift+Q) — ログ全体から SQL 文を検出して整形表示</li>
+        <li>選択範囲から SQL 抽出(Ctrl+Shift+X)</li>
+    </ul>
+
+    <h3>FTP パネル (Ctrl+T で表示/非表示)</h3>
+    <ul>
+        <li>接続情報はプロファイルとして保存可能。最後に開いていたフォルダも
+            プロファイルごとに記憶</li>
+        <li>ファイルをダブルクリック、または選択して「開く / ダウンロード」で
+            ローカルの一時フォルダにダウンロードして編集タブで開く
+            (複数選択で一括ダウンロード可)</li>
+        <li>5MB 以上のファイルはダウンロード前に確認、100MB 以上は強めの警告が出る</li>
+        <li>「⟳」ボタン: 現在のフォルダをサーバーから再取得して一覧を最新化</li>
+        <li>「🔄 FTP更新確認」(ツールバー): 現在のタブが FTP で開いたファイルの場合、
+            サーバー側の更新日時 (MDTM コマンド) を再取得し、取得時点と異なれば
+            再ダウンロードして読み込み直すか確認する</li>
+    </ul>
+    <p><b>仕様: FTP の制限事項</b><br>
+    ・ダウンロードしたファイルは <u>ローカルの一時ファイル</u> として保存されます。
+    Ctrl+S で保存してもサーバーへの自動アップロードは行われません
+    (サーバーへ反映するには別途 FTP クライアント等でアップロードしてください)。<br>
+    ・フォルダの中身一覧は自動更新されません。サーバー側でファイルが
+    追加/削除された場合は「⟳」で再取得してください。<br>
+    ・「🔄 FTP更新確認」は MDTM コマンドに対応していないサーバーでは使用できません。<br>
+    ・接続がアイドル状態でも、設定した間隔 (既定 60 秒、設定 → 表示タブで変更可)
+    ごとに自動で NOOP を送ってタイムアウト切断を防止します。切断されていた場合は
+    自動で再接続を試みます。</p>
+
+    <h3>設定 (Ctrl+, )</h3>
+    <ul>
+        <li>表示タブ: エディタ / UI のフォントサイズ、テーマ、FTP キープアライブ間隔、
+            FTP ファイル一覧の時刻表示方式 (ローカル変換 / サーバー値そのまま)</li>
+        <li>ソース検索パスタブ: ログの「Class#method():行」やスタックトレースから
+            該当ソースを開くための検索対象フォルダを登録</li>
+        <li>設定移行タブ: FTPプロファイル / UI設定 / 検索履歴 を JSON 1 ファイルに
+            エクスポート・インポート (別 PC への環境移行用)</li>
+    </ul>
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle(f"使い方・仕様 — Sora Editor v{__version__}")
+        self.resize(720, 640)
+        self._build_ui()
+
+    def _build_ui(self):
+        lay = QVBoxLayout(self)
+        lay.setContentsMargins(8, 8, 8, 8)
+        lay.setSpacing(6)
+
+        browser = QTextBrowser()
+        browser.setOpenExternalLinks(False)
+        browser.setHtml(self._HELP_HTML)
+        lay.addWidget(browser, 1)
+
+        btns = QHBoxLayout()
+        btns.addStretch()
+        close = QPushButton("閉じる")
+        close.setDefault(True)
+        close.clicked.connect(self.accept)
+        btns.addWidget(close)
+        lay.addLayout(btns)
+
+        t = _theme()
+        self.setStyleSheet(f"""
+            QDialog{{background:{t['bg']};}}
+            QTextBrowser{{background:{t['panel_bg']};color:{t['text']};
+                         border:1px solid {t['border']};padding:6px;}}
+            QPushButton{{background:{t['control_bg']};color:{t['text']};border:none;
+                        padding:4px 12px;border-radius:2px;}}
+            QPushButton:hover{{background:{t['control_hover']};}}
+            QPushButton:default{{background:{t['selection']};color:{t['text']};}}
+        """)
 
 
 # ---------------------------------------------------------------------------
@@ -4901,6 +5097,14 @@ class MainWindow(QMainWindow):
         self._ftp_toolbar_action.triggered.connect(self._toggle_ftp)
         tb.addAction(self._ftp_toolbar_action)
 
+        # 現在のタブが FTP 由来なら、サーバー側で更新されていないか確認
+        self._ftp_check_update_action = QAction("🔄 FTP更新確認", self)
+        self._ftp_check_update_action.setToolTip(
+            "現在のタブがFTPで開いたファイルなら、サーバー側の更新有無を確認する"
+        )
+        self._ftp_check_update_action.triggered.connect(self._check_ftp_update)
+        tb.addAction(self._ftp_check_update_action)
+
         tb.addSeparator()
 
         # 検索 (トグル式)
@@ -5038,6 +5242,13 @@ class MainWindow(QMainWindow):
             tm, "選択範囲からSQL抽出 (Ctrl+Shift+X)", QKeySequence("Ctrl+Shift+X"),
             self._show_sql_extract_selection,
         )
+
+        # ヘルプメニュー
+        hm = mb.addMenu("ヘルプ(&H)")
+        self._add_action(hm, "使い方・仕様(&U)...", QKeySequence("F1"), self._open_help)
+
+    def _open_help(self):
+        HelpDialog(self).exec()
 
     def _open_settings(self):
         dlg = SettingsDialog(self)
@@ -5530,13 +5741,16 @@ class MainWindow(QMainWindow):
 
     def _open_ftp_content(self, content, filename):
         tab = EditorTab(content, filename)
+        tab.is_ftp = True
         self._connect_tab(tab)
         idx = self.tabs.addTab(tab, f"[FTP] {filename}")
         self.tabs.setCurrentIndex(idx)
 
-    def _open_ftp_file(self, local_path, filename):
+    def _open_ftp_file(self, local_path, filename, remote_path='', mtime=''):
         """FTP でダウンロードしたファイルを一時ファイル経由で開く。
-        同パスのタブが既に開いていたら、そのタブを最新内容に置換 (リロード)。"""
+        同パスのタブが既に開いていたら、そのタブを最新内容に置換 (リロード)。
+        remote_path/mtime は「FTP更新確認」用にタブへ保存しておく。"""
+        ftp_host = getattr(self.ftp_panel.ftp, 'host', '') if self.ftp_panel.ftp else ''
         try:
             size = os.path.getsize(local_path)
         except Exception:
@@ -5583,6 +5797,9 @@ class MainWindow(QMainWindow):
             cur_block = tab.editor.textCursor().blockNumber()
             tab.reload_from_disk(content)
             tab.encoding = enc
+            tab.ftp_remote_path = remote_path
+            tab.ftp_host = ftp_host
+            tab.ftp_mtime = mtime
             if size < self._LARGE_FILE_SIZE:
                 tab.highlighter.rehighlight()
             # スクロール位置を元の行に近づける
@@ -5604,6 +5821,10 @@ class MainWindow(QMainWindow):
             disable_undo=huge,
         )
         tab.encoding = enc
+        tab.is_ftp = True
+        tab.ftp_remote_path = remote_path
+        tab.ftp_host = ftp_host
+        tab.ftp_mtime = mtime
         self._connect_tab(tab)
         idx = self.tabs.addTab(tab, f"[FTP] {filename}")
         self.tabs.setCurrentIndex(idx)
@@ -5612,6 +5833,62 @@ class MainWindow(QMainWindow):
         self._watch_path(local_path)
         _push_recent_file(local_path)
         self._update_encoding_label()
+
+    def _check_ftp_update(self):
+        """ツールバー「🔄 FTP更新確認」: 現在のタブが FTP 由来なら MDTM で
+        サーバー側の更新日時を再取得し、ローカル取得時点と異なれば再取得を確認する。"""
+        tab = self.current_tab()
+        if not isinstance(tab, EditorTab) or not getattr(tab, 'is_ftp', False):
+            QMessageBox.information(
+                self, "FTP更新確認", "現在のタブは FTP で開いたファイルではありません。"
+            )
+            return
+        remote_path = getattr(tab, 'ftp_remote_path', '')
+        local_mtime = getattr(tab, 'ftp_mtime', '')
+        if not remote_path or not local_mtime:
+            QMessageBox.information(
+                self, "FTP更新確認",
+                "このタブには取得時刻の情報がありません。\n"
+                "(サーバーが MDTM コマンドに対応していない可能性があります)",
+            )
+            return
+        panel = self.ftp_panel
+        if panel.ftp is None:
+            QMessageBox.warning(self, "FTP更新確認", "FTP に接続されていません。先に接続してください。")
+            return
+        if getattr(tab, 'ftp_host', '') != getattr(panel.ftp, 'host', ''):
+            QMessageBox.warning(
+                self, "FTP更新確認",
+                "現在接続中の FTP サーバーが、このファイルを取得したサーバーと異なります。\n"
+                "取得元のサーバーに再接続してから確認してください。",
+            )
+            return
+        if not panel._ensure_alive():
+            QMessageBox.warning(
+                self, "接続切断", "FTP 接続が切れました。再接続に失敗したので再度接続してください。"
+            )
+            return
+        new_mtime = panel._get_mtime(remote_path)
+        if not new_mtime:
+            QMessageBox.information(
+                self, "FTP更新確認",
+                "サーバー側の更新日時を取得できませんでした。\n"
+                "(MDTM 非対応、またはファイルが見つかりません)",
+            )
+            return
+        if new_mtime == local_mtime:
+            self.statusBar().showMessage("サーバー側に更新はありません", 4000)
+            return
+        ans = QMessageBox.question(
+            self, "サーバー側で更新あり",
+            f"{tab.filename} はサーバー側で更新されています。\n"
+            "再取得して読み込み直しますか?\n\n"
+            "(ローカルに未保存の変更がある場合は上書き確認が入ります)",
+            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+            QMessageBox.StandardButton.Yes,
+        )
+        if ans == QMessageBox.StandardButton.Yes:
+            panel._download(remote_path)
 
     def _is_local_file_modified(self, local_path: str) -> bool:
         """指定ローカルパスに紐づくタブで未保存編集があるか"""
@@ -5758,6 +6035,12 @@ class MainWindow(QMainWindow):
     }
 
     def _write_file(self, tab, path):
+        # 別パスへの「名前を付けて保存」 = FTP ソースから切り離された
+        # 通常のローカルファイルになるので is_ftp を解除 (タブタイトルの
+        # "[FTP] " も外れる)。同じパスへの上書き保存 (Ctrl+S) では
+        # is_ftp はそのまま維持する。
+        if getattr(tab, 'is_ftp', False) and path != tab.file_path:
+            tab.is_ftp = False
         # タブが持つ検出済みエンコで書き戻す (UTF-8 強制を撤廃)。
         # encoding に該当 codec が無ければ UTF-8 にフォールバック。
         enc = self._SAVE_ENC_MAP.get(getattr(tab, 'encoding', '') or '', 'utf-8')
@@ -5789,7 +6072,8 @@ class MainWindow(QMainWindow):
             tab.file_path = path
             tab.filename = os.path.basename(path)
             idx = self.tabs.indexOf(tab)
-            self.tabs.setTabText(idx, tab.filename)
+            title = f"[FTP] {tab.filename}" if getattr(tab, 'is_ftp', False) else tab.filename
+            self.tabs.setTabText(idx, title)
             tab.editor.document().setModified(False)
             tab.reset_original()  # 保存後はガターをリセット
             # 保存でパスが付いた/変わったタブのブックマークを永続化
@@ -6636,6 +6920,11 @@ class MainWindow(QMainWindow):
             return
         idx = self.tabs.indexOf(tab)
         title = tab.filename
+        if getattr(tab, 'is_ftp', False):
+            # 編集/保存で content_changed が発火する度にタイトルを
+            # filename だけで再構築していたため、"[FTP] " プレフィックスが
+            # 消えてしまっていた (仕様ではなくバグ)。維持する。
+            title = f"[FTP] {title}"
         bar = self.tabs.tabBar()
         if tab.is_modified:
             # 未保存マーク ● + タブ文字色をオレンジにして目立たせる
