@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.24"
+__version__ = "1.1.25"
 
 import sys
 import os
@@ -1540,8 +1540,7 @@ class InlineSearchBar(QWidget):
             super().keyPressEvent(event)
 
     def _on_return(self):
-        # Enter 確定時のみ履歴に push (▲▼ ボタンクリックでは push しない)
-        self._push_history(self.search_input, self._search_text())
+        # 履歴への push は _do_find 側で行う (Enter/▲▼ どちらでも共通化)
         mods = QApplication.keyboardModifiers()
         if mods & Qt.KeyboardModifier.ShiftModifier:
             self.find_prev()
@@ -1596,24 +1595,9 @@ class InlineSearchBar(QWidget):
 
         doc_text = doc.toPlainText()
 
-        # ハイライトは MAX_HIGHLIGHTS まで、件数は最後までカウント
-        # 鮮やかな黄背景 + 黒文字 + 太字 で視認性最大化 (テーマ問わず目立つ)
-        fmt = QTextCharFormat()
-        fmt.setBackground(QColor("#FFEB3B"))
-        fmt.setForeground(QColor("#000000"))
-        fmt.setFontWeight(700)
-        selections = []
-        total = 0
-        for m in pat.finditer(doc_text):
-            total += 1
-            if len(selections) < self._MAX_HIGHLIGHTS:
-                sel = QTextEdit.ExtraSelection()
-                sel.format = fmt
-                cur = self._editor.textCursor()
-                cur.setPosition(m.start())
-                cur.setPosition(m.end(), cur.MoveMode.KeepAnchor)
-                sel.cursor = cur
-                selections.append(sel)
+        # 全マッチの (start, end) をまず集める。件数は最後まで数える。
+        spans = [(m.start(), m.end()) for m in pat.finditer(doc_text)]
+        total = len(spans)
 
         if total == 0:
             self._editor.set_search_highlights([])
@@ -1621,9 +1605,34 @@ class InlineSearchBar(QWidget):
             self.match_label.setStyleSheet("color:#FF7070; font-size:10px;")
             return
 
+        # MAX_HIGHLIGHTS を超える場合、ファイル先頭からの出現順ではなく
+        # 「今画面に見えている位置」に近いマッチを優先して着色する。
+        # (先頭から数えるだけだと、後方をスクロールして検索した時に
+        #  画面内のマッチが一つも着色されない、という問題があった)
+        if total > self._MAX_HIGHLIGHTS:
+            first_block = self._editor.firstVisibleBlock()
+            anchor = first_block.position() if first_block.isValid() else 0
+            spans = sorted(spans, key=lambda se: abs(se[0] - anchor))[:self._MAX_HIGHLIGHTS]
+            spans.sort()  # 見た目/デバッグのため文書順に戻す
+
+        # 鮮やかな黄背景 + 黒文字 + 太字 で視認性最大化 (テーマ問わず目立つ)
+        fmt = QTextCharFormat()
+        fmt.setBackground(QColor("#FFEB3B"))
+        fmt.setForeground(QColor("#000000"))
+        fmt.setFontWeight(700)
+        selections = []
+        for start, end in spans:
+            sel = QTextEdit.ExtraSelection()
+            sel.format = fmt
+            cur = self._editor.textCursor()
+            cur.setPosition(start)
+            cur.setPosition(end, cur.MoveMode.KeepAnchor)
+            sel.cursor = cur
+            selections.append(sel)
+
         self._editor.set_search_highlights(selections)
         if total > self._MAX_HIGHLIGHTS:
-            self.match_label.setText(f"{total} 件 (上位{self._MAX_HIGHLIGHTS}件のみ着色)")
+            self.match_label.setText(f"{total} 件 (画面付近の{self._MAX_HIGHLIGHTS}件のみ着色)")
         else:
             self.match_label.setText(f"{total} 件")
         self.match_label.setStyleSheet("color:#6A8759; font-size:10px;")
@@ -1640,6 +1649,10 @@ class InlineSearchBar(QWidget):
         text = self._search_text()
         if not text:
             return
+        # ▲▼ ボタン/Enter どちらでの検索実行でも履歴に残す。_push_history は
+        # 既に履歴トップと同じ文字列なら即 return するので、連打してもディスク
+        # I/O は初回の 1 回だけで済む。
+        self._push_history(self.search_input, text)
         # 大ファイルで「マッチなし」をキャッシュ済みなら、再 find せず即通知
         # (前回 2 回の全文 find で確認済み = 改めて scan する意味がない)
         if self._no_match_text == text:
@@ -5439,6 +5452,15 @@ class MainWindow(QMainWindow):
     def _apply_theme(self):
         t = _theme()
         ui_fs = SETTINGS.get('ui_font_size', 10)
+        # スクロールバーは control_bg 系の色だと背景と明度差が乏しく
+        # (特に最大化時にハンドルがトラックのほぼ全域を占めた時に)
+        # ほとんど見えなくなるため、テーマの他パーツとは独立した
+        # 明度差の大きい中間グレーを使う (暗いテーマ→明るいグレー / 明るい
+        # テーマ→暗いグレー)。
+        is_light = SETTINGS.get('theme', 'Dark') in ('Light', 'Solarized Light')
+        sb_handle = "#8a8a8a" if not is_light else "#9a9a9a"
+        sb_hover  = "#a5a5a5" if not is_light else "#7a7a7a"
+        sb_border = "#5a5a5a" if not is_light else "#707070"
         self.setStyleSheet(f"""
             QMainWindow {{ background: {t['bg']}; }}
             QMenuBar {{ background: {t['toolbar_bg']}; color: {t['text']}; padding: 0; margin: 0; }}
@@ -5539,11 +5561,11 @@ class MainWindow(QMainWindow):
                 background: {t['panel_bg']}; width: 12px; border: none; margin: 0;
             }}
             QScrollBar::handle:vertical {{
-                background: {t['control_bg']}; border-radius: 4px;
-                min-height: 30px; margin: 2px;
+                background: {sb_handle}; border: 1px solid {sb_border};
+                border-radius: 4px; min-height: 30px; margin: 2px;
             }}
             QScrollBar::handle:vertical:hover {{
-                background: {t['control_hover']};
+                background: {sb_hover};
             }}
             QScrollBar::add-line:vertical,
             QScrollBar::sub-line:vertical {{ height: 0; width: 0; }}
@@ -5553,11 +5575,11 @@ class MainWindow(QMainWindow):
                 background: {t['panel_bg']}; height: 12px; border: none; margin: 0;
             }}
             QScrollBar::handle:horizontal {{
-                background: {t['control_bg']}; border-radius: 4px;
-                min-width: 30px; margin: 2px;
+                background: {sb_handle}; border: 1px solid {sb_border};
+                border-radius: 4px; min-width: 30px; margin: 2px;
             }}
             QScrollBar::handle:horizontal:hover {{
-                background: {t['control_hover']};
+                background: {sb_hover};
             }}
             QScrollBar::add-line:horizontal,
             QScrollBar::sub-line:horizontal {{ height: 0; width: 0; }}
