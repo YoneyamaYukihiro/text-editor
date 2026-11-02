@@ -1,8 +1,8 @@
 # PyInstaller version info file for Multi-Server Log Viewer
 VSVersionInfo(
   ffi=FixedFileInfo(
-    filevers=(1, 1, 26, 0),
-    prodvers=(1, 1, 26, 0),
+    filevers=(1, 1, 27, 0),
+    prodvers=(1, 1, 27, 0),
     mask=0x3f,
     flags=0x0,
     OS=0x40004,
@@ -18,12 +18,12 @@ VSVersionInfo(
           [
             StringStruct('CompanyName', 'Yoneyama Yukihiro'),
             StringStruct('FileDescription', 'Multi-Server Log Viewer'),
-            StringStruct('FileVersion', '1.1.26.0'),
+            StringStruct('FileVersion', '1.1.27.0'),
             StringStruct('InternalName', 'Multi-Server Log Viewer'),
             StringStruct('LegalCopyright', ''),
             StringStruct('OriginalFilename', 'Multi-Server Log Viewer.exe'),
             StringStruct('ProductName', 'Multi-Server Log Viewer'),
-            StringStruct('ProductVersion', '1.1.26.0'),
+            StringStruct('ProductVersion', '1.1.27.0'),
           ]
         )
       ]

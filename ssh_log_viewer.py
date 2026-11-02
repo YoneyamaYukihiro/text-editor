@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """SSH/Telnet Log Viewer — マルチサーバー・グリッドログ解析ツール"""
-__version__ = "1.1.26"
+__version__ = "1.1.27"
 
 import sys, os, re, json, stat as stat_mod, time, socket, select
 
@@ -1102,6 +1102,8 @@ class MiniLogViewer(QWidget):
         self.color_idx    = color_idx
         self._all_lines: list[str] = []
         self._worker: TailWorker | None = None
+        self._tail_retry_count = 0
+        self._tail_retry_token = 0
         self._bg, self._fg = _palette(color_idx)
         self._build_ui()
         # append 直後の即時スクロールでは Qt のレイアウト計算が間に合わず
@@ -1146,6 +1148,11 @@ class MiniLogViewer(QWidget):
         self._header_lbl = QLabel(
             f"{self.server_label}  ·  {os.path.basename(self.filepath)}"
         )
+        # 長いログ名がQSplitterの最小幅になり、列全体の均等分割を妨げないようにする。
+        self._header_lbl.setMinimumWidth(0)
+        self._header_lbl.setSizePolicy(
+            QSizePolicy.Policy.Ignored, QSizePolicy.Policy.Preferred
+        )
         # フルパス + 接続情報を tooltip で確認可能に
         self._header_lbl.setToolTip(
             f"接続: {self.conn.label}\nパス: {self.filepath}"
@@ -1187,6 +1194,7 @@ class MiniLogViewer(QWidget):
         fl.setSpacing(3)
 
         self.filter_input = QLineEdit()
+        self.filter_input.setMinimumWidth(0)
         self.filter_input.setPlaceholderText("フィルタ...")
         self.filter_input.setToolTip(
             "このセルだけのフィルタ — 検索文字列または正規表現 (即時反映)"
@@ -1343,13 +1351,34 @@ class MiniLogViewer(QWidget):
         if on:
             self._worker = TailWorker(self.conn, self.filepath)
             self._worker.new_text.connect(self._append)
-            self._worker.error.connect(lambda e: self.stats.setText(f"ERR:{e}"))
+            self._worker.error.connect(self._on_tail_error)
             self._worker.start()
         else:
             self._stop_worker()
         if hasattr(self, 'stop_btn'):
             self.stop_btn.setEnabled(on)
         self.tail_changed.emit(on)
+
+    def _on_tail_error(self, error: str):
+        self.stats.setText(f"ERR:{error}")
+        self.tail_btn.blockSignals(True)
+        self.tail_btn.setChecked(False)
+        self.tail_btn.blockSignals(False)
+        self.stop_btn.setEnabled(False)
+        self._stop_worker()
+        self.tail_changed.emit(False)
+
+        if self._tail_retry_count >= 3:
+            return
+        self._tail_retry_count += 1
+        self._tail_retry_token += 1
+        token = self._tail_retry_token
+        QTimer.singleShot(1000, lambda: self._retry_tail(token))
+
+    def _retry_tail(self, token: int):
+        if token != self._tail_retry_token or self.tail_btn.isChecked():
+            return
+        self.start_tail(reset_retry=False)
 
     def _append(self, text: str):
         self._all_lines.extend(text.splitlines())
@@ -1381,10 +1410,15 @@ class MiniLogViewer(QWidget):
 
     # ── 外部 API ──────────────────────────────────────────────────────
 
-    def start_tail(self):
+    def start_tail(self, reset_retry: bool = True):
+        if reset_retry:
+            self._tail_retry_count = 0
+            self._tail_retry_token += 1
         self.tail_btn.setChecked(True)
 
     def stop_tail(self):
+        self._tail_retry_token += 1
+        self._tail_retry_count = 0
         self.tail_btn.setChecked(False)
         self._stop_worker()
 
@@ -1474,6 +1508,10 @@ class LogGrid(QWidget):
         self._outer = QVBoxLayout(self)
         self._outer.setContentsMargins(0, 0, 0, 0)
         self._hsplit: QSplitter | None = None
+        self._equalize_scheduled = False
+        self._equalizing = False
+        self._tail_start_queue: list[MiniLogViewer] = []
+        self._tail_start_token = 0
         self._rebuild()
 
     def _rebuild(self):
@@ -1520,29 +1558,54 @@ class LogGrid(QWidget):
         hsplit.show()
 
         # レイアウト確定後に均等分割を適用 (幅が確定するまで少し待つ)
-        QTimer.singleShot(30, self._equalize)
+        self._schedule_equalize(30)
+
+    @staticmethod
+    def _equal_sizes(total: int, count: int) -> list[int]:
+        if count <= 0:
+            return []
+        base, remainder = divmod(max(0, total), count)
+        return [base + (1 if i < remainder else 0) for i in range(count)]
+
+    def _schedule_equalize(self, delay: int = 0):
+        if self._equalize_scheduled or self._equalizing:
+            return
+        self._equalize_scheduled = True
+        QTimer.singleShot(delay, self._run_scheduled_equalize)
+
+    def _run_scheduled_equalize(self):
+        self._equalize_scheduled = False
+        self._equalize()
 
     def _equalize(self):
         """全スプリッターを均等分割する。幅が未確定なら no-op (stretch factor に委ねる)。"""
         if not self._hsplit:
             return
-        w = self._hsplit.width()
-        h = self._hsplit.height()
+        w = sum(self._hsplit.sizes())
         # 幅未確定の場合は setSizes(0) を避け、再試行
-        if w < 50 or h < 50:
-            QTimer.singleShot(50, self._equalize)
+        if w < 50:
+            self._schedule_equalize(50)
             return
-        if self._cols > 0:
-            self._hsplit.setSizes([w // self._cols] * self._cols)
-        for vsplit in self._vsplits:
-            if self._rows > 0:
-                vsplit.setSizes([h // self._rows] * self._rows)
+        heights = [sum(vsplit.sizes()) for vsplit in self._vsplits]
+        if any(h < 50 for h in heights):
+            self._schedule_equalize(50)
+            return
+        self._equalizing = True
+        try:
+            if self._cols > 0:
+                self._hsplit.setSizes(self._equal_sizes(w, self._cols))
+            for vsplit in self._vsplits:
+                h = sum(vsplit.sizes())
+                if self._rows > 0:
+                    vsplit.setSizes(self._equal_sizes(h, self._rows))
+        finally:
+            self._equalizing = False
 
     def resizeEvent(self, event):
         super().resizeEvent(event)
-        # リサイズ後も均等を維持（ユーザーが手動調整した場合は上書きしない）
-        # 初期表示のみ均等化するため、ここでは何もしない
-        pass
+        # ウィンドウサイズ変更後も、次のイベントループで均等分割を再適用する
+        if not self._equalizing:
+            self._schedule_equalize()
 
     def set_size(self, rows: int, cols: int):
         self._rows = rows
@@ -1560,9 +1623,24 @@ class LogGrid(QWidget):
         return [s.viewer() for s in self._slots if s.viewer()]
 
     def start_all_tail(self):
-        for v in self.viewers(): v.start_tail()
+        self._tail_start_token += 1
+        token = self._tail_start_token
+        self._tail_start_queue = [
+            v for v in self.viewers() if not v.tail_btn.isChecked()
+        ]
+        self._start_next_tail(token)
+
+    def _start_next_tail(self, token: int):
+        if token != self._tail_start_token or not self._tail_start_queue:
+            return
+        viewer = self._tail_start_queue.pop(0)
+        viewer.start_tail()
+        # 同一SSH接続上でのopen_session集中を避ける。
+        QTimer.singleShot(350, lambda: self._start_next_tail(token))
 
     def stop_all_tail(self):
+        self._tail_start_token += 1
+        self._tail_start_queue.clear()
         for v in self.viewers(): v.stop_tail()
 
     def apply_filter(self, pattern: str, level: str):
@@ -4372,6 +4450,8 @@ class MainWindow(QMainWindow):
             QMessageBox.warning(self, "一部失敗",
                 "以下のサーバーは接続できませんでした:\n\n" + "\n".join(failed))
         self._status.setText(msg)
+        # ワークスペース読込でセル割当が完了した後、実サイズを基準に再均等化する。
+        self.grid._schedule_equalize()
 
     def _connect_from_profile(self, prof_name: str, info: dict):
         """プロファイル情報からサーバーパネルを作成・登録する。
