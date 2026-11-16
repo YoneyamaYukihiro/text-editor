@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """Sora Editor — マルチタブ・FTP対応のテキストエディタ"""
-__version__ = "1.1.27"
+__version__ = "1.1.28"
 
 import sys
 import os
@@ -4776,6 +4776,26 @@ class SettingsDialog(QDialog):
         if i >= 0:
             self.theme_combo.setCurrentIndex(i)
 
+    def sync_from_settings(self):
+        """外部で更新された SETTINGS をダイアログの入力欄へ反映する。"""
+        for k, sp in self._spinners.items():
+            sp.setValue(int(SETTINGS.get(k, _DEFAULT_SETTINGS[k])))
+
+        i = self.theme_combo.findText(SETTINGS.get('theme', _DEFAULT_SETTINGS['theme']))
+        if i >= 0:
+            self.theme_combo.setCurrentIndex(i)
+
+        if hasattr(self, 'ftp_tz_combo'):
+            mode = SETTINGS.get('ftp_time_mode', _DEFAULT_SETTINGS['ftp_time_mode'])
+            i = self.ftp_tz_combo.findData(mode)
+            if i >= 0:
+                self.ftp_tz_combo.setCurrentIndex(i)
+
+        if hasattr(self, 'source_list'):
+            self.source_list.clear()
+            for d in (SETTINGS.get('source_dirs') or []):
+                self.source_list.addItem(d)
+
     def _add_source_dir(self):
         d = QFileDialog.getExistingDirectory(self, "ソース検索パスを追加")
         if not d:
@@ -5267,7 +5287,9 @@ class MainWindow(QMainWindow):
         dlg = SettingsDialog(self)
         # 設定移行ボタンを MainWindow のメソッドに接続
         dlg.export_btn.clicked.connect(self._export_settings)
-        dlg.import_btn.clicked.connect(self._import_settings)
+        # インポート後にダイアログ側の入力欄も同期し、OK で古い値を
+        # インポート結果へ上書きしないようにする。
+        dlg.import_btn.clicked.connect(lambda: self._import_settings(dlg))
         if dlg.exec() == QDialog.DialogCode.Accepted:
             self._apply_all_settings()
 
@@ -5304,7 +5326,7 @@ class MainWindow(QMainWindow):
         except Exception as e:
             QMessageBox.critical(self, "エクスポートエラー", str(e))
 
-    def _import_settings(self):
+    def _import_settings(self, settings_dialog=None):
         path, _ = QFileDialog.getOpenFileName(
             self, "設定をインポート", "", "JSON (*.json);;すべて (*)"
         )
@@ -5373,6 +5395,8 @@ class MainWindow(QMainWindow):
             return
 
         self._apply_all_settings()
+        if settings_dialog is not None:
+            settings_dialog.sync_from_settings()
         self.statusBar().showMessage(
             f"📥 インポート完了: FTPプロファイル {len(new_ftp)}件", 4000
         )
